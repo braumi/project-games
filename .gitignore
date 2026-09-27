@@ -1,7 +1,6 @@
 node_modules/
-verify-out/
-backend/data/scores.json
-.DS_Store
 dist/
-*.local
 .vite/
+*.local
+.DS_Store
+*.log

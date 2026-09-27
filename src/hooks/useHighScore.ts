@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { getBestScore } from "@/lib/scores";
+import { getBestScore } from "@/lib/storage";
 
 function subscribe(onStoreChange: () => void) {
   const onChange = () => onStoreChange();

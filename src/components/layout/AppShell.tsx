@@ -1,19 +1,19 @@
 import type { ReactNode } from "react";
-import { SiteFooter } from "./SiteFooter";
-import styles from "./SiteShell.module.css";
+import { Footer } from "./Footer";
+import styles from "./AppShell.module.css";
 
-interface SiteShellProps {
+interface AppShellProps {
   children: ReactNode;
 }
 
-export function SiteShell({ children }: SiteShellProps) {
+export function AppShell({ children }: AppShellProps) {
   return (
     <div className={styles.wrap}>
       <a className="skip-link" href="#main">
         Skip to content
       </a>
       <main id="main">{children}</main>
-      <SiteFooter />
+      <Footer />
     </div>
   );
 }

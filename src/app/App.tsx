@@ -1,9 +1,9 @@
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
-import { SiteShell } from "@/components/layout/SiteShell";
+import { AppShell } from "@/components/layout/AppShell";
 import { getGame } from "@/data/games";
-import { HomePage } from "@/pages/HomePage";
-import { NotFoundPage } from "@/pages/NotFoundPage";
-import { PlayPage } from "@/pages/PlayPage";
+import { HomePage } from "@/pages/home/HomePage";
+import { NotFoundPage } from "@/pages/not-found/NotFoundPage";
+import { PlayPage } from "@/pages/play/PlayPage";
 
 function HashGameRedirect() {
   const { hash } = useLocation();
@@ -18,9 +18,9 @@ export function App() {
       <Route
         path="/"
         element={
-          <SiteShell>
+          <AppShell>
             <HashGameRedirect />
-          </SiteShell>
+          </AppShell>
         }
       />
       <Route path="/games" element={<Navigate to="/" replace />} />
@@ -28,9 +28,9 @@ export function App() {
       <Route
         path="*"
         element={
-          <SiteShell>
+          <AppShell>
             <NotFoundPage />
-          </SiteShell>
+          </AppShell>
         }
       />
     </Routes>

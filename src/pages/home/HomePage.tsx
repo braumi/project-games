@@ -1,11 +1,11 @@
 import { useMemo, useState } from "react";
 import { GameGrid } from "@/components/games/GameGrid";
-import { SiteHeader } from "@/components/layout/SiteHeader";
+import { Header } from "@/components/layout/Header";
 import { FilterChip } from "@/components/ui/FilterChip";
 import { CATEGORIES, filterGames } from "@/data/games";
 import type { Category } from "@/data/games";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
-import { readFilter, writeFilter } from "@/lib/scores";
+import { readFilter, writeFilter } from "@/lib/storage";
 import styles from "./HomePage.module.css";
 
 function initialCategory(): Category {
@@ -25,7 +25,7 @@ export function HomePage() {
 
   return (
     <>
-      <SiteHeader>
+      <Header>
         <div className={styles.filters} role="group" aria-label="Filter games by category">
           {CATEGORIES.map((item) => (
             <FilterChip
@@ -36,7 +36,7 @@ export function HomePage() {
             />
           ))}
         </div>
-      </SiteHeader>
+      </Header>
       <GameGrid games={games} />
     </>
   );

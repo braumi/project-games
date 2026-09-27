@@ -20,8 +20,8 @@ export interface Game {
 export const GAMES: Game[] = [
   {
     id: "2048",
-    file: "2048.html",
-    thumb: "/thumbs/2048.png",
+    file: "2048/index.html",
+    thumb: "/images/games/2048.png",
     name: "2048",
     category: "Puzzle",
     landscape: false,
@@ -31,8 +31,8 @@ export const GAMES: Game[] = [
   },
   {
     id: "key-peaks-solitaire",
-    file: "key-peaks-solitaire.html",
-    thumb: "/thumbs/key-peaks-solitaire.png",
+    file: "key-peaks-solitaire/index.html",
+    thumb: "/images/games/key-peaks-solitaire.png",
     name: "Key Peaks Solitaire",
     category: "Cards",
     landscape: true,
@@ -49,8 +49,8 @@ export const GAMES: Game[] = [
   },
   {
     id: "marble-chain",
-    file: "marble-chain.html",
-    thumb: "/thumbs/marble-chain.png",
+    file: "marble-chain/index.html",
+    thumb: "/images/games/marble-chain.png",
     name: "Marble Chain",
     category: "Puzzle",
     landscape: true,
@@ -67,8 +67,8 @@ export const GAMES: Game[] = [
   },
   {
     id: "halma",
-    file: "halma.html",
-    thumb: "/thumbs/halma.png",
+    file: "halma/index.html",
+    thumb: "/images/games/halma.png",
     name: "Halma",
     category: "Board",
     landscape: false,
@@ -81,8 +81,8 @@ export const GAMES: Game[] = [
   },
   {
     id: "hoop-drop",
-    file: "hoop-drop.html",
-    thumb: "/thumbs/hoop-drop.png",
+    file: "hoop-drop/index.html",
+    thumb: "/images/games/hoop-drop.png",
     name: "Hoop Drop",
     category: "Sports",
     landscape: false,
@@ -99,8 +99,8 @@ export const GAMES: Game[] = [
   },
   {
     id: "goal-puzzle",
-    file: "goal-puzzle.html",
-    thumb: "/thumbs/goal-puzzle.png",
+    file: "goal-puzzle/index.html",
+    thumb: "/images/games/goal-puzzle.png",
     name: "Goal Puzzle",
     category: "Sports",
     landscape: false,
@@ -110,8 +110,8 @@ export const GAMES: Game[] = [
   },
   {
     id: "star-kick",
-    file: "star-kick.html",
-    thumb: "/thumbs/star-kick.png",
+    file: "star-kick/index.html",
+    thumb: "/images/games/star-kick.png",
     name: "Star Kick",
     category: "Sports",
     landscape: true,
@@ -126,8 +126,8 @@ export const GAMES: Game[] = [
   },
   {
     id: "subway-flap",
-    file: "subway-flap.html",
-    thumb: "/thumbs/subway-flap.png",
+    file: "subway-flap/index.html",
+    thumb: "/images/games/subway-flap.png",
     name: "Subway Flap",
     category: "Arcade",
     landscape: false,
@@ -137,8 +137,8 @@ export const GAMES: Game[] = [
   },
   {
     id: "star-bouncer",
-    file: "star-bouncer.html",
-    thumb: "/thumbs/star-bouncer.png",
+    file: "star-bouncer/index.html",
+    thumb: "/images/games/star-bouncer.png",
     name: "Star Bouncer",
     category: "Arcade",
     landscape: true,

@@ -1,13 +1,13 @@
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Logo } from "@/components/ui/Logo";
-import styles from "./SiteHeader.module.css";
+import styles from "./Header.module.css";
 
-interface SiteHeaderProps {
+interface HeaderProps {
   children?: ReactNode;
 }
 
-export function SiteHeader({ children }: SiteHeaderProps) {
+export function Header({ children }: HeaderProps) {
   return (
     <header className={styles.top}>
       <div>

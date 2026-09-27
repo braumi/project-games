@@ -2,13 +2,17 @@
   "name": "playbox",
   "private": true,
   "version": "1.0.0",
+  "description": "React arcade for nine PixiJS browser games, with local high scores and a dedicated play page for each title.",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "vendor": "mkdir -p public/vendor && cp node_modules/pixi.js/dist/pixi.min.mjs public/vendor/pixi.min.mjs && cp node_modules/matter-js/build/matter.min.js public/vendor/matter.min.js",
     "postinstall": "npm run vendor"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "matter-js": "0.20.0",

@@ -1,8 +1,36 @@
 # Playbox
 
-A React site for nine PixiJS browser games. The hall lists every title; each card opens a dedicated play page.
+A React arcade for nine PixiJS browser games. The home page lists every title with category filters and local high scores. Each card opens a dedicated play page.
 
-## Run
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)](https://react.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white)](https://vite.dev)
+[![PixiJS](https://img.shields.io/badge/PixiJS-8-E72264?logo=pixijs&logoColor=white)](https://pixijs.com)
+
+The current working copy also lives at `Documents/GitHub/playbox` — use that folder name for interviews.
+
+## Features
+
+- Catalogue of nine games with category filters
+- Full-screen player with letterboxed aspect ratio and fullscreen support
+- Gameplay screenshots on every card
+- High scores stored in `localStorage` on this device
+- Light and dark themes that follow the system preference
+- Keyboard, mouse, and touch controls in every title
+
+## Tech stack
+
+| Layer | Choice |
+| --- | --- |
+| UI | React 19, React Router 7, CSS Modules |
+| Language | TypeScript |
+| Bundler | Vite 7 |
+| Games | PixiJS 8 ES modules, Matter.js for Hoop Drop |
+| Persistence | `localStorage` |
+
+The hall is a React SPA. Each game is a self-contained PixiJS module under `public/games/<id>/` and loads the engine from `/vendor/pixi.min.mjs`.
+
+## Getting started
 
 ```bash
 npm install
@@ -10,36 +38,44 @@ npm run vendor
 npm run dev
 ```
 
-Build:
+Production build:
 
 ```bash
 npm run build
 npm run preview
 ```
 
-## Layout
+## Project structure
 
 ```
 public/
-  games/                 playable PixiJS titles
-  thumbs/                gameplay screenshots for the catalogue
-  vendor/                local pixi.min.mjs + matter.min.js
+  games/                 one folder per PixiJS title
+  images/games/          catalogue screenshots
+  vendor/                local pixi.min.mjs and matter.min.js
 src/
+  app/                   routes
+  pages/
+    home/                catalogue
+    play/                player
+    not-found/
   components/
-    games/               catalogue cards + play frame
-    layout/              header, footer, page wrap
+    games/               cards, grid, player frame
+    layout/              shell, header, footer
     ui/                  logo, chips, buttons
   data/                  game catalogue
   hooks/
-  lib/                   high-score + filter storage
-  pages/                 home list, play page, 404
-  styles/                Playbox design tokens
+  lib/                   localStorage helpers
+  styles/                design tokens
 ```
 
-Routes:
+## Routes
 
-- `/` — filterable game list
-- `/play/:gameId` — full-screen player
-- `/#game-id` — redirects to the play page
+| Path | Page |
+| --- | --- |
+| `/` | Filterable game list |
+| `/play/:gameId` | Player |
+| `/#gameId` | Redirects to the play page |
 
-The site is React. Cards show real gameplay shots. Each title stays a complete PixiJS game and loads `/vendor/pixi.min.mjs`.
+## Games
+
+Puzzle: 2048, Marble Chain. Cards: Key Peaks Solitaire. Board: Halma. Sports: Hoop Drop, Goal Puzzle, Star Kick. Arcade: Subway Flap, Star Bouncer.
