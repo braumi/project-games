@@ -1,0 +1,1606 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Hoop Drop</title><!-- GAME-SPECIFIC: set to CONFIG.title (galleries read this tag) -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14121f; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #fatal { position: fixed; inset: auto 12px 12px 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fatal"></div>
+<script src="/vendor/matter.min.js"></script>
+<script type="module">
+/* =====================================================================
+   PIXIJS GAME SHELL (PixiJS v8, single file, no build step)
+   Sections marked  ##### GAME-SPECIFIC #####  are the only parts that
+   change per game. Everything else is the tested framework:
+   scenes, menu, pause, game over, play again, high scores, sound,
+   input (keys + swipe + tap), tweens, responsive scaling, test hook.
+   ===================================================================== */
+import { Application, Container, Graphics, Text, Rectangle } from '/vendor/pixi.min.mjs';
+
+/* ---------- fatal error overlay (never a silent blank screen) ---------- */
+const fatalBox = document.getElementById('fatal');
+function showFatal(msg) { fatalBox.style.display = 'block'; fatalBox.textContent = 'Error: ' + msg; }
+window.addEventListener('error', (e) => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ##### GAME-SPECIFIC: CONFIG ##### */
+const CONFIG = {
+  id: 'hoop-drop',             // unique per game: namespaces saved scores
+  title: 'Hoop Drop',
+  subtitle: 'Tilt the paddles, dunk the balls',
+  width: 720, height: 1280,    // design resolution (portrait)
+  maxHighScores: 10,
+  keyRepeat: false,
+  scoreLabel: 'Score',
+  lowerIsBetter: false,
+};
+const THEME = {
+  outerBg: 0x1e120a,           // letterbox color outside the play area
+  bg: 0x3a2416,                // play-area background (dark gym wood)
+  panel: 0x4e3121,
+  primary: 0xe8742a,
+  primaryHover: 0xf28a45,
+  secondary: 0x6a4630,
+  secondaryHover: 0x7d553b,
+  danger: 0xd9463b,
+  text: 0xfff6ec,
+  textDim: 0xe3c9ae,
+  accent: 0xffd166,
+  font: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+};
+/* Optional hooks, filled in the GAME-SPECIFIC scene section AFTER your classes are defined. */
+const GAME_HOOKS = { menuButtons: [], scenes: {} };
+/* ##### END CONFIG ##### */
+
+const W = CONFIG.width, H = CONFIG.height;
+const LAND = W > H;   // landscape layout for the shared screens
+
+/* ---------- safe storage (localStorage may throw: private mode, sandboxed iframes) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fallback = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fallback : JSON.parse(raw); }
+      catch { return fallback; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+/* ---------- high scores ---------- */
+const HighScores = {
+  list() {
+    const l = Store.get('highscores', []);
+    return Array.isArray(l) ? l.filter((e) => e && Number.isFinite(e.score)) : [];
+  },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  better(a, b) { return CONFIG.lowerIsBetter ? a < b : a > b; },
+  /** Adds a score. Returns { rank (1-based or 0 if not ranked), isBest }. */
+  add(score) {
+    if (!Number.isFinite(score) || (!CONFIG.lowerIsBetter && score <= 0)) return { rank: 0, isBest: false };
+    const prevBest = this.list()[0];
+    const entry = { score, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list();
+    l.push(entry);
+    l.sort((a, b) => (CONFIG.lowerIsBetter ? a.score - b.score : b.score - a.score) || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    const isBest = rank === 1 && (!prevBest || this.better(score, prevBest.score));
+    return { rank, isBest };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* ---------- sound (WebAudio synth: no asset files needed) ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'move': this.tone(300, 0.04, 'sine', 0.06); break;
+      case 'score': this.tone(880, 0.07, 'triangle', 0.12, 1320); break;
+      case 'merge': this.tone(520, 0.09, 'sine', 0.12, 780); break;
+      case 'hit': this.tone(180, 0.08, 'square', 0.08); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.14, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- tweens (driven by app.ticker; promise-based; safe on destroyed targets) ---------- */
+const Ease = {
+  linear: (t) => t,
+  outQuad: (t) => 1 - (1 - t) * (1 - t),
+  outCubic: (t) => 1 - Math.pow(1 - t, 3),
+  inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  outBack: (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const Tween = {
+  active: new Set(),
+  /** props: numeric fields of target; 'scale' sets scale.x and scale.y together. */
+  to(target, props, ms = 200, ease = Ease.outCubic) {
+    return new Promise((resolve) => {
+      const from = {};
+      for (const k of Object.keys(props)) from[k] = k === 'scale' ? target.scale.x : target[k];
+      const tw = { target, props, from, ms: Math.max(1, ms), t: 0, ease, resolve };
+      this.active.add(tw);
+    });
+  },
+  apply(tw, p) {
+    const e = tw.ease(p);
+    for (const k of Object.keys(tw.props)) {
+      const v = tw.from[k] + (tw.props[k] - tw.from[k]) * e;
+      if (k === 'scale') tw.target.scale.set(v); else tw.target[k] = v;
+    }
+  },
+  update(dtMs) {
+    for (const tw of [...this.active]) {
+      if (tw.target.destroyed) { this.active.delete(tw); tw.resolve(); continue; }
+      tw.t += dtMs;
+      const p = Math.min(1, tw.t / tw.ms);
+      this.apply(tw, p);
+      if (p >= 1) { this.active.delete(tw); tw.resolve(); }
+    }
+  },
+  /** Jump every running tween (optionally only one target's) to its end state. */
+  finish(target = null) {
+    for (const tw of [...this.active]) {
+      if (target && tw.target !== target) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  /** Scale up to `peak` and back (merge/score pop). */
+  pop(target, peak = 1.15, ms = 140) {
+    const base = target.scale.x;
+    return this.to(target, { scale: base * peak }, ms, (t) => Math.sin(Math.PI * t));   // up and back in one tween; finishing lands on base
+  },
+  /** Finish only tweens whose target is `container` or inside it (e.g. this.board). Prefer this over finish(). */
+  finishWithin(container) {
+    for (const tw of [...this.active]) {
+      let n = tw.target, inside = false;
+      while (n) { if (n === container) { inside = true; break; } n = n.parent; }
+      if (!inside && !tw.target.destroyed) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  kill(target) { for (const tw of [...this.active]) if (tw.target === target) { this.active.delete(tw); tw.resolve(); } },
+  get busy() { return this.active.size > 0; },
+};
+
+/* ---------- UI helpers ---------- */
+function makeText(text, size = 32, color = THEME.text, weight = '600', extra = {}) {
+  const t = new Text({ text: String(text), style: { fontFamily: THEME.font, fontSize: size, fill: color, fontWeight: weight, align: 'center', ...extra } });
+  t.anchor.set(0.5);
+  return t;
+}
+/** Shrink a Text uniformly so it fits maxW (and optional maxH). Call after setting .text. */
+function fitText(t, maxW, maxH = Infinity) {
+  t.scale.set(1);
+  const s = Math.min(1, maxW / Math.max(1, t.width), maxH / Math.max(1, t.height));
+  t.scale.set(s);
+  return t;
+}
+function makePanel(w, h, color = THEME.panel, radius = 24, alpha = 1) {
+  const g = new Graphics();
+  g.roundRect(-w / 2, -h / 2, w, h, radius).fill({ color, alpha });
+  return g;
+}
+function makeButton(label, onTap, opts = {}) {
+  const { w = 360, h = 88, size = 34, variant = 'primary' } = opts;
+  const base = variant === 'primary' ? THEME.primary : variant === 'danger' ? THEME.danger : THEME.secondary;
+  const hover = variant === 'primary' ? THEME.primaryHover : variant === 'danger' ? 0xff7a93 : THEME.secondaryHover;
+  const c = new Container();
+  c.isButton = true;
+  c.label = 'button:' + label;
+  const bg = new Graphics();
+  const draw = (col) => { bg.clear(); bg.roundRect(-w / 2, -h / 2, w, h, Math.min(28, h / 2)).fill(col); };
+  draw(base);
+  const t = makeText(label, size, THEME.text, '700');
+  c.addChild(bg, t);
+  c.eventMode = 'static';
+  c.cursor = 'pointer';
+  c.hitArea = new Rectangle(-w / 2, -h / 2, w, h);
+  c.on('pointerover', () => { draw(hover); c.scale.set(1.03); });
+  c.on('pointerout', () => { draw(base); c.scale.set(1); });
+  c.on('pointerdown', () => c.scale.set(0.96));
+  c.on('pointerup', () => c.scale.set(1.03));
+  c.on('pointerupoutside', () => { draw(base); c.scale.set(1); });
+  c.on('pointertap', (e) => {
+    e.stopPropagation();
+    if (Scenes.busy || c.disabled) return;
+    Sfx.unlock(); Sfx.play('click');
+    onTap(e);
+  });
+  c.setText = (s) => { t.text = String(s); c.btnText = String(s); };
+  c.btnText = label;
+  return c;
+}
+/** Vertical stack of buttons centered at (x, y). */
+function buttonColumn(defs, x, y, gap = 24, opts = {}) {
+  const col = new Container();
+  const h = opts.h || 88;
+  defs.forEach(([label, fn, o], i) => {
+    const b = makeButton(label, fn, { ...opts, ...(o || {}) });
+    b.position.set(0, i * (h + gap));
+    col.addChild(b);
+  });
+  col.position.set(x, y);
+  return col;
+}
+
+/* ---------- input: keyboard + swipe + actions ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'action', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();                       // stop arrows/space scrolling the page
+      Sfx.unlock();
+      const wasHeld = this.held.has(a);
+      this.held.add(a);
+      if (e.repeat && !CONFIG.keyRepeat) return;
+      if (wasHeld && !e.repeat) return;
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+  },
+  isDown(a) { return this.held.has(a); },
+};
+/** Swipe detection on the whole screen (stage hitArea = app.screen). */
+function initSwipe(app, root) {
+  let start = null;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointerdown', (e) => {
+    Sfx.unlock(); start = { x: e.global.x, y: e.global.y, t: performance.now() };
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+    const p = root.toLocal(e.global);
+    Scenes.dispatch('press', 'pointer', { x: p.x, y: p.y });   // instant: use for flap/jump/shoot games
+  });
+  const end = (e) => {
+    if (!start) return;
+    const dx = (e.global.x - start.x) / root.scale.x, dy = (e.global.y - start.y) / root.scale.y;
+    const dt = performance.now() - start.t;
+    start = null;
+    const dist = Math.hypot(dx, dy);
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }   // presses on buttons are not game input
+    if (dist < 25 && dt < 500) {               // a tap anywhere: 'tap' action with design-space position
+      const p = root.toLocal(e.global);
+      Scenes.dispatch('tap', 'pointer', { x: p.x, y: p.y });
+      return;
+    }
+    if (dist < 40 || dt > 1000) return;         // design-space pixels; ignore slow drags
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    Scenes.dispatch(dir, 'swipe');
+  };
+  app.stage.on('pointerup', end);
+  app.stage.on('pointerupoutside', end);
+}
+
+/* ---------- scenes ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.view = new Container(); this.view.label = 'scene:' + name; }
+  enter(_data) {}
+  exit() {}
+  update(_dtMs) {}
+  onAction(_action, _source, _pos) {}
+  onHidden() {}
+}
+const Scenes = {
+  app: null, root: null, current: null, busy: false, registry: {},
+  register(name, cls) { this.registry[name] = cls; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const old = this.current;
+      if (old) {
+        await Tween.to(old.view, { alpha: 0 }, 140);
+        old.exit();
+        Tween.kill(old.view);
+        this.root.removeChild(old.view);
+        old.view.destroy({ children: true });
+      }
+      const Cls = this.registry[name];
+      const scene = new Cls(name);
+      this.current = scene;
+      scene.view.alpha = 0;
+      this.root.addChild(scene.view);
+      scene.enter(data);
+      await Tween.to(scene.view, { alpha: 1 }, 160);
+    } finally {
+      this.busy = false;
+    }
+  },
+  inputStats: {},
+  dispatch(action, source, pos = null) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, pos);
+  },
+};
+
+/* ---------- shared background ---------- */
+function makeBackground() {
+  const g = new Graphics();
+  g.rect(0, 0, W, H).fill(THEME.bg);
+  return g;
+}
+function soundLabel() { return Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+
+/* ---------- Menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    // Portrait: one centered column. Landscape (W > H): text on the left, buttons on the right.
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const ty = LAND ? H * 0.34 : H * 0.24;
+    const title = makeText(CONFIG.title, 96, THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, ty);
+    const sub = makeText(CONFIG.subtitle, 30, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: textW - 40 });
+    fitText(sub, textW - 40, 80);
+    sub.position.set(cx, ty + 90);
+    const best = HighScores.best();
+    const bestT = makeText(best ? `Best: ${formatScore(best)}` : 'No high score yet', 32, THEME.accent, '700');
+    bestT.position.set(cx, ty + 160);
+    const defs = [
+      ['Play', () => Scenes.go('game')],
+      ...GAME_HOOKS.menuButtons.map(([label, fn]) => [label, fn, { variant: 'secondary' }]),
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      [soundLabel(), () => { Sfx.setMuted(!Sfx.muted); this.onMuteChanged(); }, { variant: 'secondary' }],
+    ];
+    const bh = defs.length > 4 ? 76 : 88, gap = defs.length > 4 ? 18 : 24;
+    const colH = defs.length * bh + (defs.length - 1) * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.min(H * 0.55, H - 150 - colH + bh / 2);
+    const col = buttonColumn(defs, LAND ? W * 0.72 : W / 2, colTop, gap, { h: bh });
+    this.soundBtn = col.children[col.children.length - 1];
+    const hint = makeText('Enter to play  ·  M to mute', 24, THEME.textDim, '500');
+    hint.position.set(cx, H - 60);
+    this.view.addChild(title, sub, bestT, col, hint);
+  }
+  onMuteChanged() { this.soundBtn?.setText(soundLabel()); }
+  onAction(a) { if (a === 'confirm' || a === 'action') Scenes.go('game'); }
+}
+
+/* ---------- High scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const top = LAND ? 70 : 150;
+    const title = makeText('High Scores', LAND ? 60 : 72, THEME.text, '800');
+    title.position.set(W / 2, top);
+    const rowH = LAND ? 52 : 64;
+    const panelTop = top + (LAND ? 60 : 100);
+    const room = Math.floor((H - panelTop - 200) / rowH);             // rows that fit above the Back button
+    const rows = Math.max(3, Math.min(CONFIG.maxHighScores, room));
+    const panelW = LAND ? Math.min(W - 120, 760) : W - 120;
+    const panelH = 60 + rows * rowH;
+    const panel = makePanel(panelW, panelH);
+    panel.position.set(W / 2, panelTop + panelH / 2);
+    this.view.addChild(title, panel);
+    const list = HighScores.list().slice(0, rows);
+    if (!list.length) {
+      const none = makeText('No scores yet. Go play!', 34, THEME.textDim, '500');
+      none.position.set(W / 2, panelTop + panelH / 2);
+      this.view.addChild(none);
+    }
+    const left = W / 2 - panelW / 2 + 50, right = W / 2 + panelW / 2 - 50;
+    list.forEach((e, i) => {
+      const y = panelTop + 30 + rowH / 2 + i * rowH;
+      const color = i === 0 ? THEME.accent : THEME.text;
+      const r = makeText(`${i + 1}.`, 32, color, '700'); r.anchor.set(0, 0.5); r.position.set(left, y);
+      const sc = makeText(formatScore(e.score), 32, color, '700'); sc.position.set(W / 2, y);
+      const d = makeText(e.date || '', 22, THEME.textDim, '500'); d.anchor.set(1, 0.5); d.position.set(right, y);
+      this.view.addChild(r, sc, d);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, Math.min(H - 70, panelTop + panelH + 90));
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- Game over ---------- */
+class GameOverScene extends Scene {
+  /** data: { score, rank, isBest, won, extraLine? } — extraLine comes from GameScene.gameOverData() (e.g. "Gold medal"). */
+  enter({ score = 0, rank = 0, isBest = false, won = false, extraLine = '' } = {}) {
+    this.score = score;
+    this.enteredAt = performance.now();
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const y0 = LAND ? H * 0.2 : H * 0.2;
+    const title = makeText(won ? 'You Win!' : 'Game Over', 92, won ? THEME.accent : THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, y0);
+    const label = makeText(CONFIG.scoreLabel, 30, THEME.textDim, '600');
+    label.position.set(cx, y0 + 100);
+    const sc = makeText(formatScore(score), 110, THEME.text, '800');
+    fitText(sc, textW);
+    sc.position.set(cx, y0 + 185);
+    const bestLine = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${formatScore(HighScores.best())}`;
+    const b = makeText(bestLine, 36, isBest ? THEME.accent : THEME.textDim, '700');
+    b.position.set(cx, y0 + 275);
+    this.view.addChild(title, label, sc, b);
+    if (extraLine) {
+      const ex = makeText(extraLine, 30, THEME.text, '600', { wordWrap: true, wordWrapWidth: textW });
+      fitText(ex, textW, 80);
+      ex.position.set(cx, y0 + 330);
+      this.view.addChild(ex);
+    }
+    const bh = 88, gap = 24, colH = 3 * bh + 2 * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.max(y0 + (extraLine ? 420 : 370), H - 140 - colH + bh / 2);
+    const col = buttonColumn([
+      ['Play Again', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], LAND ? W * 0.72 : W / 2, colTop, gap);
+    this.view.addChild(col);
+    if (isBest) { b.scale.set(0.2); Tween.to(b, { scale: 1 }, 450, Ease.outBack); }
+  }
+  onAction(a) {
+    if (performance.now() - this.enteredAt < 800) return;   // grace period: a late Space/tap from the game must not skip this screen
+    if (a === 'confirm' || a === 'restart') Scenes.go('game'); else if (a === 'pause') Scenes.go('menu');
+  }
+}
+
+/* ---------- Game scene: framework part (HUD, pause, end) ---------- */
+class GameSceneBase extends Scene {
+  enter() {
+    this.score = 0;
+    this.state = 'playing';              // 'playing' | 'paused' | 'over'
+    this.board = new Container();        // put all game visuals in here
+    this.board.label = 'board';
+    this.hud = new Container();
+    this.overlay = null;
+    this.view.addChild(this.board, this.hud);
+    this.buildHud();
+    this.initGame();
+    this.renderScore();
+  }
+  buildHud() {
+    const scoreBox = makePanel(220, 96, THEME.panel, 18); scoreBox.position.set(150, 80);
+    const bestBox = makePanel(220, 96, THEME.panel, 18); bestBox.position.set(390, 80);
+    const sl = makeText(CONFIG.scoreLabel.toUpperCase(), 20, THEME.textDim, '700'); sl.position.set(150, 56);
+    const bl = makeText('BEST', 20, THEME.textDim, '700'); bl.position.set(390, 56);
+    this.scoreText = makeText('0', 40, THEME.text, '800'); this.scoreText.position.set(150, 96);
+    this.bestText = makeText(formatScore(HighScores.best()), 40, THEME.text, '800'); this.bestText.position.set(390, 96);
+    const pause = makeButton('II', () => this.togglePause(), { w: 96, h: 96, size: 34, variant: 'secondary' });
+    pause.label = 'button:Pause';
+    pause.position.set(W - 90, 80);
+    this.hud.addChild(scoreBox, bestBox, sl, bl, this.scoreText, this.bestText, pause);
+  }
+  addScore(n) {
+    if (this.state === 'over') return;
+    this.score += n;
+    this.renderScore();
+  }
+  setScore(n) { this.score = n; this.renderScore(); }
+  renderScore() {
+    this.scoreText.text = formatScore(this.score);
+    const best = HighScores.best();
+    const shown = CONFIG.lowerIsBetter ? best : Math.max(best, this.score);
+    this.bestText.text = formatScore(shown);
+  }
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedOverlay = this.overlay;               // keep e.g. a win overlay underneath; restored on resume
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => this.restart(), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ]);
+  }
+  resume() {
+    this.hideOverlay();
+    if (this.savedOverlay && !this.savedOverlay.destroyed) { this.savedOverlay.visible = true; this.overlay = this.savedOverlay; }
+    this.savedOverlay = null;
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  showOverlay(title, buttons, subtitle = '') {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.6 });
+    dim.eventMode = 'static';                         // swallow clicks to the game underneath
+    dim.on('pointertap', (e) => e.stopPropagation());
+    const panelH = 218 + buttons.length * 112 + (subtitle ? 40 : 0);
+    const panel = makePanel(W - 140, panelH); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 64, THEME.text, '800'); fitText(t, W - 220); t.position.set(W / 2, H / 2 - panelH / 2 + 90);
+    o.addChild(dim, panel, t);
+    if (subtitle) { const s = makeText(subtitle, 28, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 220 }); s.position.set(W / 2, t.y + 70); o.addChild(s); }
+    const col = buttonColumn(buttons, W / 2, t.y + (subtitle ? 180 : 140));
+    o.addChild(col);
+    this.overlay = o;
+    this.view.addChild(o);
+  }
+  hideOverlay() { if (this.overlay) { this.overlay.destroy({ children: true }); this.overlay = null; } }
+  hideAllOverlays() { this.hideOverlay(); if (this.savedOverlay) { this.savedOverlay.destroy({ children: true }); this.savedOverlay = null; } }
+  /** Call exactly when the game ends. Idempotent. */
+  endGame({ won = false, delay = 500 } = {}) {
+    if (this.state === 'over') return;
+    this.state = 'over';
+    this.hideAllOverlays();
+    Sfx.play(won ? 'win' : 'lose');
+    const { rank, isBest } = HighScores.add(this.score);
+    const score = this.score;
+    const extra = this.gameOverData?.() || {};      // optional: return { extraLine: 'Gold medal' }
+    wait(delay).then(() => { if (Scenes.current === this) Scenes.go('gameover', { score, rank, isBest, won, ...extra }); });
+  }
+  onAction(a, source, pos) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.overlay) return;                       // game-specific overlay (e.g. win) is showing: only its buttons act
+    if (a === 'restart' && this.state === 'playing') return this.restart();
+    if (this.state !== 'playing') return;
+    this.handleInput(a, source, pos);
+  }
+  update(dtMs) {
+    if (this.state !== 'paused' && this.timers?.length) {          // this.later() timers: frozen while paused, dropped with the scene
+      for (const t of [...this.timers]) { t.left -= dtMs; if (t.left <= 0) { this.timers.splice(this.timers.indexOf(t), 1); t.fn(); } }
+    }
+    if (this.state === 'playing') this.tick(dtMs);
+  }
+  /** Run fn after ms of game time. Paused time doesn't count; cancelled if the scene is left. Use for result panels, delayed spawns, AI turns. */
+  later(ms, fn) { (this.timers ||= []).push({ left: ms, fn }); }
+  /** R key and Pause→Restart. Default: fresh game. Level-based games override to replay the CURRENT level (keep run score as it was at level start). */
+  restart() { Scenes.go('game'); }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+  exit() { this.cleanup?.(); }
+  /** Override in GameScene to also expose game data, e.g. { ...super.debugState(), grid: this.grid } (verify.py and play-tests read it). */
+  debugState() { return { state: this.state, score: this.score }; }
+}
+
+/* ---------- timing helper: resolves after ms of ticker time ---------- */
+function wait(ms) {
+  return new Promise((resolve) => {
+    let t = 0;
+    const fn = (ticker) => { t += ticker.deltaMS; if (t >= ms) { Scenes.app.ticker.remove(fn); resolve(); } };
+    Scenes.app.ticker.add(fn);
+  });
+}
+
+/* ##### GAME-SPECIFIC: formatting ##### */
+function formatScore(n) { return String(Math.round(n)); }
+
+/* ##### GAME-SPECIFIC: pure game logic (NO Pixi here; unit-tested below) ##### */
+/* RULE DECISIONS (where the spec is silent; chosen to match Dunk Balls as closely as possible)
+   - Dispenser: first ball leaves the instant "Drop" is pressed, then one every 700 ms. Drop works once per attempt.
+     Balls leave the chute with no velocity (+/-1 px seeded jitter so stacked balls do not balance perfectly).
+   - Dunk: ball centre inside the basket cavity (between the inner wall faces, below the rim, above the floor)
+     AND speed < 1.2 px/step (72 px/s) continuously for 300 ms. A dunk is final: the ball drops through the net
+     (it is removed from the physics world), so it can never be counted twice or knocked back out.
+   - Lost: ball centre leaves the screen left/right/bottom (balls batted above the top may fall back in),
+     OR a ball rests outside the basket for 5 s on scenery (not while touching a paddle: the player may be holding it), OR a ball lives 45 s (safety net).
+   - Paddles are kinematic static bodies that follow the drag at up to 20 px and 0.15 rad per physics step
+     (1200 px/s; the rest of a faster flick carries over), so they cannot jump past balls; ball speed is capped at
+     24 px/step, so no launches. Paddles stay fully on screen and below the dispenser (y >= 372, leaving room for a ball resting under the chute). They may overlap scenery.
+   - Levels have no side walls: missing the basket usually means the ball falls off the screen.
+   - Score: +100 the moment a ball is dunked; +50 per star when the level succeeds. "Try Again" restores the score
+     the level started with and keeps the player's paddle placement. "End Run" (on the level result panel) or
+     finishing level 12 ends the run and submits the total to the high scores; after a FAILED level, End Run
+     submits the score the level started with (that attempt's dunks don't count). R = Pause->Restart = replay
+     the current level from its start score.
+   - Stars: all N = 3, >= K+1 = 2, >= K = 1 (the higher rule wins when K+1 == N).
+   - Progress: best stars per level are saved; level i+1 unlocks when level i has >= 1 star.
+     Menu "Play" starts the highest unlocked level.
+   - Keyboard: Space = Drop, Enter = select next paddle, Left/Right = move selected paddle, Up/Down = rotate it. */
+const Logic = (() => {
+  const M = () => globalThis.Matter;
+  const STEP_MS = 1000 / 60;
+  const C = {
+    STEP_MS, BALL_R: 22, PADDLE_W: 180, PADDLE_H: 24, HANDLE_R: 18,
+    DROP_INTERVAL: 700, SPAWN_Y: 300, DUNK_HOLD_MS: 300, DUNK_SPEED: 1.2,
+    MAX_BALL_SPEED: 24, PADDLE_MAX_VEL: 20, PADDLE_MAX_ANGVEL: 0.15,
+    STUCK_SPEED: 0.3, STUCK_MS: 5000, BALL_MAX_LIFE_MS: 45000,
+    AREA: { x0: 0, x1: W, y0: 250, y1: H }, PADDLE_MIN_Y: 372,   // paddles stay below the spawn zone, with room for a resting ball under the chute
+    BASKET_INNER_W: 150, BASKET_WALL_H: 120, BASKET_WALL: 20, PEG_R: 12,
+  };
+
+  function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  const wrapAngle = (a) => { while (a > Math.PI) a -= 2 * Math.PI; while (a <= -Math.PI) a += 2 * Math.PI; return a; };
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  /* ---------- LEVELS (data). basket: {x: centre, y: top of floor}. angle in radians (clockwise on screen). ---------- */
+  const LEVELS = [
+    {"name":"First Dunk","N":5,"K":3,"drop":{"x":160},"basket":{"x":540,"y":1150},"paddles":[{"x":400,"y":640,"angle":0}],"solution":[{"x":191,"y":938,"angle":0.62}]},
+    {"name":"Other Side","N":5,"K":3,"drop":{"x":560},"basket":{"x":170,"y":1040},"paddles":[{"x":330,"y":760,"angle":0}],"solution":[{"x":560,"y":528,"angle":-0.67}]},
+    {"name":"The Wall","N":5,"K":3,"drop":{"x":150},"basket":{"x":570,"y":1180},"paddles":[{"x":400,"y":560,"angle":0}],"walls":[{"x":390,"y":1060,"w":30,"h":440,"angle":0}],"solution":[{"x":176,"y":458,"angle":0.44}]},
+    {"name":"Zig Zag","N":5,"K":3,"drop":{"x":600},"basket":{"x":450,"y":1190},"paddles":[{"x":200,"y":460,"angle":0},{"x":200,"y":1100,"angle":0}],"walls":[{"x":510,"y":720,"w":420,"h":30,"angle":0}],"solution":[{"x":559,"y":449,"angle":-0.46},{"x":172,"y":791,"angle":0.6}]},
+    {"name":"Peg Field","N":6,"K":4,"drop":{"x":360},"basket":{"x":170,"y":1160},"paddles":[{"x":560,"y":1100,"angle":0}],"pegs":[{"x":240,"y":640},{"x":360,"y":640},{"x":480,"y":640},{"x":300,"y":740},{"x":420,"y":740},{"x":180,"y":740},{"x":540,"y":740},{"x":240,"y":840},{"x":360,"y":840},{"x":480,"y":840}],"solution":[{"x":322,"y":576,"angle":-0.1}]},
+    {"name":"Pinball Lane","N":6,"K":4,"drop":{"x":140},"basket":{"x":560,"y":1180},"paddles":[{"x":400,"y":420,"angle":0},{"x":250,"y":1000,"angle":0}],"pegs":[{"x":420,"y":760},{"x":480,"y":820},{"x":540,"y":880},{"x":600,"y":940},{"x":660,"y":1000}],"walls":[{"x":280,"y":760,"w":30,"h":260,"angle":0}],"solution":[{"x":103,"y":521,"angle":0.5},{"x":427,"y":1052,"angle":0.44}]},
+    {"name":"Ramps","N":6,"K":4,"drop":{"x":560},"basket":{"x":150,"y":1190},"paddles":[{"x":360,"y":1160,"angle":0}],"walls":[{"x":470,"y":600,"w":300,"h":24,"angle":-0.35},{"x":420,"y":820,"w":300,"h":24,"angle":0.35}],"solution":[{"x":459,"y":443,"angle":0.76}]},
+    {"name":"Boing","N":6,"K":4,"drop":{"x":360},"basket":{"x":580,"y":760},"paddles":[{"x":200,"y":1100,"angle":0}],"bumpers":[{"x":360,"y":1000,"r":40}],"walls":[{"x":430,"y":900,"w":24,"h":400,"angle":0}],"solution":[{"x":270,"y":587,"angle":0.06}]},
+    {"name":"Bumper Alley","N":7,"K":5,"drop":{"x":140},"basket":{"x":360,"y":1190},"paddles":[{"x":560,"y":420,"angle":0}],"bumpers":[{"x":140,"y":820,"r":36},{"x":600,"y":820,"r":36}],"walls":[{"x":360,"y":760,"w":200,"h":24,"angle":0}],"solution":[{"x":193,"y":588,"angle":0.41}]},
+    {"name":"Gauntlet","N":7,"K":5,"drop":{"x":600},"basket":{"x":130,"y":1190},"paddles":[{"x":400,"y":440,"angle":0},{"x":400,"y":1180,"angle":0}],"bumpers":[{"x":340,"y":820,"r":34}],"pegs":[{"x":180,"y":700},{"x":240,"y":760},{"x":120,"y":760},{"x":180,"y":820}],"walls":[{"x":620,"y":1000,"w":24,"h":300,"angle":0}],"solution":[{"x":467,"y":1066,"angle":-0.66},{"x":577,"y":660,"angle":-0.47}]},
+    {"name":"Low Ceiling","N":8,"K":5,"drop":{"x":150},"basket":{"x":560,"y":1190},"paddles":[{"x":400,"y":420,"angle":0},{"x":360,"y":1160,"angle":0}],"bumpers":[{"x":150,"y":700,"r":36}],"walls":[{"x":590,"y":920,"w":260,"h":24,"angle":0}],"pegs":[{"x":620,"y":560},{"x":680,"y":640}],"solution":[{"x":200,"y":573,"angle":0.82},{"x":363,"y":1017,"angle":0.66}]},
+    {"name":"Grand Final","N":8,"K":6,"drop":{"x":360},"basket":{"x":270,"y":1190},"paddles":[{"x":130,"y":400,"angle":0},{"x":600,"y":640,"angle":0},{"x":620,"y":1190,"angle":0}],"bumpers":[{"x":360,"y":600,"r":34}],"pegs":[{"x":200,"y":640},{"x":520,"y":480},{"x":650,"y":880}],"walls":[{"x":270,"y":880,"w":460,"h":24,"angle":0}],"solution":[{"x":330,"y":470,"angle":0.35},{"x":600,"y":1060,"angle":-0.45},{"x":620,"y":1190,"angle":0}]},
+  ];
+
+  /* ---------- geometry helpers (pure) ---------- */
+  function basketGeom(b) {
+    const iw = C.BASKET_INNER_W, wh = C.BASKET_WALL_H, t = C.BASKET_WALL;
+    return {
+      inner: { x0: b.x - iw / 2, x1: b.x + iw / 2, y0: b.y - wh, y1: b.y },
+      walls: [
+        { x: b.x - iw / 2 - t / 2, y: b.y - wh / 2 + t / 2, w: t, h: wh + t, angle: 0 },
+        { x: b.x + iw / 2 + t / 2, y: b.y - wh / 2 + t / 2, w: t, h: wh + t, angle: 0 },
+        { x: b.x, y: b.y + t / 2, w: iw + 2 * t, h: t, angle: 0 },
+      ],
+    };
+  }
+  function rectExtents(w, h, a) {
+    const c = Math.abs(Math.cos(a)), s = Math.abs(Math.sin(a));
+    return { ex: c * w / 2 + s * h / 2, ey: s * w / 2 + c * h / 2 };
+  }
+  /** Keep a paddle pose fully on screen and below the HUD. Returns a new pose. */
+  function clampPaddle(p) {
+    const angle = wrapAngle(Number.isFinite(p.angle) ? p.angle : 0);
+    const { ex, ey } = rectExtents(C.PADDLE_W, C.PADDLE_H, angle);
+    const x = clamp(Number.isFinite(p.x) ? p.x : W / 2, C.AREA.x0 + ex, C.AREA.x1 - ex);
+    const y = clamp(Number.isFinite(p.y) ? p.y : H / 2, C.PADDLE_MIN_Y + ey, C.AREA.y1 - ey);
+    return { x, y, angle };
+  }
+  function handlePos(p) { return { x: p.x + Math.cos(p.angle) * C.PADDLE_W / 2, y: p.y + Math.sin(p.angle) * C.PADDLE_W / 2 }; }
+  /** What part of a paddle a pointer at pt grabs: 'handle', 'body' or null (touch-friendly margins). */
+  function hitPaddle(p, pt) {
+    const hp = handlePos(p);
+    if (Math.hypot(pt.x - hp.x, pt.y - hp.y) <= 40) return 'handle';
+    const dx = pt.x - p.x, dy = pt.y - p.y, c = Math.cos(-p.angle), s = Math.sin(-p.angle);
+    const lx = dx * c - dy * s, ly = dx * s + dy * c;
+    if (Math.abs(lx) <= C.PADDLE_W / 2 + 8 && Math.abs(ly) <= C.PADDLE_H / 2 + 24) return 'body';
+    return null;
+  }
+  /** Distance from point to an (optionally rotated) rectangle; 0 inside. */
+  function distToRect(pt, r) {
+    const dx = pt.x - r.x, dy = pt.y - r.y, c = Math.cos(-(r.angle || 0)), s = Math.sin(-(r.angle || 0));
+    const lx = dx * c - dy * s, ly = dx * s + dy * c;
+    const qx = Math.max(Math.abs(lx) - r.w / 2, 0), qy = Math.max(Math.abs(ly) - r.h / 2, 0);
+    return Math.hypot(qx, qy);
+  }
+  function staticObstacles(level) {
+    const g = basketGeom(level.basket);
+    return {
+      rects: [...g.walls, ...(level.walls || [])],
+      circles: [...(level.pegs || []).map((p) => ({ x: p.x, y: p.y, r: p.r || C.PEG_R })), ...(level.bumpers || []).map((b) => ({ x: b.x, y: b.y, r: b.r }))],
+    };
+  }
+  /** Flood fill over ball-centre positions from the chute: can a ball reach the basket cavity at all (ignoring paddles)? */
+  function basketReachable(level, cell = 10) {
+    const obs = staticObstacles(level), R = C.BALL_R - 1;
+    const free = (x, y) => {
+      if (x < R || x > W - R || y < C.AREA.y0 - 60 || y > H - R) return false;
+      for (const r of obs.rects) if (distToRect({ x, y }, r) < R) return false;
+      for (const c of obs.circles) if (Math.hypot(x - c.x, y - c.y) < R + c.r) return false;
+      return true;
+    };
+    const inner = basketGeom(level.basket).inner;
+    const cols = Math.floor(W / cell), rows = Math.floor(H / cell);
+    const seen = new Uint8Array(cols * rows);
+    const sc = Math.round(level.drop.x / cell), sr = Math.round(C.SPAWN_Y / cell);
+    if (!free(sc * cell, sr * cell)) return false;
+    const q = [sr * cols + sc]; seen[q[0]] = 1;
+    while (q.length) {
+      const k = q.pop(), c = k % cols, r = (k - c) / cols, x = c * cell, y = r * cell;
+      if (x > inner.x0 + R && x < inner.x1 - R && y > inner.y0 && y < inner.y1 - R + 2) return true;
+      for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nc = c + dc, nr = r + dr;
+        if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
+        const nk = nr * cols + nc;
+        if (seen[nk] || !free(nc * cell, nr * cell)) continue;
+        seen[nk] = 1; q.push(nk);
+      }
+    }
+    return false;
+  }
+  function samePose(a, b, eps = 0.5) { return Math.abs(a.x - b.x) < eps && Math.abs(a.y - b.y) < eps && Math.abs(wrapAngle(a.angle - b.angle)) < 0.01; }
+  /** Structural problems with a level (empty list = OK). */
+  function validateLevel(level) {
+    const out = [];
+    if (!(level.N >= 1 && level.K >= 1 && level.K <= level.N)) out.push('bad N/K');
+    if (!level.paddles || !level.paddles.length) out.push('no paddles');
+    for (const set of ['paddles', 'solution']) {
+      (level[set] || []).forEach((p, i) => { if (!samePose(clampPaddle(p), p)) out.push(`${set}[${i}] does not fit on screen`); });
+    }
+    if ((level.solution || []).length !== (level.paddles || []).length) out.push('solution/paddle count mismatch');
+    const g = basketGeom(level.basket);
+    const bx0 = g.walls[0].x - C.BASKET_WALL / 2, bx1 = g.walls[1].x + C.BASKET_WALL / 2;
+    if (bx0 < 0 || bx1 > W || g.inner.y0 < C.AREA.y0 || level.basket.y + C.BASKET_WALL > H) out.push('basket off screen');
+    if (!(level.drop.x >= 60 && level.drop.x <= W - 60)) out.push('dispenser off screen');
+    if (!basketReachable(level)) out.push('basket enclosed / unreachable');
+    return out;
+  }
+
+  /* ---------- pure rule helpers ---------- */
+  /** Advance one ball's dunk timer. Pure. Returns { holdMs, dunk }. */
+  function updateDunk(holdMs, pos, speed, inner, dtMs) {
+    const inside = pos.x > inner.x0 && pos.x < inner.x1 && pos.y > inner.y0 && pos.y < inner.y1;
+    if (!inside || !(speed < C.DUNK_SPEED)) return { holdMs: 0, dunk: false };
+    const h = holdMs + dtMs;
+    return { holdMs: h, dunk: h >= C.DUNK_HOLD_MS - 1e-6 };
+  }
+  function starsFor(dunked, N, K) { return dunked >= N ? 3 : dunked >= K + 1 ? 2 : dunked >= K ? 1 : 0; }
+  function levelPoints(dunked, stars) { return dunked * 100 + stars * 50; }
+  function isOffScreen(p) { const m = C.BALL_R * 2; return p.x < -m || p.x > W + m || p.y > H + m || p.y < -800; }
+
+  /* ---------- progress (pure) ---------- */
+  function normalizeProgress(raw) {
+    const a = Array.isArray(raw) ? raw : [];
+    return LEVELS.map((_, i) => { const v = Math.round(Number(a[i])); return Number.isFinite(v) ? clamp(v, 0, 3) : 0; });
+  }
+  function isUnlocked(stars, i) { return i === 0 || (i > 0 && i < LEVELS.length && stars[i - 1] > 0); }
+  function highestUnlocked(stars) { let h = 0; for (let i = 0; i < LEVELS.length; i++) if (isUnlocked(stars, i)) h = i; return h; }
+  function recordStars(stars, i, s) { const out = stars.slice(); out[i] = Math.max(out[i] || 0, s); return out; }
+
+  /* ---------- physics world (matter.js; no Pixi) ---------- */
+  function createSim(level, opts = {}) {
+    const { Engine, Bodies, Composite, Events } = M();
+    const rng = opts.rng || Math.random;
+    const engine = Engine.create({ positionIterations: 10, velocityIterations: 8, enableSleeping: false });
+    engine.gravity.x = 0; engine.gravity.y = 1;
+    const geom = basketGeom(level.basket);
+    const statics = [];
+    for (const r of geom.walls) statics.push(Bodies.rectangle(r.x, r.y, r.w, r.h, { isStatic: true, label: 'basket', friction: 0.05, chamfer: { radius: 4 } }));
+    for (const r of level.walls || []) statics.push(Bodies.rectangle(r.x, r.y, r.w, r.h, { isStatic: true, angle: r.angle || 0, label: 'wall', friction: 0.02 }));
+    for (const p of level.pegs || []) statics.push(Bodies.circle(p.x, p.y, p.r || C.PEG_R, { isStatic: true, label: 'peg', restitution: 0.4, friction: 0.01 }));
+    for (const b of level.bumpers || []) statics.push(Bodies.circle(b.x, b.y, b.r, { isStatic: true, label: 'bumper', restitution: 1.25, friction: 0 }));
+    const poses = (opts.paddles || level.paddles).map(clampPaddle);
+    const paddles = poses.map((p) => ({
+      pose: { ...p }, target: { ...p },
+      body: Bodies.rectangle(p.x, p.y, C.PADDLE_W, C.PADDLE_H, { isStatic: true, angle: p.angle, label: 'paddle', friction: 0.02, chamfer: { radius: 10 } }),
+    }));
+    Composite.add(engine.world, [...statics, ...paddles.map((p) => p.body)]);
+    const sim = { engine, level, rng, geom, paddles, balls: [], nextId: 1, released: 0, dropping: false, dropTimer: 0,
+      timeMs: 0, acc: 0, dunked: 0, lost: 0, _hits: 0, _bumps: 0 };
+    Events.on(engine, 'collisionStart', (e) => {
+      for (const pr of e.pairs) {
+        const a = pr.bodyA.parent.label, b = pr.bodyB.parent.label;
+        if (a === 'ball' || b === 'ball') { const o = a === 'ball' ? b : a; if (o === 'paddle') sim._hits++; else if (o === 'bumper') sim._bumps++; }
+      }
+    });
+    return sim;
+  }
+  function addBall(sim, x, y, vel = null) {
+    const { Bodies, Composite, Body } = M();
+    const body = Bodies.circle(x, y, C.BALL_R, { label: 'ball', restitution: 0.5, friction: 0.02, frictionStatic: 0.2, frictionAir: 0.004, density: 0.001 });
+    Composite.add(sim.engine.world, body);
+    if (vel) Body.setVelocity(body, vel);
+    const ball = { id: sim.nextId++, body, state: 'live', holdMs: 0, stillMs: 0, lifeMs: 0, x, y, angle: 0 };
+    sim.balls.push(ball);
+    return ball;
+  }
+  function startDrop(sim) {
+    if (sim.dropping || sim.released > 0) return false;
+    sim.dropping = true; sim.dropTimer = 0;
+    return true;
+  }
+  function setPaddle(sim, i, pose) {
+    const p = sim.paddles[i]; if (!p) return null;
+    p.target = clampPaddle(pose);
+    return { ...p.target };
+  }
+  function removeBall(sim, ball, state) {
+    M().Composite.remove(sim.engine.world, ball.body);
+    ball.state = state;
+    if (state === 'dunked') sim.dunked++; else sim.lost++;
+  }
+  /** Set of ball bodies currently in contact with a paddle. */
+  function ballsOnPaddles(sim) {
+    const out = new Set();
+    for (const pr of sim.engine.pairs.list) {
+      if (!pr.isActive || pr.isSensor) continue;
+      const a = pr.bodyA.parent, b = pr.bodyB.parent;
+      if (a.label === 'ball' && b.label === 'paddle') out.add(a); else if (b.label === 'ball' && a.label === 'paddle') out.add(b);
+    }
+    return out;
+  }
+  function capSpeed(body) {
+    const v = body.velocity, s = Math.hypot(v.x, v.y);
+    if (s > C.MAX_BALL_SPEED) M().Body.setVelocity(body, { x: v.x * C.MAX_BALL_SPEED / s, y: v.y * C.MAX_BALL_SPEED / s });
+  }
+  /** One fixed physics step. Returns events { released, dunked, lost, hits, bumps } (arrays of ball ids / counts). */
+  function step(sim) {
+    const { Engine, Body } = M();
+    const ev = { released: [], dunked: [], lost: [], hits: 0, bumps: 0 };
+    const lv = sim.level;
+    if (sim.dropping && sim.released < lv.N) {
+      sim.dropTimer -= STEP_MS;
+      if (sim.dropTimer <= 1e-6) {
+        const b = addBall(sim, lv.drop.x + (sim.rng() - 0.5) * 2, C.SPAWN_Y);
+        sim.released++; ev.released.push(b.id);
+        sim.dropTimer += C.DROP_INTERVAL;
+        if (sim.released >= lv.N) sim.dropping = false;
+      }
+    }
+    // kinematic paddles: the body moves toward the dragged target by at most PADDLE_MAX_VEL px and
+    // PADDLE_MAX_ANGVEL rad per step (the rest carries over to later steps), so a fast drag can never
+    // jump the paddle past a ball; the velocity it imparts is exactly that bounded per-step move.
+    for (const p of sim.paddles) {
+      const b = p.body, t = p.target;
+      let dx = t.x - b.position.x, dy = t.y - b.position.y;
+      const d = Math.hypot(dx, dy);
+      if (d > C.PADDLE_MAX_VEL) { dx *= C.PADDLE_MAX_VEL / d; dy *= C.PADDLE_MAX_VEL / d; }
+      const da = clamp(wrapAngle(t.angle - b.angle), -C.PADDLE_MAX_ANGVEL, C.PADDLE_MAX_ANGVEL);
+      if (dx || dy) Body.setPosition(b, { x: b.position.x + dx, y: b.position.y + dy }, false);
+      if (da) Body.setAngle(b, b.angle + da, false);
+      b.positionPrev.x = b.position.x - dx; b.positionPrev.y = b.position.y - dy;
+      b.anglePrev = b.angle - da;
+      p.pose = { x: b.position.x, y: b.position.y, angle: wrapAngle(b.angle) };
+    }
+    for (const bl of sim.balls) if (bl.state === 'live') capSpeed(bl.body);
+    Engine.update(sim.engine, STEP_MS);
+    for (const p of sim.paddles) { const b = p.body; b.positionPrev.x = b.position.x; b.positionPrev.y = b.position.y; b.anglePrev = b.angle; }
+    ev.hits = sim._hits; ev.bumps = sim._bumps; sim._hits = 0; sim._bumps = 0;
+    const inner = sim.geom.inner;
+    const onPaddle = ballsOnPaddles(sim);
+    for (const bl of sim.balls) {
+      if (bl.state !== 'live') continue;
+      const body = bl.body;
+      capSpeed(body);
+      bl.x = body.position.x; bl.y = body.position.y; bl.angle = body.angle;
+      bl.lifeMs += STEP_MS;
+      const speed = Math.hypot(body.velocity.x, body.velocity.y);
+      if (isOffScreen(body.position)) { removeBall(sim, bl, 'lost'); ev.lost.push(bl.id); continue; }
+      const d = updateDunk(bl.holdMs, body.position, speed, inner, STEP_MS);
+      bl.holdMs = d.holdMs;
+      if (d.dunk) { removeBall(sim, bl, 'dunked'); ev.dunked.push(bl.id); continue; }
+      const inside = body.position.x > inner.x0 && body.position.x < inner.x1 && body.position.y > inner.y0 && body.position.y < inner.y1;
+      // stuck timeout only for balls resting on scenery; a ball held on a paddle stays (45 s cap still applies)
+      bl.stillMs = !inside && speed < C.STUCK_SPEED && !onPaddle.has(body) ? bl.stillMs + STEP_MS : 0;
+      if (bl.stillMs >= C.STUCK_MS || bl.lifeMs >= C.BALL_MAX_LIFE_MS) { removeBall(sim, bl, 'lost'); ev.lost.push(bl.id); }
+    }
+    sim.timeMs += STEP_MS;
+    return ev;
+  }
+  /** Fixed-step accumulator. Only steps when running (pause => nothing moves). Merges events. */
+  function advance(sim, dtMs, running = true) {
+    const all = { released: [], dunked: [], lost: [], hits: 0, bumps: 0, steps: 0 };
+    if (!running || !(dtMs > 0)) return all;
+    sim.acc = Math.min(sim.acc + dtMs, STEP_MS * 6);
+    while (sim.acc >= STEP_MS - 1e-9) {
+      sim.acc -= STEP_MS;
+      const e = step(sim);
+      all.released.push(...e.released); all.dunked.push(...e.dunked); all.lost.push(...e.lost);
+      all.hits += e.hits; all.bumps += e.bumps; all.steps++;
+    }
+    return all;
+  }
+  function liveCount(sim) { return sim.balls.filter((b) => b.state === 'live').length; }
+  function isDone(sim) { return sim.released >= sim.level.N && liveCount(sim) === 0; }
+  function result(sim) {
+    const stars = starsFor(sim.dunked, sim.level.N, sim.level.K);
+    return { dunked: sim.dunked, lost: sim.lost, stars, success: sim.dunked >= sim.level.K, points: levelPoints(sim.dunked, stars) };
+  }
+  /** Headless play of a level with fixed paddle poses. */
+  function simulate(level, paddles, seed = 1, maxMs = 60000, stopWhenDecided = false) {
+    const sim = createSim(level, { rng: mulberry32(seed), paddles });
+    startDrop(sim);
+    while (!isDone(sim) && sim.timeMs < maxMs) {
+      if (stopWhenDecided && (sim.dunked >= level.K || level.N - sim.lost < level.K)) break;
+      step(sim);
+    }
+    return { ...result(sim), timeMs: sim.timeMs, done: isDone(sim) };
+  }
+
+  return { ...C, C, LEVELS, mulberry32, wrapAngle, basketGeom, clampPaddle, handlePos, hitPaddle, distToRect, basketReachable,
+    validateLevel, updateDunk, starsFor, levelPoints, isOffScreen, normalizeProgress, isUnlocked, highestUnlocked, recordStars,
+    createSim, addBall, ballsOnPaddles, startDrop, setPaddle, step, advance, liveCount, isDone, result, simulate, capSpeed };
+})();
+
+
+/* ##### GAME-SPECIFIC: logic self-tests (run by verify.py via window.__game.selfTest()) ##### */
+const TESTS = [];
+{
+  const T = (name, fn) => TESTS.push([name, fn]);
+  const L = Logic;
+  const flat = (x, y) => [{ x, y, angle: 0 }];
+  // a bare test level: basket in the middle, one paddle parked out of the way
+  const bare = (extra = {}) => ({ name: 't', N: 1, K: 1, drop: { x: 360 }, basket: { x: 360, y: 1100 }, paddles: flat(110, 1250), solution: flat(110, 1250), ...extra });
+  const runUntil = (sim, pred, maxSteps = 3000) => { const evs = []; for (let i = 0; i < maxSteps && !pred(); i++) evs.push(L.step(sim)); return evs; };
+
+  T('12 levels; N/K valid; a new element every few levels', () => {
+    assertEq(L.LEVELS.length, 12);
+    L.LEVELS.forEach((lv, i) => { assert(lv.K >= 1 && lv.K <= lv.N && lv.N >= 5, 'N/K level ' + (i + 1)); assert(lv.solution.length === lv.paddles.length, 'solution size'); });
+    assertEq(L.LEVELS[0].N, 5, 'level 1 has 5 balls');
+    const first = (k) => L.LEVELS.findIndex((lv) => (lv[k] || []).length > 0) + 1;
+    assert(first('walls') === 3 && first('pegs') === 5 && first('bumpers') === 8, `introductions walls ${first('walls')} pegs ${first('pegs')} bumpers ${first('bumpers')}`);
+    assert(L.LEVELS.findIndex((lv) => lv.paddles.length > 1) + 1 === 4, 'second paddle at level 4');
+    assert(L.LEVELS.findIndex((lv) => lv.paddles.length > 2) + 1 === 12, 'third paddle at level 12');
+  });
+  L.LEVELS.forEach((lv, i) => T(`level ${i + 1} layout: basket reachable (not enclosed), paddles fit on screen`, () => {
+    assertEq(L.validateLevel(lv), [], `level ${i + 1}`);
+  }));
+  L.LEVELS.forEach((lv, i) => T(`level ${i + 1} solvable by stored solution; start layout is not already a win`, () => {
+    const r = L.simulate(lv, lv.solution, 1, 60000, true);
+    assert(r.dunked >= lv.K, `solution dunked ${r.dunked}/${lv.N}, need ${lv.K}`);
+    const r0 = L.simulate(lv, lv.paddles, 1, 60000, true);
+    assert(r0.dunked < lv.K && lv.N - r0.lost < lv.K, `start layout already wins (${r0.dunked})`);
+  }));
+  T('validateLevel catches an enclosed basket and off-screen paddles', () => {
+    const boxed = bare({ walls: [{ x: 360, y: 950, w: 260, h: 24 }] });
+    assert(L.validateLevel(boxed).some((p) => p.includes('unreachable')), 'lid not detected');
+    const off = bare({ paddles: flat(20, 600), solution: flat(20, 600) });
+    assert(L.validateLevel(off).some((p) => p.includes('fit')), 'off-screen paddle not detected');
+  });
+  T('stars: all = 3, K+1 = 2, K = 1, below K = 0; score 100/ball + 50/star', () => {
+    assertEq([5, 4, 3, 2, 0].map((d) => L.starsFor(d, 5, 3)), [3, 2, 1, 0, 0]);
+    assertEq([4, 3, 2].map((d) => L.starsFor(d, 4, 3)), [3, 1, 0]);
+    assertEq(L.levelPoints(5, 3), 650); assertEq(L.levelPoints(3, 1), 350); assertEq(L.levelPoints(2, 0), 200);
+  });
+  T('dunk rule: inside + slow for 300 ms; resets when fast or outside', () => {
+    const inner = { x0: 0, x1: 100, y0: 0, y1: 100 };
+    let h = 0, dunk = false, n = 0;
+    while (!dunk) { ({ holdMs: h, dunk } = L.updateDunk(h, { x: 50, y: 50 }, 0.1, inner, L.STEP_MS)); n++; }
+    assertEq(n, 18, '300ms of 60Hz steps');
+    let r = L.updateDunk(250, { x: 50, y: 50 }, 5, inner, 16);
+    assertEq(r, { holdMs: 0, dunk: false }, 'fast resets');
+    r = L.updateDunk(250, { x: 50, y: -5 }, 0.1, inner, 16);
+    assertEq(r, { holdMs: 0, dunk: false }, 'outside resets');
+  });
+  T('classic bug: ball bouncing out is not dunked (slow apex inside < 300 ms, then leaves)', () => {
+    const inner = { x0: 0, x1: 100, y0: 0, y1: 100 };
+    let h = 0, dunk = false;
+    for (let i = 0; i < 15; i++) { const r = L.updateDunk(h, { x: 50, y: 20 }, 0.5, inner, L.STEP_MS); h = r.holdMs; dunk = dunk || r.dunk; }
+    const r = L.updateDunk(h, { x: 50, y: -30 }, 0.5, inner, L.STEP_MS);
+    assert(!dunk && !r.dunk && r.holdMs === 0, 'counted while bouncing out');
+    // physics: a fast ball skimming through the basket cavity is never dunked
+    const sim = L.createSim(bare());
+    L.addBall(sim, 250, 1030, { x: 24, y: -2 });
+    let dunks = 0; runUntil(sim, () => L.liveCount(sim) === 0).forEach((e) => { dunks += e.dunked.length; });
+    assertEq(dunks, 0, 'skimming ball dunked');
+  });
+  T('classic bug: a ball is counted once; dunked balls leave the world', () => {
+    const sim = L.createSim(bare());
+    const b = L.addBall(sim, 360, 900);
+    let dunks = 0;
+    for (let i = 0; i < 600; i++) dunks += L.step(sim).dunked.length;
+    assertEq(dunks, 1); assertEq(sim.dunked, 1); assertEq(b.state, 'dunked');
+    assert(!Matter.Composite.allBodies(sim.engine.world).includes(b.body), 'body still in world');
+    const before = sim.dunked; for (let i = 0; i < 60; i++) L.step(sim); assertEq(sim.dunked, before);
+  });
+  T('dispenser: Drop releases N balls 700 ms apart, only once', () => {
+    const lv = L.LEVELS[0], sim = L.createSim(lv, { rng: L.mulberry32(3) });
+    assert(L.startDrop(sim)); assert(!L.startDrop(sim), 'second Drop accepted');
+    const times = [];
+    for (let i = 0; i < 400; i++) { const e = L.step(sim); if (e.released.length) times.push(Math.round(sim.timeMs)); }
+    assertEq(times.length, lv.N);
+    for (let i = 1; i < times.length; i++) assert(Math.abs(times[i] - times[i - 1] - 700) <= 17, 'gap ' + (times[i] - times[i - 1]));
+    assertEq(sim.released, lv.N);
+    assert(!L.startDrop(sim), 'Drop after release');
+  });
+  T('no balls before Drop; balls leaving the screen are lost exactly once', () => {
+    const sim = L.createSim(bare({ N: 3 }));
+    for (let i = 0; i < 120; i++) L.step(sim);
+    assertEq(sim.balls.length, 0);
+    const b = L.addBall(sim, 700, 400, { x: 20, y: 0 });
+    let lost = 0; for (let i = 0; i < 200; i++) lost += L.step(sim).lost.length;
+    assertEq(lost, 1); assertEq(b.state, 'lost'); assertEq(sim.lost, 1);
+  });
+  T('classic bug: no tunnelling through a 24px paddle (max-speed balls, 60 offsets)', () => {
+    assert(L.PADDLE_H >= 24);
+    for (let k = 0; k < 60; k++) {
+      const sim = L.createSim(bare({ paddles: [{ x: 360, y: 900, angle: (k % 5 - 2) * 0.15 }] }));
+      const b = L.addBall(sim, 300 + k * 2, 820 - (k % 4) * 3, { x: 0, y: 60 });   // 60 px/step requested -> capped
+      for (let i = 0; i < 12; i++) L.step(sim);
+      const p = sim.paddles[0].pose, c = Math.cos(-p.angle), s = Math.sin(-p.angle);
+      const ly = (b.x - p.x) * s + (b.y - p.y) * c;
+      assert(ly < 0 || Math.abs((b.x - p.x) * c - (b.y - p.y) * s) > L.PADDLE_W / 2, `ball ${k} passed through paddle (ly=${ly.toFixed(1)})`);
+    }
+  });
+  T('classic bug: dragging a paddle through a ball never launches it (speed capped)', () => {
+    const sim = L.createSim(bare({ paddles: flat(360, 800) }));
+    const b = L.addBall(sim, 360, 760);
+    for (let i = 0; i < 60; i++) L.step(sim);                        // ball rests on paddle
+    let maxV = 0;
+    const poses = [{ x: 360, y: 500 }, { x: 600, y: 300 }, { x: 100, y: 900 }, { x: 360, y: 700 }];
+    for (const q of poses) {
+      L.setPaddle(sim, 0, { ...q, angle: 1.2 });
+      for (let i = 0; i < 20; i++) { L.step(sim); if (b.state === 'live') maxV = Math.max(maxV, b.body.speed, Math.hypot(b.body.velocity.x, b.body.velocity.y)); }
+    }
+    assert(maxV <= L.MAX_BALL_SPEED + 1e-6, 'ball speed ' + maxV);
+    const c = L.createSim(bare()); const f = L.addBall(c, 360, 500, { x: 90, y: -90 }); L.step(c);
+    assert(Math.hypot(f.body.velocity.x, f.body.velocity.y) <= L.MAX_BALL_SPEED + 1e-6, 'free ball speed not capped');
+  });
+  T('classic bug: physics does not run while paused', () => {
+    const sim = L.createSim(L.LEVELS[0]); L.startDrop(sim);
+    L.advance(sim, 200, true);
+    const snap = JSON.stringify(sim.balls.map((b) => [b.body.position.x, b.body.position.y])), t = sim.timeMs;
+    const e = L.advance(sim, 5000, false);
+    assertEq(e.steps, 0); assertEq(sim.timeMs, t);
+    assertEq(JSON.stringify(sim.balls.map((b) => [b.body.position.x, b.body.position.y])), snap);
+  });
+  T('fixed 1000/60 step: frame-rate independent (same result for 7/16/33/50 ms frames)', () => {
+    const run = (dt) => { const sim = L.createSim(L.LEVELS[0], { rng: L.mulberry32(5), paddles: L.LEVELS[0].solution }); L.startDrop(sim);
+      let t = 0; while (t < 1600) { L.advance(sim, dt, true); t += dt; }
+      return { steps: Math.round(sim.timeMs / L.STEP_MS), pos: sim.balls.map((b) => Math.round(b.x) + ',' + Math.round(b.y)).join(' ') }; };
+    const ref = run(50);
+    for (const dt of [7, 33]) { const r = run(dt); if (r.steps === ref.steps) assertEq(r.pos, ref.pos, 'dt ' + dt); else assert(Math.abs(r.steps - ref.steps) <= 1); }
+    const sim = L.createSim(L.LEVELS[0]); assert(L.advance(sim, 50).steps === 3 && L.advance(sim, 10).steps === 0);
+  });
+  T('stuck ball resting on scenery is lost after 5 s so the level always ends', () => {
+    const sim = L.createSim(bare({ walls: [{ x: 360, y: 700, w: 300, h: 24 }] }));
+    const b = L.addBall(sim, 360, 660);
+    let n = 0; while (b.state === 'live' && n < 1000) { L.step(sim); n++; }
+    assertEq(b.state, 'lost'); assert(n * L.STEP_MS >= L.STUCK_MS && n * L.STEP_MS < L.STUCK_MS + 1500, 'lost after ' + n);
+  });
+  T('review #6: a ball held on a PADDLE is not timed out after 5 s (45 s cap still applies)', () => {
+    const sim = L.createSim(bare({ paddles: flat(360, 700) }));
+    const b = L.addBall(sim, 360, 660);
+    for (let i = 0; i < 12 * 60; i++) L.step(sim);
+    assertEq(b.state, 'live', 'ball on paddle vanished');
+    assert(L.ballsOnPaddles(sim).has(b.body));
+    let n = 12 * 60; while (b.state === 'live' && n < 50 * 60) { L.step(sim); n++; }
+    assertEq(b.state, 'lost'); assert(Math.abs(n * L.STEP_MS - L.BALL_MAX_LIFE_MS) < 50, 'life cap at ' + n);
+  });
+  T('level end + result: done only when every released ball is dunked or lost', () => {
+    const lv = L.LEVELS[0], sim = L.createSim(lv, { rng: L.mulberry32(2), paddles: lv.solution });
+    assert(!L.isDone(sim)); L.startDrop(sim);
+    let sawDoneEarly = false;
+    for (let i = 0; i < 4000 && !L.isDone(sim); i++) { L.step(sim); if (L.isDone(sim) && sim.released < lv.N) sawDoneEarly = true; }
+    assert(L.isDone(sim) && !sawDoneEarly);
+    const r = L.result(sim);
+    assertEq(r.dunked + r.lost, lv.N); assertEq(r.stars, L.starsFor(r.dunked, lv.N, lv.K)); assertEq(r.success, r.dunked >= lv.K);
+  });
+  T('paddle clamp keeps every pose on screen and below the HUD (500 random poses)', () => {
+    const rng = L.mulberry32(9);
+    for (let i = 0; i < 500; i++) {
+      const p = L.clampPaddle({ x: rng() * 1400 - 340, y: rng() * 2000 - 400, angle: rng() * 20 - 10 });
+      const c = Math.cos(p.angle) * L.PADDLE_W / 2, s = Math.sin(p.angle) * L.PADDLE_W / 2;
+      for (const [x, y] of [[p.x + c, p.y + s], [p.x - c, p.y - s]]) assert(x >= 0 && x <= W && y >= L.AREA.y0 && y <= H, 'end off screen');
+      assert(p.angle > -Math.PI - 1e-9 && p.angle <= Math.PI + 1e-9);
+      assertEq(L.clampPaddle(p), p, 'clamp idempotent');
+    }
+    assertEq(L.clampPaddle({ x: NaN, y: 500, angle: 0 }).x, W / 2);
+  });
+  T('paddle hit test: handle (rotate) vs body (move) vs miss', () => {
+    const p = { x: 300, y: 600, angle: 0 };
+    assertEq(L.hitPaddle(p, { x: 390, y: 600 }), 'handle');
+    assertEq(L.hitPaddle(p, { x: 260, y: 610 }), 'body');
+    assertEq(L.hitPaddle(p, { x: 300, y: 700 }), null);
+    assertEq(L.hitPaddle({ x: 300, y: 600, angle: Math.PI / 2 }, { x: 300, y: 690 }), 'handle');
+  });
+  T('moving a paddle mid-drop takes effect in the physics world', () => {
+    const sim = L.createSim(bare({ paddles: flat(360, 700) }));
+    L.setPaddle(sim, 0, { x: 200, y: 900, angle: 0.3 }); L.step(sim);
+    const b = sim.paddles[0].body;
+    assert(Math.abs(Math.hypot(b.position.x - 360, b.position.y - 700) - L.PADDLE_MAX_VEL) < 1e-6 && Math.abs(b.angle - 0.15) < 1e-6, 'first step not limited');
+    for (let i = 0; i < 20; i++) L.step(sim);
+    assert(Math.abs(b.position.x - 200) < 1e-6 && Math.abs(b.position.y - 900) < 1e-6 && Math.abs(b.angle - 0.3) < 1e-6);
+    assert(b.isStatic && b.positionPrev.x === b.position.x, 'paddle keeps no velocity after the step');
+  });
+  T('review #3: fast flicks cannot pass a paddle through balls (limited to 20 px / 0.15 rad per step)', () => {
+    for (const v of [40, 60, 300]) {           // 2400 px/s, 3600 px/s, teleport-like drags
+      const sim = L.createSim(bare({ basket: { x: 600, y: 1200 }, paddles: flat(300, 1000) }));
+      const b = L.addBall(sim, 300, 950);
+      for (let i = 0; i < 60; i++) L.step(sim);
+      let hit = false;
+      for (let i = 0; i < Math.ceil(300 / v); i++) { const p = sim.paddles[0].target; L.setPaddle(sim, 0, { ...p, y: p.y - v }); L.step(sim); hit = hit || b.y < 940; }
+      for (let i = 0; i < 30; i++) { L.step(sim); hit = hit || b.y < 940; }
+      assert(hit && (b.state !== 'live' || b.y < sim.paddles[0].pose.y), `up ${v}px/step: ball fell through (ball ${b.y.toFixed(0)} paddle ${sim.paddles[0].pose.y.toFixed(0)})`);
+      const s2 = L.createSim(bare({ basket: { x: 600, y: 1200 }, walls: [{ x: 360, y: 800, w: 500, h: 24 }], paddles: [{ x: 150, y: 720, angle: Math.PI / 2 }] }));
+      const b2 = L.addBall(s2, 360, 760);
+      for (let i = 0; i < 60; i++) L.step(s2);
+      for (let i = 0; i < Math.ceil(300 / v); i++) { const p = s2.paddles[0].target; L.setPaddle(s2, 0, { ...p, x: Math.min(p.x + v, 520) }); L.step(s2); }
+      for (let i = 0; i < 40; i++) L.step(s2);
+      assert(b2.state !== 'live' || b2.x > s2.paddles[0].pose.x, `sideways ${v}px/step: paddle passed through ball`);
+    }
+    // the carried-over remainder still arrives: target reached after enough steps
+    const sim = L.createSim(bare({ paddles: flat(300, 1000) }));
+    L.setPaddle(sim, 0, { x: 300, y: 400, angle: 1 }); for (let i = 0; i < 40; i++) L.step(sim);
+    const t = sim.paddles[0].target, q = sim.paddles[0].pose;
+    assert(t.y > 400 && Math.abs(q.y - t.y) < 1e-6 && Math.abs(q.x - t.x) < 1e-6 && Math.abs(q.angle - 1) < 1e-6, 'paddle never reached target');
+  });
+  T('review #5: paddles cannot be parked over the dispenser spawn zone', () => {
+    for (const lv of L.LEVELS) for (const a of [0, 0.5, -1, Math.PI / 2]) {
+      const p = L.clampPaddle({ x: lv.drop.x, y: 250, angle: a });
+      const d = L.distToRect({ x: lv.drop.x, y: L.SPAWN_Y }, { x: p.x, y: p.y, w: L.PADDLE_W, h: L.PADDLE_H, angle: p.angle });
+      assert(d >= L.BALL_R + 5, `paddle overlaps spawn (${d.toFixed(1)})`);
+    }
+    const low = L.clampPaddle({ x: 360, y: 0, angle: 0 });    // a ball resting on the highest paddle still clears the spawn point
+    assert(low.y - L.PADDLE_H / 2 - 2 * L.BALL_R >= L.SPAWN_Y + L.BALL_R, 'resting ball would overlap spawning balls');
+    const sim = L.createSim(bare({ N: 1, paddles: flat(360, 300) }));
+    L.startDrop(sim); L.step(sim);
+    const b = sim.balls[0];
+    assert(b.y < sim.paddles[0].pose.y - L.PADDLE_H / 2 - L.BALL_R + 2, 'ball spawned inside paddle');
+  });
+  T('progress: unlock chain, best stars kept, Play resumes highest unlocked', () => {
+    let s = L.normalizeProgress(null);
+    assertEq(s.length, 12); assert(L.isUnlocked(s, 0) && !L.isUnlocked(s, 1)); assertEq(L.highestUnlocked(s), 0);
+    s = L.recordStars(s, 0, 2); s = L.recordStars(s, 0, 1); assertEq(s[0], 2);
+    s = L.recordStars(s, 1, 3); assertEq(L.highestUnlocked(s), 2);
+    assertEq(L.normalizeProgress([9, -1, 'x', 2.2]).slice(0, 4), [3, 0, 0, 2]);
+    assertEq(L.highestUnlocked(L.LEVELS.map(() => 3)), 11);
+  });
+  T('seeded bots: random paddle drags during drops keep invariants (no NaN, speed cap, counts add up)', () => {
+    for (const seed of [11, 22, 33]) {
+      const rng = L.mulberry32(seed), lv = L.LEVELS[seed % 12], sim = L.createSim(lv, { rng });
+      L.startDrop(sim);
+      let dunkEv = 0, lostEv = 0;
+      for (let i = 0; i < 2400 && !L.isDone(sim); i++) {
+        if (i % 10 === 0) { const j = Math.floor(rng() * sim.paddles.length), p = sim.paddles[j].target;
+          L.setPaddle(sim, j, { x: p.x + (rng() - 0.5) * 120, y: p.y + (rng() - 0.5) * 120, angle: p.angle + (rng() - 0.5) * 0.6 }); }
+        const e = L.step(sim); dunkEv += e.dunked.length; lostEv += e.lost.length;
+        for (const b of sim.balls) if (b.state === 'live') {
+          assert(Number.isFinite(b.x) && Number.isFinite(b.y), 'NaN position');
+          assert(Math.hypot(b.body.velocity.x, b.body.velocity.y) <= L.MAX_BALL_SPEED + 1e-6, 'speed');
+        }
+        assertEq(sim.dunked + sim.lost + L.liveCount(sim), sim.released);
+      }
+      assertEq([dunkEv, lostEv], [sim.dunked, sim.lost]);
+    }
+  });
+  T('createSim does not mutate level data', () => {
+    const lv = L.LEVELS[11], before = JSON.stringify(lv);
+    const sim = L.createSim(lv); L.setPaddle(sim, 0, { x: 1, y: 1, angle: 3 }); L.startDrop(sim); for (let i = 0; i < 30; i++) L.step(sim);
+    assertEq(JSON.stringify(lv), before);
+  });
+}
+
+/* ##### GAME-SPECIFIC: extra scenes + menu hook ##### */
+const Progress = {
+  load() { return Logic.normalizeProgress(Store.get('progress', [])); },
+  save(stars) { Store.set('progress', Logic.normalizeProgress(stars)); },
+};
+const starStr = (n) => '★'.repeat(n) + '☆'.repeat(3 - n);
+
+class LevelSelectScene extends Scene {
+  enter() {
+    const prog = Progress.load();
+    const title = makeText('Levels', 72, THEME.text, '800'); title.position.set(W / 2, 120);
+    const total = makeText(`★ ${prog.reduce((a, b) => a + b, 0)} / ${prog.length * 3}`, 34, THEME.accent, '700'); total.position.set(W / 2, 200);
+    this.view.addChild(title, total);
+    Logic.LEVELS.forEach((lv, i) => {
+      const unlocked = Logic.isUnlocked(prog, i);
+      const b = makeButton(String(i + 1), () => { if (unlocked) Scenes.go('game', { level: i }); },
+        { w: 185, h: 180, size: 64, variant: unlocked && !prog[i] ? 'primary' : 'secondary' });
+      b.children[1].y = -24;
+      const st = makeText(unlocked ? (prog[i] ? starStr(prog[i]) : 'Play') : 'Locked', prog[i] ? 34 : 26, !unlocked ? THEME.textDim : prog[i] ? THEME.accent : THEME.text, '700');
+      st.y = 50; b.addChild(st);
+      if (!unlocked) { b.disabled = true; b.alpha = 0.45; b.cursor = 'default'; }
+      b.position.set(W / 2 + ((i % 3) - 1) * 215, 340 + Math.floor(i / 3) * 205);
+      this.view.addChild(b);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, 1180);
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause') Scenes.go('menu'); }
+}
+GAME_HOOKS.scenes.levels = LevelSelectScene;
+GAME_HOOKS.menuButtons.push(['Levels', () => Scenes.go('levels')]);   // Play still starts the highest unlocked level
+
+/* ##### GAME-SPECIFIC: the game scene ##### */
+const COL = { ball: 0xf07a22, ballDark: 0x5a2a0c, paddle: 0x2f7fe0, paddleEdge: 0x1b4f96, handle: 0xffffff, basket: 0xd8332a,
+  rim: 0xff5a3c, net: 0xffffff, wall: 0x5b3a26, wallTop: 0x7a5236, peg: 0xe9dcc7, bumper: 0x9b59d0, bumperRing: 0xf5d0ff };
+
+class GameScene extends GameSceneBase {
+  enter(data) { this.data = data || {}; super.enter(); }
+  initGame() {
+    const d = this.data;
+    const prog = Progress.load();
+    this.levelIndex = Math.max(0, Math.min(Logic.LEVELS.length - 1, Number.isInteger(d.level) ? d.level : Logic.highestUnlocked(prog)));
+    this.level = Logic.LEVELS[this.levelIndex];
+    this.startScore = Math.max(0, d.score || 0);
+    this.score = this.startScore;
+    this.sim = Logic.createSim(this.level, { rng: Math.random, paddles: d.paddles });
+    this.selected = 0; this.drag = null; this.levelOver = false; this.clock = 0; this.lastHitSfx = -1000;
+    this.dunkEvents = 0; this.result = null; this.balls = new Map();
+    this.buildView();
+    this.bindPointer();
+  }
+
+  /* ---------- view ---------- */
+  buildView() {
+    const bg = new Graphics();
+    const plank = 90;
+    for (let x = 0, i = 0; x < W; x += plank, i++) bg.rect(x, 0, plank, H).fill(i % 2 ? 0xc98a50 : 0xd29659);
+    for (let x = plank; x < W; x += plank) bg.rect(x - 1, 0, 2, H).fill({ color: 0x7a4a24, alpha: 0.35 });
+    for (let i = 0; i < 14; i++) { const x = (i * 211) % W, y = 260 + ((i * 397) % 1000); bg.rect(x - (x % plank), y, plank, 2).fill({ color: 0x7a4a24, alpha: 0.3 }); }
+    for (let i = 0; i < 10; i++) bg.rect(0, H - (i + 1) * 60, W, 60).fill({ color: 0x2a140a, alpha: 0.025 * (10 - i) });
+    bg.rect(0, 0, W, 248).fill({ color: 0x2a160c, alpha: 0.82 });
+    bg.rect(0, 246, W, 3).fill({ color: 0xffd9a8, alpha: 0.35 });
+    this.board.addChild(bg);
+
+    // scenery (static): walls, pegs, bumpers
+    const sc = new Graphics();
+    for (const r of this.level.walls || []) {
+      const c = Math.cos(r.angle || 0), s = Math.sin(r.angle || 0), hw = r.w / 2, hh = r.h / 2;
+      const pts = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].flatMap(([x, y]) => [r.x + x * c - y * s, r.y + x * s + y * c]);
+      sc.poly(pts).fill(COL.wall).stroke({ width: 3, color: COL.wallTop });
+    }
+    for (const p of this.level.pegs || []) sc.circle(p.x, p.y, p.r || Logic.PEG_R).fill(COL.peg).stroke({ width: 3, color: 0x8a6a4a });
+    this.board.addChild(sc);
+    this.bumperViews = (this.level.bumpers || []).map((b) => {
+      const g = new Graphics();
+      g.circle(0, 0, b.r).fill(COL.bumper).circle(0, 0, b.r - 8).stroke({ width: 4, color: COL.bumperRing }).circle(0, 0, b.r * 0.35).fill(COL.bumperRing);
+      g.position.set(b.x, b.y); this.board.addChild(g); return g;
+    });
+
+    // basket back
+    const bk = this.sim.geom, inr = bk.inner;
+    const back = new Graphics();
+    back.rect(inr.x0, inr.y0, inr.x1 - inr.x0, inr.y1 - inr.y0).fill({ color: 0x3a1410, alpha: 0.35 });
+    this.board.addChild(back);
+
+    // dispenser
+    const dx = this.level.drop.x;
+    const disp = new Graphics();
+    disp.poly([dx - 48, 250, dx + 48, 250, dx + 30, 276, dx - 30, 276]).fill(0x3b3b46).stroke({ width: 3, color: 0x9a9aae });
+    disp.rect(dx - 30, 250, 60, 6).fill(0xffd166);
+    this.board.addChild(disp);
+    this.remainText = makeText(String(this.level.N), 26, THEME.text, '800');
+    this.remainText.position.set(dx + (dx > W / 2 ? -80 : 80), 268);
+    this.board.addChild(this.remainText);
+    this.remainIcon = this.makeBallGfx(12); this.remainIcon.position.set(this.remainText.x + (dx > W / 2 ? -34 : 34), 268);
+    this.board.addChild(this.remainIcon);
+
+    this.ballLayer = new Container(); this.board.addChild(this.ballLayer);
+
+    // basket front: walls + net
+    const front = new Graphics();
+    for (let x = inr.x0 + 10; x < inr.x1; x += 22) front.moveTo(x, inr.y0 + 6).lineTo(Math.min(inr.x1, x + 26), inr.y1);
+    for (let x = inr.x1 - 10; x > inr.x0; x -= 22) front.moveTo(x, inr.y0 + 6).lineTo(Math.max(inr.x0, x - 26), inr.y1);
+    front.stroke({ width: 2, color: COL.net, alpha: 0.6 });
+    for (const w of bk.walls) front.roundRect(w.x - w.w / 2, w.y - w.h / 2, w.w, w.h, 5).fill(COL.basket);
+    front.roundRect(inr.x0 - Logic.BASKET_WALL - 4, inr.y0 - 4, inr.x1 - inr.x0 + 2 * Logic.BASKET_WALL + 8, 12, 6).fill(COL.rim);
+    this.board.addChild(front);
+    this.fxLayer = new Container(); this.board.addChild(this.fxLayer);
+
+    // paddles
+    this.paddleViews = this.sim.paddles.map(() => {
+      const c = new Container();
+      const sel = new Graphics(); sel.roundRect(-Logic.PADDLE_W / 2 - 7, -Logic.PADDLE_H / 2 - 7, Logic.PADDLE_W + 14, Logic.PADDLE_H + 14, 18).stroke({ width: 4, color: 0xffd166, alpha: 0.9 });
+      const g = new Graphics();
+      g.roundRect(-Logic.PADDLE_W / 2, -Logic.PADDLE_H / 2, Logic.PADDLE_W, Logic.PADDLE_H, 10).fill(COL.paddle).stroke({ width: 3, color: COL.paddleEdge });
+      g.rect(-Logic.PADDLE_W / 2 + 14, -3, Logic.PADDLE_W - 60, 6).fill({ color: 0xffffff, alpha: 0.25 });
+      g.circle(Logic.PADDLE_W / 2, 0, Logic.HANDLE_R).fill(COL.handle).stroke({ width: 4, color: COL.paddleEdge });
+      g.circle(Logic.PADDLE_W / 2, 0, 6).fill(COL.paddleEdge);
+      c.addChild(sel, g); c.sel = sel;
+      this.board.addChild(c); return c;
+    });
+
+    // info bar
+    this.levelText = makeText(`Level ${this.levelIndex + 1}`, 32, THEME.text, '800'); this.levelText.anchor.set(0, 0.5); this.levelText.position.set(26, 182);
+    this.nameText = makeText(`${this.level.name} · need ${this.level.K}`, 22, THEME.textDim, '600'); this.nameText.anchor.set(0, 0.5); this.nameText.position.set(26, 220);
+    fitText(this.nameText, 280);
+    this.countText = makeText(`0 / ${this.level.N}`, 50, THEME.accent, '800'); this.countText.position.set(395, 200);
+    this.dropBtn = makeButton('Drop', () => this.drop(), { w: 190, h: 76, size: 30 });
+    this.dropBtn.position.set(W - 115, 200);
+    this.board.addChild(this.levelText, this.nameText, this.countText, this.dropBtn);
+    this.syncView();
+  }
+  makeBallGfx(r = Logic.BALL_R) {
+    const g = new Graphics();
+    g.circle(0, 0, r).fill(COL.ball).stroke({ width: Math.max(1.5, r / 9), color: COL.ballDark });
+    g.moveTo(-r, 0).lineTo(r, 0).moveTo(0, -r).lineTo(0, r).stroke({ width: Math.max(1.5, r / 11), color: COL.ballDark });
+    g.moveTo(-r * 0.62, -r * 0.78).quadraticCurveTo(-r * 0.2, 0, -r * 0.62, r * 0.78).stroke({ width: Math.max(1.5, r / 11), color: COL.ballDark });
+    g.moveTo(r * 0.62, -r * 0.78).quadraticCurveTo(r * 0.2, 0, r * 0.62, r * 0.78).stroke({ width: Math.max(1.5, r / 11), color: COL.ballDark });
+    return g;
+  }
+  syncView() {
+    this.sim.paddles.forEach((p, i) => {
+      const v = this.paddleViews[i];
+      v.position.set(p.pose.x, p.pose.y); v.rotation = p.pose.angle;
+      v.sel.visible = i === this.selected && this.sim.paddles.length > 1;
+    });
+    for (const b of this.sim.balls) {
+      const v = this.balls.get(b.id);
+      if (v && b.state === 'live') { v.position.set(b.x, b.y); v.rotation = b.angle; }
+    }
+    const remain = String(this.level.N - this.sim.released);
+    if (this.remainText.text !== remain) this.remainText.text = remain;
+    const cnt = `${this.sim.dunked} / ${this.level.N}`;
+    if (this.countText.text !== cnt) { this.countText.text = cnt; Tween.kill(this.countText); this.countText.scale.set(1); Tween.pop(this.countText, 1.25, 180); }
+  }
+  confetti(x, y) {
+    const cols = [0xffd166, 0xff5c7a, 0x4cc9f0, 0x80ed99, 0xffffff, 0xf07a22];
+    for (let i = 0; i < 16; i++) {
+      const g = new Graphics(); g.rect(-5, -3, 10, 6).fill(cols[i % cols.length]);
+      g.position.set(x, y); g.rotation = Math.random() * 6;
+      this.fxLayer.addChild(g);
+      const a = -Math.PI / 2 + (Math.random() - 0.5) * 2.2, d = 60 + Math.random() * 90;
+      Tween.to(g, { x: x + Math.cos(a) * d, y: y + Math.sin(a) * d, rotation: g.rotation + 4, alpha: 0 }, 650 + Math.random() * 250, Ease.outCubic)
+        .then(() => { if (!g.destroyed) g.destroy(); });
+    }
+  }
+
+  /* ---------- input ---------- */
+  canInteract() { return this.state === 'playing' && !this.overlay && !this.levelOver && Scenes.current === this; }
+  bindPointer() {
+    const stage = Scenes.app.stage;
+    this._down = (e) => {
+      if (!this.canInteract()) return;
+      let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+      this.pointerDown(this.board.toLocal(e.global));
+    };
+    this._move = (e) => { if (!this.drag) return; if (!this.canInteract()) { this.drag = null; return; } this.pointerMove(this.board.toLocal(e.global)); };
+    this._up = () => { this.drag = null; };
+    stage.on('pointerdown', this._down); stage.on('pointermove', this._move);
+    stage.on('pointerup', this._up); stage.on('pointerupoutside', this._up);
+  }
+  cleanup() {
+    const stage = Scenes.app.stage;
+    stage.off('pointerdown', this._down); stage.off('pointermove', this._move);
+    stage.off('pointerup', this._up); stage.off('pointerupoutside', this._up);
+    this.drag = null;
+  }
+  pointerDown(p) {
+    if (!this.canInteract()) return false;
+    const ps = this.sim.paddles;
+    for (const mode of ['handle', 'body']) {
+      for (let i = ps.length - 1; i >= 0; i--) {
+        if (Logic.hitPaddle(ps[i].pose, p) !== mode) continue;
+        this.selected = i;
+        const q = ps[i].target;
+        this.drag = mode === 'handle' ? { i, mode: 'rotate' } : { i, mode: 'move', ox: q.x - p.x, oy: q.y - p.y };
+        this.syncView();
+        return true;
+      }
+    }
+    return false;
+  }
+  pointerMove(p) {
+    if (!this.drag || !this.canInteract()) return;
+    const { i } = this.drag, q = this.sim.paddles[i].target;
+    if (this.drag.mode === 'rotate') Logic.setPaddle(this.sim, i, { x: q.x, y: q.y, angle: Math.atan2(p.y - q.y, p.x - q.x) });
+    else Logic.setPaddle(this.sim, i, { x: p.x + this.drag.ox, y: p.y + this.drag.oy, angle: q.angle });
+    this.syncView();
+  }
+  pointerUp() { this.drag = null; }
+  setPaddlePose(i, pose) { const r = Logic.setPaddle(this.sim, i, pose); this.syncView(); return r; }
+  solution() { return this.level.solution.map((p) => ({ ...p })); }
+  handleInput(a, source) {
+    if (source === 'swipe' || a === 'tap' || a === 'press' || !this.canInteract()) return;
+    if (a === 'action') return this.drop();
+    const ps = this.sim.paddles; if (!ps.length) return;
+    if (a === 'confirm') { this.selected = (this.selected + 1) % ps.length; this.syncView(); return; }
+    const q = ps[this.selected].target;
+    if (a === 'left' || a === 'right') Logic.setPaddle(this.sim, this.selected, { ...q, x: q.x + (a === 'left' ? -16 : 16) });
+    if (a === 'up' || a === 'down') Logic.setPaddle(this.sim, this.selected, { ...q, angle: q.angle + (a === 'up' ? -0.08 : 0.08) });
+    this.syncView();
+  }
+  drop() {
+    if (!this.canInteract()) return false;
+    if (!Logic.startDrop(this.sim)) return false;
+    Sfx.play('move');
+    this.dropBtn.setText('Dropping'); this.dropBtn.disabled = true; this.dropBtn.alpha = 0.55;
+    return true;
+  }
+
+  /* ---------- simulation ---------- */
+  tick(dtMs) {
+    this.clock += dtMs;
+    if (this.levelOver || this.overlay) return;
+    const ev = Logic.advance(this.sim, dtMs, true);
+    for (const id of ev.released) {
+      const g = this.makeBallGfx(); this.ballLayer.addChild(g); this.balls.set(id, g);
+      const b = this.sim.balls.find((x) => x.id === id); g.position.set(b.x, b.y);
+    }
+    for (const id of ev.dunked) this.onDunk(id);
+    for (const id of ev.lost) this.onLost(id);
+    if ((ev.hits || ev.bumps) && this.clock - this.lastHitSfx > 120) { this.lastHitSfx = this.clock; Sfx.play('hit'); }
+    if (ev.bumps) for (const v of this.bumperViews) { Tween.kill(v); v.scale.set(1); Tween.pop(v, 1.12, 140); }
+    this.syncView();
+    if (Logic.isDone(this.sim)) this.finishLevel();
+  }
+  onDunk(id) {
+    this.dunkEvents++;
+    const b = this.sim.balls.find((x) => x.id === id), v = this.balls.get(id);
+    this.addScore(100);
+    Sfx.play('score');
+    this.confetti(b.x, b.y - 10);
+    if (v) { v.position.set(b.x, b.y); Tween.to(v, { y: this.sim.geom.inner.y1 + 30, alpha: 0, scale: 0.7 }, 450, Ease.inOutQuad).then(() => { if (!v.destroyed) v.destroy(); }); }
+    this.balls.delete(id);
+  }
+  onLost(id) {
+    const v = this.balls.get(id);
+    if (v) Tween.to(v, { alpha: 0 }, 250).then(() => { if (!v.destroyed) v.destroy(); });
+    this.balls.delete(id);
+  }
+  finishLevel() {
+    if (this.levelOver) return;
+    this.levelOver = true;
+    this.drag = null;
+    const r = Logic.result(this.sim);
+    this.result = r;
+    const last = this.levelIndex === Logic.LEVELS.length - 1;
+    if (r.success) {
+      Progress.save(Logic.recordStars(Progress.load(), this.levelIndex, r.stars));
+      this.addScore(r.stars * 50);
+    }
+    this.later(650, () => {                       // game-time delay: frozen while paused, shown after Resume
+      if (Scenes.current !== this || this.state === 'over') return;
+      const sub = `${r.dunked} / ${this.level.N} dunked · need ${this.level.K}`;
+      if (r.success) {
+        Sfx.play('win');
+        if (last) this.showOverlay(`${starStr(r.stars)}  All Clear!`, [['Finish', () => this.endRun(true)]], `${sub} · +${r.stars * 50} bonus`);
+        else this.showOverlay(`${starStr(r.stars)}  Level ${this.levelIndex + 1}`, [
+          ['Next Level', () => this.goLevel(this.levelIndex + 1, this.score)],
+          ['Replay', () => this.goLevel(this.levelIndex, this.startScore), { variant: 'secondary' }],
+          ['End Run', () => this.endRun(false), { variant: 'secondary' }],
+        ], `${sub} · +${r.stars * 50} bonus`);
+      } else {
+        Sfx.play('lose');
+        this.showOverlay('Try Again', [
+          ['Try Again', () => this.retry()],
+          ['End Run', () => this.endRun(false), { variant: 'secondary' }],
+        ], sub);
+      }
+    });
+  }
+  goLevel(i, score, paddles) { return Scenes.go('game', { level: i, score, paddles }); }
+  retry() { return this.goLevel(this.levelIndex, this.startScore, this.sim.paddles.map((p) => ({ ...p.target }))); }
+  /** R key and Pause->Restart: replay the CURRENT level from the score it started with. */
+  restart() { return this.goLevel(this.levelIndex, this.startScore); }
+  endRun(won) {
+    this.hideOverlay();
+    if (this.result && !this.result.success) this.setScore(this.startScore);   // failed attempt's dunks are not banked
+    this.endGame({ won, delay: 250 });
+  }
+  togglePause() {                       // framework's, plus the level name as subtitle
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.drag = null;
+    this.savedOverlay = this.overlay;
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => this.restart(), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], `Level ${this.levelIndex + 1} · ${this.level.name}`);
+  }
+  debugState() {
+    const s = this.sim;
+    return { ...super.debugState(), level: this.levelIndex + 1, levelName: this.level.name, N: this.level.N, K: this.level.K,
+      released: s.released, dunked: s.dunked, lost: s.lost, live: Logic.liveCount(s), dropping: s.dropping, simTimeMs: Math.round(s.timeMs),
+      levelOver: this.levelOver, result: this.result, selected: this.selected, dunkEvents: this.dunkEvents, startScore: this.startScore,
+      paddles: s.paddles.map((p) => ({ x: +p.target.x.toFixed(1), y: +p.target.y.toFixed(1), angle: +p.target.angle.toFixed(3) })),
+      paddleBodies: s.paddles.map((p) => ({ x: +p.pose.x.toFixed(1), y: +p.pose.y.toFixed(1), angle: +p.pose.angle.toFixed(3) })),
+      balls: s.balls.map((b) => ({ id: b.id, x: +b.x.toFixed(1), y: +b.y.toFixed(1), state: b.state })),
+      progress: Progress.load() };
+  }
+}
+/* ##### END GAME-SPECIFIC ##### */
+
+/* ---------- test helpers ---------- */
+function assert(cond, msg = 'assertion failed') { if (!cond) throw new Error(msg); }
+function assertEq(a, b, msg = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg} expected ${B} got ${A}`); }
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const app = new Application();
+  await app.init({
+    resizeTo: window,
+    background: THEME.outerBg,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preference: 'webgl',
+  });
+  document.getElementById('app').appendChild(app.canvas);
+
+  const root = new Container(); root.label = 'root';
+  root.addChild(makeBackground());
+  const sceneLayer = new Container(); sceneLayer.label = 'scenes';
+  root.addChild(sceneLayer);
+  app.stage.addChild(root);
+
+  const mask = new Graphics(); mask.rect(0, 0, W, H).fill(0xffffff);
+  root.addChild(mask); root.mask = mask;       // nothing draws outside the play area
+
+  function layout() {
+    const sw = app.screen.width, sh = app.screen.height;
+    const s = Math.min(sw / W, sh / H);
+    root.scale.set(s);
+    root.position.set(Math.round((sw - W * s) / 2), Math.round((sh - H * s) / 2));
+    app.stage.hitArea = app.screen;
+  }
+  layout();
+  window.addEventListener('resize', () => requestAnimationFrame(() => { app.resize(); layout(); }));
+
+  Scenes.app = app; Scenes.root = sceneLayer;
+  Scenes.register('menu', MenuScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+  for (const [name, cls] of Object.entries(GAME_HOOKS.scenes)) Scenes.register(name, cls);
+
+  Input.init();
+  initSwipe(app, root);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden(); });
+
+  app.ticker.add((ticker) => {
+    const dt = Math.min(ticker.deltaMS, 50);  // clamp: no huge jumps after tab switch
+    Tween.update(dt);
+    Scenes.current?.update(dt);
+  });
+
+  await Scenes.go('menu');
+
+  /* test hook used by scripts/verify.py (harmless in production) */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },          // for checks.js: direct access to the live scene (set up boards, read fields)
+    inputStats() { return { ...Scenes.inputStats }; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    boardObjects() { const b = Scenes.current?.board; let n = 0; const walk = (c) => { if (!c.visible) return; n++; c.children.forEach(walk); }; if (b) walk(b); return n - (b ? 1 : 0); },
+    buttons() {
+      const out = [];
+      const walk = (c) => {
+        if (!c.visible || c.destroyed) return;
+        if (c.isButton) { const p = c.getGlobalPosition(); out.push({ label: c.btnText, x: p.x, y: p.y }); }
+        for (const ch of c.children) walk(ch);
+      };
+      walk(app.stage);
+      return out;
+    },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endGame) { s.endGame({ delay: 0 }); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+  };
+})().catch((e) => showFatal(e.message || String(e)));
+</script>
+</body>
+</html>

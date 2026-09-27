@@ -1,0 +1,17 @@
+.wrap {
+  aspect-ratio: 16 / 10;
+  width: 100%;
+  background: var(--stage);
+  overflow: hidden;
+}
+
+.thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+}
+
+.portrait {
+  transform: scale(1.72);
+}

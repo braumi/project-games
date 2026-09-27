@@ -1,0 +1,977 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>2048</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14121f; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #fatal { position: fixed; inset: auto 12px 12px 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fatal"></div>
+<script type="module">
+/* =====================================================================
+   PIXIJS GAME SHELL (PixiJS v8, single file, no build step)
+   Sections marked  ##### GAME-SPECIFIC #####  are the only parts that
+   change per game. Everything else is the tested framework:
+   scenes, menu, pause, game over, play again, high scores, sound,
+   input (keys + swipe + tap), tweens, responsive scaling, test hook.
+   ===================================================================== */
+import { Application, Container, Graphics, Text, Rectangle } from '/vendor/pixi.min.mjs';
+
+/* ---------- fatal error overlay (never a silent blank screen) ---------- */
+const fatalBox = document.getElementById('fatal');
+function showFatal(msg) { fatalBox.style.display = 'block'; fatalBox.textContent = 'Error: ' + msg; }
+window.addEventListener('error', (e) => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ##### GAME-SPECIFIC: CONFIG ##### */
+const CONFIG = {
+  id: 'classic-2048',          // unique per game: namespaces saved scores
+  title: '2048',
+  subtitle: 'Join the tiles, get to 2048!',
+  width: 720, height: 1280,    // design resolution (portrait). Landscape games: 1280 x 720
+  maxHighScores: 10,
+  keyRepeat: false,            // true for continuous-movement games (e.g. paddle), false for turn/grid games
+  scoreLabel: 'Score',
+  lowerIsBetter: false,        // true for time-based games (fastest time wins)
+};
+const THEME = {
+  outerBg: 0x15120f,           // letterbox color outside the play area
+  bg: 0x221d19,                // play-area background
+  panel: 0x352e28,
+  primary: 0xc0703a,
+  primaryHover: 0xd4824a,
+  secondary: 0x4a4038,
+  secondaryHover: 0x5c5046,
+  danger: 0xff5c7a,
+  text: 0xfaf6f0,
+  textDim: 0xbdb2a4,
+  accent: 0xedc22e,
+  font: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+};
+/* ##### END CONFIG ##### */
+
+const W = CONFIG.width, H = CONFIG.height;
+
+/* ---------- safe storage (localStorage may throw: private mode, sandboxed iframes) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fallback = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fallback : JSON.parse(raw); }
+      catch { return fallback; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+/* ---------- high scores ---------- */
+const HighScores = {
+  list() {
+    const l = Store.get('highscores', []);
+    return Array.isArray(l) ? l.filter((e) => e && Number.isFinite(e.score)) : [];
+  },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  better(a, b) { return CONFIG.lowerIsBetter ? a < b : a > b; },
+  /** Adds a score. Returns { rank (1-based or 0 if not ranked), isBest }. */
+  add(score) {
+    if (!Number.isFinite(score) || (!CONFIG.lowerIsBetter && score <= 0)) return { rank: 0, isBest: false };
+    const prevBest = this.list()[0];
+    const entry = { score, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list();
+    l.push(entry);
+    l.sort((a, b) => (CONFIG.lowerIsBetter ? a.score - b.score : b.score - a.score) || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    const isBest = rank === 1 && (!prevBest || this.better(score, prevBest.score));
+    return { rank, isBest };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* ---------- sound (WebAudio synth: no asset files needed) ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'move': this.tone(300, 0.04, 'sine', 0.06); break;
+      case 'score': this.tone(880, 0.07, 'triangle', 0.12, 1320); break;
+      case 'merge': this.tone(520, 0.09, 'sine', 0.12, 780); break;
+      case 'hit': this.tone(180, 0.08, 'square', 0.08); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.14, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- tweens (driven by app.ticker; promise-based; safe on destroyed targets) ---------- */
+const Ease = {
+  linear: (t) => t,
+  outQuad: (t) => 1 - (1 - t) * (1 - t),
+  outCubic: (t) => 1 - Math.pow(1 - t, 3),
+  inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  outBack: (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const Tween = {
+  active: new Set(),
+  /** props: numeric fields of target; 'scale' sets scale.x and scale.y together. */
+  to(target, props, ms = 200, ease = Ease.outCubic) {
+    return new Promise((resolve) => {
+      const from = {};
+      for (const k of Object.keys(props)) from[k] = k === 'scale' ? target.scale.x : target[k];
+      const tw = { target, props, from, ms: Math.max(1, ms), t: 0, ease, resolve };
+      this.active.add(tw);
+    });
+  },
+  apply(tw, p) {
+    const e = tw.ease(p);
+    for (const k of Object.keys(tw.props)) {
+      const v = tw.from[k] + (tw.props[k] - tw.from[k]) * e;
+      if (k === 'scale') tw.target.scale.set(v); else tw.target[k] = v;
+    }
+  },
+  update(dtMs) {
+    for (const tw of [...this.active]) {
+      if (tw.target.destroyed) { this.active.delete(tw); tw.resolve(); continue; }
+      tw.t += dtMs;
+      const p = Math.min(1, tw.t / tw.ms);
+      this.apply(tw, p);
+      if (p >= 1) { this.active.delete(tw); tw.resolve(); }
+    }
+  },
+  /** Jump every running tween (optionally only one target's) to its end state. */
+  finish(target = null) {
+    for (const tw of [...this.active]) {
+      if (target && tw.target !== target) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  /** Scale up to `peak` and back (merge/score pop). */
+  pop(target, peak = 1.15, ms = 140) {
+    const base = target.scale.x;
+    return this.to(target, { scale: base * peak }, ms, (t) => Math.sin(Math.PI * t));   // up and back in one tween; finishing lands on base
+  },
+  /** Finish only tweens whose target is `container` or inside it (e.g. this.board). Prefer this over finish(). */
+  finishWithin(container) {
+    for (const tw of [...this.active]) {
+      let n = tw.target, inside = false;
+      while (n) { if (n === container) { inside = true; break; } n = n.parent; }
+      if (!inside && !tw.target.destroyed) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  kill(target) { for (const tw of [...this.active]) if (tw.target === target) { this.active.delete(tw); tw.resolve(); } },
+  get busy() { return this.active.size > 0; },
+};
+
+/* ---------- UI helpers ---------- */
+function makeText(text, size = 32, color = THEME.text, weight = '600', extra = {}) {
+  const t = new Text({ text: String(text), style: { fontFamily: THEME.font, fontSize: size, fill: color, fontWeight: weight, align: 'center', ...extra } });
+  t.anchor.set(0.5);
+  return t;
+}
+/** Shrink a Text uniformly so it fits maxW (and optional maxH). Call after setting .text. */
+function fitText(t, maxW, maxH = Infinity) {
+  t.scale.set(1);
+  const s = Math.min(1, maxW / Math.max(1, t.width), maxH / Math.max(1, t.height));
+  t.scale.set(s);
+  return t;
+}
+function makePanel(w, h, color = THEME.panel, radius = 24, alpha = 1) {
+  const g = new Graphics();
+  g.roundRect(-w / 2, -h / 2, w, h, radius).fill({ color, alpha });
+  return g;
+}
+function makeButton(label, onTap, opts = {}) {
+  const { w = 360, h = 88, size = 34, variant = 'primary' } = opts;
+  const base = variant === 'primary' ? THEME.primary : variant === 'danger' ? THEME.danger : THEME.secondary;
+  const hover = variant === 'primary' ? THEME.primaryHover : variant === 'danger' ? 0xff7a93 : THEME.secondaryHover;
+  const c = new Container();
+  c.isButton = true;
+  c.label = 'button:' + label;
+  const bg = new Graphics();
+  const draw = (col) => { bg.clear(); bg.roundRect(-w / 2, -h / 2, w, h, Math.min(28, h / 2)).fill(col); };
+  draw(base);
+  const t = makeText(label, size, THEME.text, '700');
+  c.addChild(bg, t);
+  c.eventMode = 'static';
+  c.cursor = 'pointer';
+  c.hitArea = new Rectangle(-w / 2, -h / 2, w, h);
+  c.on('pointerover', () => { draw(hover); c.scale.set(1.03); });
+  c.on('pointerout', () => { draw(base); c.scale.set(1); });
+  c.on('pointerdown', () => c.scale.set(0.96));
+  c.on('pointerup', () => c.scale.set(1.03));
+  c.on('pointerupoutside', () => { draw(base); c.scale.set(1); });
+  c.on('pointertap', (e) => {
+    e.stopPropagation();
+    if (Scenes.busy || c.disabled) return;
+    Sfx.unlock(); Sfx.play('click');
+    onTap(e);
+  });
+  c.setText = (s) => { t.text = String(s); c.btnText = String(s); };
+  c.btnText = label;
+  return c;
+}
+/** Vertical stack of buttons centered at (x, y). */
+function buttonColumn(defs, x, y, gap = 24, opts = {}) {
+  const col = new Container();
+  const h = opts.h || 88;
+  defs.forEach(([label, fn, o], i) => {
+    const b = makeButton(label, fn, { ...opts, ...(o || {}) });
+    b.position.set(0, i * (h + gap));
+    col.addChild(b);
+  });
+  col.position.set(x, y);
+  return col;
+}
+
+/* ---------- input: keyboard + swipe + actions ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'action', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();                       // stop arrows/space scrolling the page
+      Sfx.unlock();
+      const wasHeld = this.held.has(a);
+      this.held.add(a);
+      if (e.repeat && !CONFIG.keyRepeat) return;
+      if (wasHeld && !e.repeat) return;
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+  },
+  isDown(a) { return this.held.has(a); },
+};
+/** Swipe detection on the whole screen (stage hitArea = app.screen). */
+function initSwipe(app, root) {
+  let start = null;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointerdown', (e) => { Sfx.unlock(); start = { x: e.global.x, y: e.global.y, t: performance.now() }; });
+  const end = (e) => {
+    if (!start) return;
+    const dx = (e.global.x - start.x) / root.scale.x, dy = (e.global.y - start.y) / root.scale.y;
+    const dt = performance.now() - start.t;
+    start = null;
+    const dist = Math.hypot(dx, dy);
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }   // presses on buttons are not game input
+    if (dist < 25 && dt < 500) {               // a tap anywhere: 'tap' action with design-space position
+      const p = root.toLocal(e.global);
+      Scenes.dispatch('tap', 'pointer', { x: p.x, y: p.y });
+      return;
+    }
+    if (dist < 40 || dt > 1000) return;         // design-space pixels; ignore slow drags
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    Scenes.dispatch(dir, 'swipe');
+  };
+  app.stage.on('pointerup', end);
+  app.stage.on('pointerupoutside', end);
+}
+
+/* ---------- scenes ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.view = new Container(); this.view.label = 'scene:' + name; }
+  enter(_data) {}
+  exit() {}
+  update(_dtMs) {}
+  onAction(_action, _source, _pos) {}
+  onHidden() {}
+}
+const Scenes = {
+  app: null, root: null, current: null, busy: false, registry: {},
+  register(name, cls) { this.registry[name] = cls; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const old = this.current;
+      if (old) {
+        await Tween.to(old.view, { alpha: 0 }, 140);
+        old.exit();
+        Tween.kill(old.view);
+        this.root.removeChild(old.view);
+        old.view.destroy({ children: true });
+      }
+      const Cls = this.registry[name];
+      const scene = new Cls(name);
+      this.current = scene;
+      scene.view.alpha = 0;
+      this.root.addChild(scene.view);
+      scene.enter(data);
+      await Tween.to(scene.view, { alpha: 1 }, 160);
+    } finally {
+      this.busy = false;
+    }
+  },
+  inputStats: {},
+  dispatch(action, source, pos = null) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, pos);
+  },
+};
+
+/* ---------- shared background ---------- */
+function makeBackground() {
+  const g = new Graphics();
+  g.rect(0, 0, W, H).fill(THEME.bg);
+  return g;
+}
+function soundLabel() { return Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+
+/* ---------- Menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    const title = makeText(CONFIG.title, 96, THEME.text, '800');
+    fitText(title, W - 80);
+    title.position.set(W / 2, H * 0.24);
+    const sub = makeText(CONFIG.subtitle, 30, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 120 });
+    fitText(sub, W - 120, 80);
+    sub.position.set(W / 2, H * 0.24 + 90);
+    const best = HighScores.best();
+    const bestT = makeText(best ? `Best: ${formatScore(best)}` : 'No high score yet', 32, THEME.accent, '700');
+    bestT.position.set(W / 2, H * 0.24 + 160);
+    this.soundBtn = null;
+    const col = buttonColumn([
+      ['Play', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      [soundLabel(), () => { Sfx.setMuted(!Sfx.muted); this.onMuteChanged(); }, { variant: 'secondary' }],
+    ], W / 2, H * 0.55);
+    this.soundBtn = col.children[2];
+    const hint = makeText('Enter to play  ·  M to mute', 24, THEME.textDim, '500');
+    hint.position.set(W / 2, H - 80);
+    this.view.addChild(title, sub, bestT, col, hint);
+  }
+  onMuteChanged() { this.soundBtn?.setText(soundLabel()); }
+  onAction(a) { if (a === 'confirm' || a === 'action') Scenes.go('game'); }
+}
+
+/* ---------- High scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const title = makeText('High Scores', 72, THEME.text, '800');
+    title.position.set(W / 2, 150);
+    const panelH = 80 + CONFIG.maxHighScores * 64;
+    const panel = makePanel(W - 120, panelH);
+    panel.position.set(W / 2, 250 + panelH / 2);
+    this.view.addChild(title, panel);
+    const list = HighScores.list();
+    if (!list.length) {
+      const none = makeText('No scores yet. Go play!', 34, THEME.textDim, '500');
+      none.position.set(W / 2, 250 + panelH / 2);
+      this.view.addChild(none);
+    }
+    list.forEach((e, i) => {
+      const y = 250 + 72 + i * 64;
+      const color = i === 0 ? THEME.accent : THEME.text;
+      const r = makeText(`${i + 1}.`, 34, color, '700'); r.anchor.set(0, 0.5); r.position.set(110, y);
+      const s = makeText(formatScore(e.score), 34, color, '700'); s.position.set(W / 2, y);
+      const d = makeText(e.date || '', 24, THEME.textDim, '500'); d.anchor.set(1, 0.5); d.position.set(W - 110, y);
+      this.view.addChild(r, s, d);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, Math.min(H - 110, 250 + panelH + 110));
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- Game over ---------- */
+class GameOverScene extends Scene {
+  enter({ score = 0, rank = 0, isBest = false, won = false } = {}) {
+    this.score = score;
+    const title = makeText(won ? 'You Win!' : 'Game Over', 92, won ? THEME.accent : THEME.text, '800');
+    fitText(title, W - 80);
+    title.position.set(W / 2, H * 0.22);
+    const label = makeText(CONFIG.scoreLabel, 30, THEME.textDim, '600');
+    label.position.set(W / 2, H * 0.34);
+    const s = makeText(formatScore(score), 110, THEME.text, '800');
+    fitText(s, W - 80);
+    s.position.set(W / 2, H * 0.34 + 90);
+    const bestLine = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${formatScore(HighScores.best())}`;
+    const b = makeText(bestLine, 36, isBest ? THEME.accent : THEME.textDim, '700');
+    b.position.set(W / 2, H * 0.34 + 190);
+    const col = buttonColumn([
+      ['Play Again', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], W / 2, H * 0.62);
+    this.view.addChild(title, label, s, b, col);
+    if (isBest) { b.scale.set(0.2); Tween.to(b, { scale: 1 }, 450, Ease.outBack); }
+  }
+  onAction(a) { if (a === 'confirm' || a === 'action' || a === 'restart') Scenes.go('game'); else if (a === 'pause') Scenes.go('menu'); }
+}
+
+/* ---------- Game scene: framework part (HUD, pause, end) ---------- */
+class GameSceneBase extends Scene {
+  enter() {
+    this.score = 0;
+    this.state = 'playing';              // 'playing' | 'paused' | 'over'
+    this.board = new Container();        // put all game visuals in here
+    this.board.label = 'board';
+    this.hud = new Container();
+    this.overlay = null;
+    this.view.addChild(this.board, this.hud);
+    this.buildHud();
+    this.initGame();
+    this.renderScore();
+  }
+  buildHud() {
+    const scoreBox = makePanel(220, 96, THEME.panel, 18); scoreBox.position.set(150, 80);
+    const bestBox = makePanel(220, 96, THEME.panel, 18); bestBox.position.set(390, 80);
+    const sl = makeText(CONFIG.scoreLabel.toUpperCase(), 20, THEME.textDim, '700'); sl.position.set(150, 56);
+    const bl = makeText('BEST', 20, THEME.textDim, '700'); bl.position.set(390, 56);
+    this.scoreText = makeText('0', 40, THEME.text, '800'); this.scoreText.position.set(150, 96);
+    this.bestText = makeText(formatScore(HighScores.best()), 40, THEME.text, '800'); this.bestText.position.set(390, 96);
+    const pause = makeButton('II', () => this.togglePause(), { w: 96, h: 96, size: 34, variant: 'secondary' });
+    pause.label = 'button:Pause';
+    pause.position.set(W - 90, 80);
+    this.hud.addChild(scoreBox, bestBox, sl, bl, this.scoreText, this.bestText, pause);
+  }
+  addScore(n) {
+    if (this.state === 'over') return;
+    this.score += n;
+    this.renderScore();
+  }
+  setScore(n) { this.score = n; this.renderScore(); }
+  renderScore() {
+    this.scoreText.text = formatScore(this.score);
+    const best = HighScores.best();
+    const shown = CONFIG.lowerIsBetter ? best : Math.max(best, this.score);
+    this.bestText.text = formatScore(shown);
+  }
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedOverlay = this.overlay;               // keep e.g. a win overlay underneath; restored on resume
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => Scenes.go('game'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ]);
+  }
+  resume() {
+    this.hideOverlay();
+    if (this.savedOverlay && !this.savedOverlay.destroyed) { this.savedOverlay.visible = true; this.overlay = this.savedOverlay; }
+    this.savedOverlay = null;
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  showOverlay(title, buttons, subtitle = '') {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.6 });
+    dim.eventMode = 'static';                         // swallow clicks to the game underneath
+    dim.on('pointertap', (e) => e.stopPropagation());
+    const panelH = 218 + buttons.length * 112 + (subtitle ? 40 : 0);
+    const panel = makePanel(W - 140, panelH); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 64, THEME.text, '800'); fitText(t, W - 220); t.position.set(W / 2, H / 2 - panelH / 2 + 90);
+    o.addChild(dim, panel, t);
+    if (subtitle) { const s = makeText(subtitle, 28, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 220 }); s.position.set(W / 2, t.y + 70); o.addChild(s); }
+    const col = buttonColumn(buttons, W / 2, t.y + (subtitle ? 180 : 140));
+    o.addChild(col);
+    this.overlay = o;
+    this.view.addChild(o);
+  }
+  hideOverlay() { if (this.overlay) { this.overlay.destroy({ children: true }); this.overlay = null; } }
+  hideAllOverlays() { this.hideOverlay(); if (this.savedOverlay) { this.savedOverlay.destroy({ children: true }); this.savedOverlay = null; } }
+  /** Call exactly when the game ends. Idempotent. */
+  endGame({ won = false, delay = 500 } = {}) {
+    if (this.state === 'over') return;
+    this.state = 'over';
+    this.hideAllOverlays();
+    Sfx.play(won ? 'win' : 'lose');
+    const { rank, isBest } = HighScores.add(this.score);
+    const score = this.score;
+    wait(delay).then(() => { if (Scenes.current === this) Scenes.go('gameover', { score, rank, isBest, won }); });
+  }
+  onAction(a, source, pos) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.overlay) return;                       // game-specific overlay (e.g. win) is showing: only its buttons act
+    if (a === 'restart' && this.state === 'playing') return Scenes.go('game');
+    if (this.state !== 'playing') return;
+    this.handleInput(a, source, pos);
+  }
+  update(dtMs) { if (this.state === 'playing') this.tick(dtMs); }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+  exit() { this.cleanup?.(); }
+  /** Override in GameScene to also expose game data, e.g. { ...super.debugState(), grid: this.grid } (verify.py and play-tests read it). */
+  debugState() { return { state: this.state, score: this.score }; }
+}
+
+/* ---------- timing helper: resolves after ms of ticker time ---------- */
+function wait(ms) {
+  return new Promise((resolve) => {
+    let t = 0;
+    const fn = (ticker) => { t += ticker.deltaMS; if (t >= ms) { Scenes.app.ticker.remove(fn); resolve(); } };
+    Scenes.app.ticker.add(fn);
+  });
+}
+
+/* ##### GAME-SPECIFIC: formatting ##### */
+function formatScore(n) { return String(Math.round(n)); }
+
+/* ##### GAME-SPECIFIC: pure game logic (NO Pixi here; unit-tested below) ##### */
+const Logic = {
+  N: 4,
+  WIN_VALUE: 2048,
+  empty(n = 4) { return Array.from({ length: n }, () => Array(n).fill(0)); },
+  clone(grid) { return grid.map((row) => row.slice()); },
+  /** Slide one row toward index 0. Each tile merges at most once; merging resolves from index 0. */
+  slideRow(row) {
+    const tiles = [];
+    row.forEach((v, i) => { if (v) tiles.push({ v, i }); });
+    const out = Array(row.length).fill(0);
+    const merges = [], dest = [];
+    let k = 0, gained = 0;
+    for (let t = 0; t < tiles.length; t++) {
+      const a = tiles[t], b = tiles[t + 1];
+      if (b && a.v === b.v) {
+        out[k] = a.v * 2; gained += a.v * 2;
+        merges.push({ from: [a.i, b.i], to: k });
+        dest.push({ from: a.i, to: k }, { from: b.i, to: k });
+        t++;
+      } else {
+        out[k] = a.v;
+        dest.push({ from: a.i, to: k });
+      }
+      k++;
+    }
+    const moved = out.some((v, i) => v !== row[i]);
+    return { row: out, gained, merges, moved, dest };
+  },
+  /** Cells of line i, ordered from the side tiles move toward. */
+  lineCoords(dir, i, n) {
+    const out = [];
+    for (let j = 0; j < n; j++) {
+      if (dir === 'left') out.push([i, j]);
+      else if (dir === 'right') out.push([i, n - 1 - j]);
+      else if (dir === 'up') out.push([j, i]);
+      else out.push([n - 1 - j, i]);        // down
+    }
+    return out;
+  },
+  move(grid, dir) {
+    const n = grid.length;
+    const next = this.empty(n);
+    const moves = [], merged = [];
+    let gained = 0, moved = false;
+    for (let i = 0; i < n; i++) {
+      const coords = this.lineCoords(dir, i, n);
+      const line = coords.map(([r, c]) => grid[r][c]);
+      const res = this.slideRow(line);
+      res.row.forEach((v, j) => { const [r, c] = coords[j]; next[r][c] = v; });
+      for (const d of res.dest) {
+        const [fr, fc] = coords[d.from], [tr, tc] = coords[d.to];
+        moves.push({ fromR: fr, fromC: fc, toR: tr, toC: tc, value: line[d.from] });
+      }
+      for (const m of res.merges) { const [r, c] = coords[m.to]; merged.push({ r, c, value: res.row[m.to] }); }
+      gained += res.gained;
+      moved = moved || res.moved;
+    }
+    return { grid: next, gained, moved, moves, merged };
+  },
+  emptyCells(grid) {
+    const out = [];
+    grid.forEach((row, r) => row.forEach((v, c) => { if (!v) out.push([r, c]); }));
+    return out;
+  },
+  spawn(grid, rng = Math.random) {
+    const cells = this.emptyCells(grid);
+    const g = this.clone(grid);
+    if (!cells.length) return { grid: g, cell: null };
+    const [r, c] = cells[Math.min(cells.length - 1, Math.floor(rng() * cells.length))];
+    const value = rng() < 0.9 ? 2 : 4;
+    g[r][c] = value;
+    return { grid: g, cell: { r, c, value } };
+  },
+  canMove(grid) {
+    const n = grid.length;
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+      const v = grid[r][c];
+      if (!v) return true;
+      if (c + 1 < n && grid[r][c + 1] === v) return true;
+      if (r + 1 < n && grid[r + 1][c] === v) return true;
+    }
+    return false;
+  },
+  hasValue(grid, v) { return grid.some((row) => row.includes(v)); },
+  newGame(rng = Math.random, n = 4) {
+    let g = this.empty(n);
+    g = this.spawn(g, rng).grid;
+    g = this.spawn(g, rng).grid;
+    return g;
+  },
+  /** One full turn: move, spawn only if changed, then decide outcome.
+   *  outcome: 'none' | 'win' (show overlay) | 'over' (endGame; won says whether 2048 was reached). */
+  turn(grid, dir, rng = Math.random, winShown = false) {
+    const m = this.move(grid, dir);
+    if (!m.moved) return { ...m, grid: this.clone(grid), spawned: null, outcome: 'none', won: winShown };
+    const s = this.spawn(m.grid, rng);
+    const reached = this.hasValue(s.grid, this.WIN_VALUE);
+    const dead = !this.canMove(s.grid);
+    let outcome = 'none';
+    if (dead) outcome = 'over';
+    else if (reached && !winShown) outcome = 'win';
+    return { ...m, grid: s.grid, spawned: s.cell, outcome, won: winShown || reached };
+  },
+};
+function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+/* ##### GAME-SPECIFIC: logic self-tests (run by verify.py via window.__game.selfTest()) ##### */
+const row = (r) => Logic.slideRow(r).row;
+const TESTS = [
+  ['spec rows slide left', () => {
+    assertEq(row([2, 2, 2, 2]), [4, 4, 0, 0]);
+    assertEq(row([2, 2, 2, 0]), [4, 2, 0, 0]);
+    assertEq(row([4, 4, 8, 0]), [8, 8, 0, 0]);
+    assertEq(row([2, 0, 2, 4]), [4, 4, 0, 0]);
+    assertEq(row([8, 0, 0, 8]), [16, 0, 0, 0]);
+    assertEq(row([0, 0, 0, 2]), [2, 0, 0, 0]);
+  }],
+  ['no double merge [2,2,4,0]', () => { assertEq(row([2, 2, 4, 0]), [4, 4, 0, 0]); assertEq(row([4, 4, 8, 8]), [8, 16, 0, 0]); }],
+  ['right merge priority [2,2,2,0] -> [0,0,2,4]', () => {
+    const g = [[2, 2, 2, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    assertEq(Logic.move(g, 'right').grid[0], [0, 0, 2, 4]);
+  }],
+  ['down merge priority', () => {
+    const g = [[2, 0, 0, 0], [2, 0, 0, 0], [2, 0, 0, 0], [0, 0, 0, 0]];
+    const m = Logic.move(g, 'down').grid;
+    assertEq(m.map((r) => r[0]), [0, 0, 2, 4]);
+    const u = Logic.move(g, 'up').grid;
+    assertEq(u.map((r) => r[0]), [4, 2, 0, 0]);
+  }],
+  ['score adds merged value, not pre-merge', () => {
+    assertEq(Logic.slideRow([2, 2, 4, 4]).gained, 12);
+    assertEq(Logic.slideRow([2, 4, 8, 16]).gained, 0);
+    const g = [[4, 4, 0, 0], [8, 8, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    assertEq(Logic.move(g, 'left').gained, 24);
+  }],
+  ['no-op move: no spawn, grid unchanged', () => {
+    const g = [[2, 4, 0, 0], [8, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    const t = Logic.turn(g, 'left', mulberry32(1));
+    assert(!t.moved, 'should not move');
+    assertEq(t.grid, g); assertEq(t.spawned, null); assertEq(t.gained, 0);
+  }],
+  ['changing move spawns exactly one tile of 2 or 4', () => {
+    const g = [[0, 0, 0, 2], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    const t = Logic.turn(g, 'left', mulberry32(7));
+    assert(t.moved && t.spawned, 'should move and spawn');
+    const count = t.grid.flat().filter(Boolean).length;
+    assertEq(count, 2);
+    assert([2, 4].includes(t.spawned.value), 'spawn value');
+  }],
+  ['move/spawn/turn do not mutate input', () => {
+    const g = [[2, 2, 0, 4], [0, 4, 4, 0], [2, 0, 2, 0], [8, 8, 8, 8]];
+    const before = JSON.stringify(g);
+    for (const d of ['left', 'right', 'up', 'down']) { Logic.move(g, d); Logic.turn(g, d, mulberry32(3)); }
+    Logic.spawn(g, mulberry32(2)); Logic.canMove(g);
+    assertEq(JSON.stringify(g), before);
+  }],
+  ['game over detects vertical pairs', () => {
+    const vert = [[2, 4, 2, 4], [2, 8, 16, 8], [4, 2, 4, 2], [8, 4, 8, 4]];   // only vertical 2/2 in column 0
+    assert(Logic.canMove(vert), 'vertical pair must allow move');
+    const horiz = [[2, 2, 8, 4], [4, 8, 16, 8], [2, 4, 2, 4], [4, 2, 4, 2]];
+    assert(Logic.canMove(horiz), 'horizontal pair');
+    const dead = [[2, 4, 2, 4], [4, 2, 4, 2], [2, 4, 2, 4], [4, 2, 4, 2]];
+    assert(!Logic.canMove(dead), 'dead board');
+    assert(Logic.canMove([[2, 4, 2, 4], [4, 2, 4, 2], [2, 4, 0, 4], [4, 2, 4, 2]]), 'empty cell');
+  }],
+  ['win outcome once; keep going never re-triggers', () => {
+    const g = [[1024, 1024, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    const t = Logic.turn(g, 'left', mulberry32(5), false);
+    assertEq(t.outcome, 'win'); assert(t.won);
+    const g2 = [[2048, 0, 0, 0], [1024, 1024, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    const t2 = Logic.turn(g2, 'left', mulberry32(5), true);
+    assertEq(t2.outcome, 'none'); assert(t2.won);
+  }],
+  ['win on a dead board -> over with won', () => {
+    const g = [[1024, 1024, 32, 8], [64, 128, 256, 16], [2, 4, 8, 32], [4, 8, 16, 64]];
+    for (let s = 1; s < 20; s++) {
+      const t = Logic.turn(g, 'left', mulberry32(s), false);
+      assertEq(t.outcome, 'over'); assert(t.won, 'won flag');
+    }
+  }],
+  ['lose checked after spawn', () => {
+    const g = [[2, 4, 2, 0], [8, 4, 2, 4], [4, 2, 4, 2], [2, 4, 2, 4]];
+    const dead = Logic.turn(g, 'right', () => 0.95);           // spawns a 4 at (0,0) -> no moves left
+    assertEq(dead.grid[0], [4, 2, 4, 2]);
+    assertEq(dead.outcome, 'over'); assert(!dead.won, 'not won');
+    const alive = Logic.turn(g, 'right', () => 0.5);           // spawns a 2 at (0,0) -> 2,2 pair remains
+    assertEq(alive.grid[0], [2, 2, 4, 2]);
+    assertEq(alive.outcome, 'none');
+  }],
+  ['moves list: one entry per tile, merges share destination', () => {
+    const g = [[2, 2, 0, 4], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    const m = Logic.move(g, 'left');
+    assertEq(m.moves.length, 3);
+    assertEq(m.moves.filter((x) => x.toC === 0).length, 2);
+    assertEq(m.merged, [{ r: 0, c: 0, value: 4 }]);
+  }],
+  ['newGame has exactly two tiles', () => {
+    for (let s = 1; s < 30; s++) {
+      const g = Logic.newGame(mulberry32(s));
+      assertEq(g.flat().filter(Boolean).length, 2);
+      assert(g.flat().every((v) => [0, 2, 4].includes(v)), 'values');
+    }
+  }],
+  ['spawn distribution ~90% twos', () => {
+    const rng = mulberry32(99); let twos = 0;
+    for (let i = 0; i < 2000; i++) if (Logic.spawn(Logic.empty(), rng).cell.value === 2) twos++;
+    assert(twos > 1700 && twos < 1900, 'twos=' + twos);
+  }],
+  ['seeded 500-move simulation keeps invariants', () => {
+    const rng = mulberry32(42); let g = Logic.newGame(rng), score = 0, won = false;
+    const dirs = ['left', 'right', 'up', 'down'];
+    for (let i = 0; i < 500; i++) {
+      const sumBefore = g.flat().reduce((a, b) => a + b, 0);
+      const t = Logic.turn(g, dirs[Math.floor(rng() * 4)], rng, won);
+      assert(t.gained >= 0 && Number.isFinite(t.gained), 'gained');
+      score += t.gained; won = t.won;
+      const sumAfter = t.grid.flat().reduce((a, b) => a + b, 0);
+      assertEq(sumAfter, sumBefore + (t.spawned ? t.spawned.value : 0), 'tile sum conserved');
+      assertEq(t.grid.length, 4); assert(t.grid.every((r) => r.length === 4), 'shape');
+      g = t.grid;
+      if (t.outcome === 'over') { g = Logic.newGame(rng); won = false; }
+    }
+    assert(Number.isFinite(score) && score > 0, 'score');
+  }],
+];
+
+/* ##### GAME-SPECIFIC: the game scene ##### */
+const TILE_COLORS = { 2: 0xeee4da, 4: 0xede0c8, 8: 0xf2b179, 16: 0xf59563, 32: 0xf67c5f, 64: 0xf65e3b,
+  128: 0xedcf72, 256: 0xedcc61, 512: 0xedc850, 1024: 0xedc53f, 2048: 0xedc22e };
+class GameScene extends GameSceneBase {
+  initGame() {
+    this.N = 4; this.gap = 16; this.size = 620;
+    this.cell = (this.size - (this.N + 1) * this.gap) / this.N;   // 135
+    this.boardX = (W - this.size) / 2; this.boardY = 620 - this.size / 2;
+    this.moveId = 0;
+    this.winShown = false;
+    const bg = new Graphics();
+    bg.roundRect(this.boardX, this.boardY, this.size, this.size, 20).fill(0xbbada0);
+    for (let r = 0; r < this.N; r++) for (let c = 0; c < this.N; c++) {
+      const p = this.cellPos(r, c);
+      bg.roundRect(p.x - this.cell / 2, p.y - this.cell / 2, this.cell, this.cell, 12).fill(0xcdc1b4);
+    }
+    this.board.addChild(bg);
+    this.tileLayer = new Container(); this.board.addChild(this.tileLayer);
+    const hint = makeText('Arrows / WASD or swipe to move tiles', 26, THEME.textDim, '500');
+    fitText(hint, W - 80);
+    hint.position.set(W / 2, this.boardY + this.size + 70);
+    this.board.addChild(hint);
+    this.grid = Logic.newGame();
+    this.syncView([], null, true);
+  }
+  cellPos(r, c) {
+    return { x: this.boardX + this.gap + c * (this.cell + this.gap) + this.cell / 2,
+             y: this.boardY + this.gap + r * (this.cell + this.gap) + this.cell / 2 };
+  }
+  makeTile(value) {
+    const t = new Container();
+    const g = new Graphics();
+    g.roundRect(-this.cell / 2, -this.cell / 2, this.cell, this.cell, 12).fill(TILE_COLORS[value] ?? 0x3c3a32);
+    const digits = String(value).length;
+    const size = digits <= 2 ? 64 : digits === 3 ? 56 : digits === 4 ? 46 : 38;
+    const txt = makeText(value, size, value <= 4 ? 0x776e65 : 0xf9f6f2, '800');
+    fitText(txt, this.cell - 18);
+    t.addChild(g, txt);
+    return t;
+  }
+  /** Rebuild every tile from this.grid (the view can never drift from logic). */
+  syncView(merged = [], spawned = null, spawnAll = false) {
+    for (const ch of [...this.tileLayer.children]) { Tween.kill(ch); ch.destroy({ children: true }); }
+    for (let r = 0; r < this.N; r++) for (let c = 0; c < this.N; c++) {
+      const v = this.grid[r][c];
+      if (!v) continue;
+      const t = this.makeTile(v);
+      const p = this.cellPos(r, c); t.position.set(p.x, p.y);
+      this.tileLayer.addChild(t);
+      if (spawnAll || (spawned && spawned.r === r && spawned.c === c)) { t.scale.set(0); Tween.to(t, { scale: 1 }, 120, Ease.outCubic); }
+      else if (merged.some((m) => m.r === r && m.c === c)) Tween.pop(t, 1.15, 120);
+    }
+  }
+  handleInput(action) {
+    if (!['left', 'right', 'up', 'down'].includes(action)) return;
+    // finish any running slide/pop and rebuild from logic before applying the new move
+    Tween.finishWithin(this.board);
+    this.moveId++;
+    this.syncView();
+    const res = Logic.turn(this.grid, action, Math.random, this.winShown);
+    if (!res.moved) return;                         // no-op: no spawn, no sound, no animation
+    this.grid = res.grid;
+    if (res.gained) { this.addScore(res.gained); Sfx.play('merge'); } else Sfx.play('move');
+    const id = this.moveId;
+    this.animateSlide(res.moves).then(() => {
+      if (id !== this.moveId || this.tileLayer.destroyed) return;
+      this.syncView(res.merged, res.spawned);
+    });
+    if (res.outcome === 'over') { this.winShown = this.winShown || res.won; this.endGame({ won: res.won }); }
+    else if (res.outcome === 'win') {
+      this.winShown = true;
+      Sfx.play('win');
+      this.showOverlay('You made 2048!', [
+        ['Keep Going', () => this.hideOverlay()],
+        ['New Game', () => Scenes.go('game'), { variant: 'secondary' }],
+      ], 'Keep playing for a higher score');
+    }
+  }
+  animateSlide(moves) {
+    for (const ch of [...this.tileLayer.children]) ch.destroy({ children: true });
+    const tweens = moves.map((m) => {
+      const t = this.makeTile(m.value);
+      const a = this.cellPos(m.fromR, m.fromC), b = this.cellPos(m.toR, m.toC);
+      t.position.set(a.x, a.y);
+      this.tileLayer.addChild(t);
+      return Tween.to(t, { x: b.x, y: b.y }, 100, Ease.outQuad);
+    });
+    return Promise.all(tweens);
+  }
+  tick() {}
+  debugState() { return { ...super.debugState(), grid: this.grid, winShown: this.winShown, overlay: !!this.overlay }; }
+}
+/* ##### END GAME-SPECIFIC ##### */
+
+/* ---------- test helpers ---------- */
+function assert(cond, msg = 'assertion failed') { if (!cond) throw new Error(msg); }
+function assertEq(a, b, msg = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg} expected ${B} got ${A}`); }
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const app = new Application();
+  await app.init({
+    resizeTo: window,
+    background: THEME.outerBg,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preference: 'webgl',
+  });
+  document.getElementById('app').appendChild(app.canvas);
+
+  const root = new Container(); root.label = 'root';
+  root.addChild(makeBackground());
+  const sceneLayer = new Container(); sceneLayer.label = 'scenes';
+  root.addChild(sceneLayer);
+  app.stage.addChild(root);
+
+  const mask = new Graphics(); mask.rect(0, 0, W, H).fill(0xffffff);
+  root.addChild(mask); root.mask = mask;       // nothing draws outside the play area
+
+  function layout() {
+    const sw = app.screen.width, sh = app.screen.height;
+    const s = Math.min(sw / W, sh / H);
+    root.scale.set(s);
+    root.position.set(Math.round((sw - W * s) / 2), Math.round((sh - H * s) / 2));
+    app.stage.hitArea = app.screen;
+  }
+  layout();
+  window.addEventListener('resize', () => requestAnimationFrame(() => { app.resize(); layout(); }));
+
+  Scenes.app = app; Scenes.root = sceneLayer;
+  Scenes.register('menu', MenuScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+
+  Input.init();
+  initSwipe(app, root);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden(); });
+
+  app.ticker.add((ticker) => {
+    const dt = Math.min(ticker.deltaMS, 50);  // clamp: no huge jumps after tab switch
+    Tween.update(dt);
+    Scenes.current?.update(dt);
+  });
+
+  await Scenes.go('menu');
+
+  /* test hook used by scripts/verify.py (harmless in production) */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },          // for checks.js: direct access to the live scene (set up boards, read fields)
+    inputStats() { return { ...Scenes.inputStats }; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    boardObjects() { const b = Scenes.current?.board; let n = 0; const walk = (c) => { if (!c.visible) return; n++; c.children.forEach(walk); }; if (b) walk(b); return n - (b ? 1 : 0); },
+    buttons() {
+      const out = [];
+      const walk = (c) => {
+        if (!c.visible || c.destroyed) return;
+        if (c.isButton) { const p = c.getGlobalPosition(); out.push({ label: c.btnText, x: p.x, y: p.y }); }
+        for (const ch of c.children) walk(ch);
+      };
+      walk(app.stage);
+      return out;
+    },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endGame) { s.endGame({ delay: 0 }); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+  };
+})().catch((e) => showFatal(e.message || String(e)));
+</script>
+</body>
+</html>

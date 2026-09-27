@@ -1,0 +1,1642 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Star Kick</title><!-- GAME-SPECIFIC: set to CONFIG.title (galleries read this tag) -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14121f; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #fatal { position: fixed; inset: auto 12px 12px 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fatal"></div>
+<script src="/vendor/matter.min.js"></script>
+<script type="module">
+/* =====================================================================
+   PIXIJS GAME SHELL (PixiJS v8, single file, no build step)
+   Sections marked  ##### GAME-SPECIFIC #####  are the only parts that
+   change per game. Everything else is the tested framework:
+   scenes, menu, pause, game over, play again, high scores, sound,
+   input (keys + swipe + tap), tweens, responsive scaling, test hook.
+   ===================================================================== */
+import { Application, Container, Graphics, Text, Rectangle } from '/vendor/pixi.min.mjs';
+
+/* ---------- fatal error overlay (never a silent blank screen) ---------- */
+const fatalBox = document.getElementById('fatal');
+function showFatal(msg) { fatalBox.style.display = 'block'; fatalBox.textContent = 'Error: ' + msg; }
+window.addEventListener('error', (e) => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ##### GAME-SPECIFIC: CONFIG ##### */
+const CONFIG = {
+  id: 'star-kick',             // unique per game: namespaces saved scores
+  title: 'Star Kick',
+  subtitle: 'Hit a star, then score a goal!',
+  width: 1280, height: 720,    // landscape
+  maxHighScores: 10,
+  keyRepeat: true,             // hold arrows to adjust the aim
+  scoreLabel: 'Score',
+  lowerIsBetter: false,
+};
+const THEME = {
+  outerBg: 0x14121f,
+  bg: 0x1f1b2e,
+  panel: 0x2b2640,
+  primary: 0x7c5cff,
+  primaryHover: 0x9479ff,
+  secondary: 0x3a3452,
+  secondaryHover: 0x4a4366,
+  danger: 0xff5c7a,
+  text: 0xf4f1ff,
+  textDim: 0xa9a3c4,
+  accent: 0xffd166,
+  font: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+};
+/* Optional hooks, filled in the GAME-SPECIFIC scene section AFTER your classes are defined. */
+const GAME_HOOKS = { menuButtons: [], scenes: {} };
+/* ##### END CONFIG ##### */
+const W = CONFIG.width, H = CONFIG.height;
+const LAND = W > H;   // landscape layout for the shared screens
+
+/* ---------- safe storage (localStorage may throw: private mode, sandboxed iframes) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fallback = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fallback : JSON.parse(raw); }
+      catch { return fallback; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+/* ---------- high scores ---------- */
+const HighScores = {
+  list() {
+    const l = Store.get('highscores', []);
+    return Array.isArray(l) ? l.filter((e) => e && Number.isFinite(e.score)) : [];
+  },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  better(a, b) { return CONFIG.lowerIsBetter ? a < b : a > b; },
+  /** Adds a score. Returns { rank (1-based or 0 if not ranked), isBest }. */
+  add(score) {
+    if (!Number.isFinite(score) || (!CONFIG.lowerIsBetter && score <= 0)) return { rank: 0, isBest: false };
+    const prevBest = this.list()[0];
+    const entry = { score, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list();
+    l.push(entry);
+    l.sort((a, b) => (CONFIG.lowerIsBetter ? a.score - b.score : b.score - a.score) || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    const isBest = rank === 1 && (!prevBest || this.better(score, prevBest.score));
+    return { rank, isBest };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* ---------- sound (WebAudio synth: no asset files needed) ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'move': this.tone(300, 0.04, 'sine', 0.06); break;
+      case 'score': this.tone(880, 0.07, 'triangle', 0.12, 1320); break;
+      case 'merge': this.tone(520, 0.09, 'sine', 0.12, 780); break;
+      case 'hit': this.tone(180, 0.08, 'square', 0.08); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.14, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- tweens (driven by app.ticker; promise-based; safe on destroyed targets) ---------- */
+const Ease = {
+  linear: (t) => t,
+  outQuad: (t) => 1 - (1 - t) * (1 - t),
+  outCubic: (t) => 1 - Math.pow(1 - t, 3),
+  inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  outBack: (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const Tween = {
+  active: new Set(),
+  /** props: numeric fields of target; 'scale' sets scale.x and scale.y together. */
+  to(target, props, ms = 200, ease = Ease.outCubic) {
+    return new Promise((resolve) => {
+      const from = {};
+      for (const k of Object.keys(props)) from[k] = k === 'scale' ? target.scale.x : target[k];
+      const tw = { target, props, from, ms: Math.max(1, ms), t: 0, ease, resolve };
+      this.active.add(tw);
+    });
+  },
+  apply(tw, p) {
+    const e = tw.ease(p);
+    for (const k of Object.keys(tw.props)) {
+      const v = tw.from[k] + (tw.props[k] - tw.from[k]) * e;
+      if (k === 'scale') tw.target.scale.set(v); else tw.target[k] = v;
+    }
+  },
+  update(dtMs) {
+    for (const tw of [...this.active]) {
+      if (tw.target.destroyed) { this.active.delete(tw); tw.resolve(); continue; }
+      tw.t += dtMs;
+      const p = Math.min(1, tw.t / tw.ms);
+      this.apply(tw, p);
+      if (p >= 1) { this.active.delete(tw); tw.resolve(); }
+    }
+  },
+  /** Jump every running tween (optionally only one target's) to its end state. */
+  finish(target = null) {
+    for (const tw of [...this.active]) {
+      if (target && tw.target !== target) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  /** Scale up to `peak` and back (merge/score pop). */
+  pop(target, peak = 1.15, ms = 140) {
+    const base = target.scale.x;
+    return this.to(target, { scale: base * peak }, ms, (t) => Math.sin(Math.PI * t));   // up and back in one tween; finishing lands on base
+  },
+  /** Finish only tweens whose target is `container` or inside it (e.g. this.board). Prefer this over finish(). */
+  finishWithin(container) {
+    for (const tw of [...this.active]) {
+      let n = tw.target, inside = false;
+      while (n) { if (n === container) { inside = true; break; } n = n.parent; }
+      if (!inside && !tw.target.destroyed) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  kill(target) { for (const tw of [...this.active]) if (tw.target === target) { this.active.delete(tw); tw.resolve(); } },
+  get busy() { return this.active.size > 0; },
+};
+
+/* ---------- UI helpers ---------- */
+function makeText(text, size = 32, color = THEME.text, weight = '600', extra = {}) {
+  const t = new Text({ text: String(text), style: { fontFamily: THEME.font, fontSize: size, fill: color, fontWeight: weight, align: 'center', ...extra } });
+  t.anchor.set(0.5);
+  return t;
+}
+/** Shrink a Text uniformly so it fits maxW (and optional maxH). Call after setting .text. */
+function fitText(t, maxW, maxH = Infinity) {
+  t.scale.set(1);
+  const s = Math.min(1, maxW / Math.max(1, t.width), maxH / Math.max(1, t.height));
+  t.scale.set(s);
+  return t;
+}
+function makePanel(w, h, color = THEME.panel, radius = 24, alpha = 1) {
+  const g = new Graphics();
+  g.roundRect(-w / 2, -h / 2, w, h, radius).fill({ color, alpha });
+  return g;
+}
+function makeButton(label, onTap, opts = {}) {
+  const { w = 360, h = 88, size = 34, variant = 'primary' } = opts;
+  const base = variant === 'primary' ? THEME.primary : variant === 'danger' ? THEME.danger : THEME.secondary;
+  const hover = variant === 'primary' ? THEME.primaryHover : variant === 'danger' ? 0xff7a93 : THEME.secondaryHover;
+  const c = new Container();
+  c.isButton = true;
+  c.label = 'button:' + label;
+  const bg = new Graphics();
+  const draw = (col) => { bg.clear(); bg.roundRect(-w / 2, -h / 2, w, h, Math.min(28, h / 2)).fill(col); };
+  draw(base);
+  const t = makeText(label, size, THEME.text, '700');
+  c.addChild(bg, t);
+  c.eventMode = 'static';
+  c.cursor = 'pointer';
+  c.hitArea = new Rectangle(-w / 2, -h / 2, w, h);
+  c.on('pointerover', () => { draw(hover); c.scale.set(1.03); });
+  c.on('pointerout', () => { draw(base); c.scale.set(1); });
+  c.on('pointerdown', () => c.scale.set(0.96));
+  c.on('pointerup', () => c.scale.set(1.03));
+  c.on('pointerupoutside', () => { draw(base); c.scale.set(1); });
+  c.on('pointertap', (e) => {
+    e.stopPropagation();
+    if (Scenes.busy || c.disabled) return;
+    Sfx.unlock(); Sfx.play('click');
+    onTap(e);
+  });
+  c.setText = (s) => { t.text = String(s); c.btnText = String(s); };
+  c.btnText = label;
+  return c;
+}
+/** Vertical stack of buttons centered at (x, y). */
+function buttonColumn(defs, x, y, gap = 24, opts = {}) {
+  const col = new Container();
+  const h = opts.h || 88;
+  defs.forEach(([label, fn, o], i) => {
+    const b = makeButton(label, fn, { ...opts, ...(o || {}) });
+    b.position.set(0, i * (h + gap));
+    col.addChild(b);
+  });
+  col.position.set(x, y);
+  return col;
+}
+
+/* ---------- input: keyboard + swipe + actions ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'action', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();                       // stop arrows/space scrolling the page
+      Sfx.unlock();
+      const wasHeld = this.held.has(a);
+      this.held.add(a);
+      if (e.repeat && !CONFIG.keyRepeat) return;
+      if (wasHeld && !e.repeat) return;
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+  },
+  isDown(a) { return this.held.has(a); },
+};
+/** Swipe detection on the whole screen (stage hitArea = app.screen). */
+function initSwipe(app, root) {
+  let start = null;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointerdown', (e) => {
+    Sfx.unlock(); start = { x: e.global.x, y: e.global.y, t: performance.now() };
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+    const p = root.toLocal(e.global);
+    Scenes.dispatch('press', 'pointer', { x: p.x, y: p.y });   // instant: use for flap/jump/shoot games
+  });
+  const end = (e) => {
+    if (!start) return;
+    const dx = (e.global.x - start.x) / root.scale.x, dy = (e.global.y - start.y) / root.scale.y;
+    const dt = performance.now() - start.t;
+    start = null;
+    const dist = Math.hypot(dx, dy);
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }   // presses on buttons are not game input
+    if (dist < 25 && dt < 500) {               // a tap anywhere: 'tap' action with design-space position
+      const p = root.toLocal(e.global);
+      Scenes.dispatch('tap', 'pointer', { x: p.x, y: p.y });
+      return;
+    }
+    if (dist < 40 || dt > 1000) return;         // design-space pixels; ignore slow drags
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    Scenes.dispatch(dir, 'swipe');
+  };
+  app.stage.on('pointerup', end);
+  app.stage.on('pointerupoutside', end);
+}
+
+/* ---------- scenes ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.view = new Container(); this.view.label = 'scene:' + name; }
+  enter(_data) {}
+  exit() {}
+  update(_dtMs) {}
+  onAction(_action, _source, _pos) {}
+  onHidden() {}
+}
+const Scenes = {
+  app: null, root: null, current: null, busy: false, registry: {},
+  register(name, cls) { this.registry[name] = cls; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const old = this.current;
+      if (old) {
+        await Tween.to(old.view, { alpha: 0 }, 140);
+        old.exit();
+        Tween.kill(old.view);
+        this.root.removeChild(old.view);
+        old.view.destroy({ children: true });
+      }
+      const Cls = this.registry[name];
+      const scene = new Cls(name);
+      this.current = scene;
+      scene.view.alpha = 0;
+      this.root.addChild(scene.view);
+      scene.enter(data);
+      await Tween.to(scene.view, { alpha: 1 }, 160);
+    } finally {
+      this.busy = false;
+    }
+  },
+  inputStats: {},
+  dispatch(action, source, pos = null) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, pos);
+  },
+};
+
+/* ---------- shared background ---------- */
+function makeBackground() {
+  const g = new Graphics();
+  g.rect(0, 0, W, H).fill(THEME.bg);
+  return g;
+}
+function soundLabel() { return Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+
+/* ---------- Menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    // Portrait: one centered column. Landscape (W > H): text on the left, buttons on the right.
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const ty = LAND ? H * 0.34 : H * 0.24;
+    const title = makeText(CONFIG.title, 96, THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, ty);
+    const sub = makeText(CONFIG.subtitle, 30, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: textW - 40 });
+    fitText(sub, textW - 40, 80);
+    sub.position.set(cx, ty + 90);
+    const best = HighScores.best();
+    const bestT = makeText(best ? `Best: ${formatScore(best)}` : 'No high score yet', 32, THEME.accent, '700');
+    bestT.position.set(cx, ty + 160);
+    const defs = [
+      ['Play', () => Scenes.go('game')],
+      ...GAME_HOOKS.menuButtons.map(([label, fn]) => [label, fn, { variant: 'secondary' }]),
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      [soundLabel(), () => { Sfx.setMuted(!Sfx.muted); this.onMuteChanged(); }, { variant: 'secondary' }],
+    ];
+    const bh = defs.length > 4 ? 76 : 88, gap = defs.length > 4 ? 18 : 24;
+    const colH = defs.length * bh + (defs.length - 1) * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.min(H * 0.55, H - 150 - colH + bh / 2);
+    const col = buttonColumn(defs, LAND ? W * 0.72 : W / 2, colTop, gap, { h: bh });
+    this.soundBtn = col.children[col.children.length - 1];
+    const hint = makeText('Enter to play  ·  M to mute', 24, THEME.textDim, '500');
+    hint.position.set(cx, H - 60);
+    this.view.addChild(title, sub, bestT, col, hint);
+  }
+  onMuteChanged() { this.soundBtn?.setText(soundLabel()); }
+  onAction(a) { if (a === 'confirm' || a === 'action') Scenes.go('game'); }
+}
+
+/* ---------- High scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const top = LAND ? 70 : 150;
+    const title = makeText('High Scores', LAND ? 60 : 72, THEME.text, '800');
+    title.position.set(W / 2, top);
+    const rowH = LAND ? 52 : 64;
+    const panelTop = top + (LAND ? 60 : 100);
+    const room = Math.floor((H - panelTop - 200) / rowH);             // rows that fit above the Back button
+    const rows = Math.max(3, Math.min(CONFIG.maxHighScores, room));
+    const panelW = LAND ? Math.min(W - 120, 760) : W - 120;
+    const panelH = 60 + rows * rowH;
+    const panel = makePanel(panelW, panelH);
+    panel.position.set(W / 2, panelTop + panelH / 2);
+    this.view.addChild(title, panel);
+    const list = HighScores.list().slice(0, rows);
+    if (!list.length) {
+      const none = makeText('No scores yet. Go play!', 34, THEME.textDim, '500');
+      none.position.set(W / 2, panelTop + panelH / 2);
+      this.view.addChild(none);
+    }
+    const left = W / 2 - panelW / 2 + 50, right = W / 2 + panelW / 2 - 50;
+    list.forEach((e, i) => {
+      const y = panelTop + 30 + rowH / 2 + i * rowH;
+      const color = i === 0 ? THEME.accent : THEME.text;
+      const r = makeText(`${i + 1}.`, 32, color, '700'); r.anchor.set(0, 0.5); r.position.set(left, y);
+      const sc = makeText(formatScore(e.score), 32, color, '700'); sc.position.set(W / 2, y);
+      const d = makeText(e.date || '', 22, THEME.textDim, '500'); d.anchor.set(1, 0.5); d.position.set(right, y);
+      this.view.addChild(r, sc, d);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, Math.min(H - 70, panelTop + panelH + 90));
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- Game over ---------- */
+class GameOverScene extends Scene {
+  /** data: { score, rank, isBest, won, extraLine? } — extraLine comes from GameScene.gameOverData() (e.g. "Gold medal"). */
+  enter({ score = 0, rank = 0, isBest = false, won = false, extraLine = '' } = {}) {
+    this.score = score;
+    this.enteredAt = performance.now();
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const y0 = LAND ? H * 0.2 : H * 0.2;
+    const title = makeText(won ? 'You Win!' : 'Game Over', 92, won ? THEME.accent : THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, y0);
+    const label = makeText(CONFIG.scoreLabel, 30, THEME.textDim, '600');
+    label.position.set(cx, y0 + 100);
+    const sc = makeText(formatScore(score), 110, THEME.text, '800');
+    fitText(sc, textW);
+    sc.position.set(cx, y0 + 185);
+    const bestLine = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${formatScore(HighScores.best())}`;
+    const b = makeText(bestLine, 36, isBest ? THEME.accent : THEME.textDim, '700');
+    b.position.set(cx, y0 + 275);
+    this.view.addChild(title, label, sc, b);
+    if (extraLine) {
+      const ex = makeText(extraLine, 30, THEME.text, '600', { wordWrap: true, wordWrapWidth: textW });
+      fitText(ex, textW, 80);
+      ex.position.set(cx, y0 + 330);
+      this.view.addChild(ex);
+    }
+    const bh = 88, gap = 24, colH = 3 * bh + 2 * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.max(y0 + (extraLine ? 420 : 370), H - 140 - colH + bh / 2);
+    const col = buttonColumn([
+      ['Play Again', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], LAND ? W * 0.72 : W / 2, colTop, gap);
+    this.view.addChild(col);
+    if (isBest) { b.scale.set(0.2); Tween.to(b, { scale: 1 }, 450, Ease.outBack); }
+  }
+  onAction(a) {
+    if (performance.now() - this.enteredAt < 800) return;   // grace period: a late Space/tap from the game must not skip this screen
+    if (a === 'confirm' || a === 'restart') Scenes.go('game'); else if (a === 'pause') Scenes.go('menu');
+  }
+}
+
+/* ---------- Game scene: framework part (HUD, pause, end) ---------- */
+class GameSceneBase extends Scene {
+  enter() {
+    this.score = 0;
+    this.state = 'playing';              // 'playing' | 'paused' | 'over'
+    this.board = new Container();        // put all game visuals in here
+    this.board.label = 'board';
+    this.hud = new Container();
+    this.overlay = null;
+    this.view.addChild(this.board, this.hud);
+    this.buildHud();
+    this.initGame();
+    this.renderScore();
+  }
+  buildHud() {
+    const scoreBox = makePanel(220, 96, THEME.panel, 18); scoreBox.position.set(150, 80);
+    const bestBox = makePanel(220, 96, THEME.panel, 18); bestBox.position.set(390, 80);
+    const sl = makeText(CONFIG.scoreLabel.toUpperCase(), 20, THEME.textDim, '700'); sl.position.set(150, 56);
+    const bl = makeText('BEST', 20, THEME.textDim, '700'); bl.position.set(390, 56);
+    this.scoreText = makeText('0', 40, THEME.text, '800'); this.scoreText.position.set(150, 96);
+    this.bestText = makeText(formatScore(HighScores.best()), 40, THEME.text, '800'); this.bestText.position.set(390, 96);
+    const pause = makeButton('II', () => this.togglePause(), { w: 96, h: 96, size: 34, variant: 'secondary' });
+    pause.label = 'button:Pause';
+    pause.position.set(W - 90, 80);
+    this.hud.addChild(scoreBox, bestBox, sl, bl, this.scoreText, this.bestText, pause);
+  }
+  addScore(n) {
+    if (this.state === 'over') return;
+    this.score += n;
+    this.renderScore();
+  }
+  setScore(n) { this.score = n; this.renderScore(); }
+  renderScore() {
+    this.scoreText.text = formatScore(this.score);
+    const best = HighScores.best();
+    const shown = CONFIG.lowerIsBetter ? best : Math.max(best, this.score);
+    this.bestText.text = formatScore(shown);
+  }
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedOverlay = this.overlay;               // keep e.g. a win overlay underneath; restored on resume
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => this.restart(), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ]);
+  }
+  resume() {
+    this.hideOverlay();
+    if (this.savedOverlay && !this.savedOverlay.destroyed) { this.savedOverlay.visible = true; this.overlay = this.savedOverlay; }
+    this.savedOverlay = null;
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  showOverlay(title, buttons, subtitle = '') {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.6 });
+    dim.eventMode = 'static';                         // swallow clicks to the game underneath
+    dim.on('pointertap', (e) => e.stopPropagation());
+    const panelH = 218 + buttons.length * 112 + (subtitle ? 40 : 0);
+    const panel = makePanel(W - 140, panelH); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 64, THEME.text, '800'); fitText(t, W - 220); t.position.set(W / 2, H / 2 - panelH / 2 + 90);
+    o.addChild(dim, panel, t);
+    if (subtitle) { const s = makeText(subtitle, 28, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 220 }); s.position.set(W / 2, t.y + 70); o.addChild(s); }
+    const col = buttonColumn(buttons, W / 2, t.y + (subtitle ? 180 : 140));
+    o.addChild(col);
+    this.overlay = o;
+    this.view.addChild(o);
+  }
+  hideOverlay() { if (this.overlay) { this.overlay.destroy({ children: true }); this.overlay = null; } }
+  hideAllOverlays() { this.hideOverlay(); if (this.savedOverlay) { this.savedOverlay.destroy({ children: true }); this.savedOverlay = null; } }
+  /** Call exactly when the game ends. Idempotent. */
+  endGame({ won = false, delay = 500 } = {}) {
+    if (this.state === 'over') return;
+    this.state = 'over';
+    this.hideAllOverlays();
+    Sfx.play(won ? 'win' : 'lose');
+    const { rank, isBest } = HighScores.add(this.score);
+    const score = this.score;
+    const extra = this.gameOverData?.() || {};      // optional: return { extraLine: 'Gold medal' }
+    wait(delay).then(() => { if (Scenes.current === this) Scenes.go('gameover', { score, rank, isBest, won, ...extra }); });
+  }
+  onAction(a, source, pos) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.overlay) return;                       // game-specific overlay (e.g. win) is showing: only its buttons act
+    if (a === 'restart' && this.state === 'playing') return this.restart();
+    if (this.state !== 'playing') return;
+    this.handleInput(a, source, pos);
+  }
+  update(dtMs) {
+    if (this.state !== 'paused' && this.timers?.length) {          // this.later() timers: frozen while paused, dropped with the scene
+      for (const t of [...this.timers]) { t.left -= dtMs; if (t.left <= 0) { this.timers.splice(this.timers.indexOf(t), 1); t.fn(); } }
+    }
+    if (this.state === 'playing') this.tick(dtMs);
+  }
+  /** Run fn after ms of game time. Paused time doesn't count; cancelled if the scene is left. Use for result panels, delayed spawns, AI turns. */
+  later(ms, fn) { (this.timers ||= []).push({ left: ms, fn }); }
+  /** R key and Pause→Restart. Default: fresh game. Level-based games override to replay the CURRENT level (keep run score as it was at level start). */
+  restart() { Scenes.go('game'); }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+  exit() { this.cleanup?.(); }
+  /** Override in GameScene to also expose game data, e.g. { ...super.debugState(), grid: this.grid } (verify.py and play-tests read it). */
+  debugState() { return { state: this.state, score: this.score }; }
+}
+
+/* ---------- timing helper: resolves after ms of ticker time ---------- */
+function wait(ms) {
+  return new Promise((resolve) => {
+    let t = 0;
+    const fn = (ticker) => { t += ticker.deltaMS; if (t >= ms) { Scenes.app.ticker.remove(fn); resolve(); } };
+    Scenes.app.ticker.add(fn);
+  });
+}
+
+/* ##### GAME-SPECIFIC: formatting ##### */
+function formatScore(n) { return String(Math.round(n)); }
+
+/* ##### GAME-SPECIFIC: pure game logic (NO Pixi here; unit-tested below) ##### */
+/*
+  RULE DECISIONS (where the spec is silent)
+  - Aiming (GoalShot style): press and hold anywhere; while held, the aim runs from the BALL toward the
+    pointer (the arrow points where the ball goes) and power = distance ball->pointer / 300 design px, capped
+    at 1. Release kicks. Releasing with power < 0.08 (pointer on the ball) cancels without using a ball.
+    Keyboard: Up/Down = angle +-2 deg, Left/Right = power -+0.02, Space/Enter = kick.
+    Launch speed = power * 28 px per 1/60 s step.
+  - Angles are in degrees, math convention (0 = right, 90 = straight up).
+  - Every ball starts from a fresh copy of the level: knocked boxes are put back before the next ball, so
+    the stored solution and the trajectory preview are always valid. Moving platforms keep their phase
+    (their position is a pure function of level time).
+  - Trajectory preview: 1.2 s simulated in a fresh world built from the same level data with the same
+    buildWorld/stepShot code; moving platforms are left out of the preview. Stars/portals/goal/walls/boxes
+    all behave identically, so without moving platforms the preview is exact.
+  - Goal = the ball's CENTER inside the goal's interior rectangle. The goal frame (crossbar, back post, and a
+    bottom plate for raised goals) is solid; the side facing the kicker (left) is open.
+    Entering the goal without a star ends the shot as a miss ("goalNoStar").
+  - Stars: touching = the ball's path during a step passes within ballR + starR of the star centre (swept
+    test, so fast balls cannot skip a star). Stars are checked before the goal in the same step.
+  - Portals: triggered when the ball's centre path passes within the portal radius. The ball is moved to the
+    linked portal's centre, velocity rotated by (exitAngle - entryAngle). Both portals of the pair are then
+    disarmed; a portal re-arms 250 ms after the ball's centre has left its radius (so no ping-pong).
+  - Shot end: goal / goalNoStar / out (centre beyond 40 px left, right or below the screen; above the top is
+    allowed, the ball comes back down) / rest (speed < 0.2 for 800 ms) / timeout (8 s).
+  - Level result: stars rating = stars collected on the scoring shot (1-3). Points for a cleared level =
+    100 x rating + 50 x balls left. The session keeps the BEST result per level (replaying a level cannot
+    farm points); session score = sum. Saved progress keeps the best rating per level.
+  - Menu "Play" starts the first level without stars (level 1 again when all are cleared) and continues
+    level by level. "End Run" on the result panels records the session score (Game Over); quitting through
+    the pause menu (Main Menu) also records it. R / Pause->Restart replays the CURRENT level and keeps the
+    session score (nothing recorded). A clear is saved the moment the goal is scored; the panel follows 1 s later. Clearing level 15 and pressing Finish ends the run as a win.
+*/
+const Logic = (() => {
+  const MJ = () => globalThis.Matter;
+  const C = {
+    STEP_MS: 1000 / 60,
+    GROUND_Y: 680,
+    BALL_R: 14,
+    STAR_R: 20,
+    PORTAL_R: 30,
+    MAX_SPEED: 28,
+    MAX_DRAG: 300,
+    MIN_POWER: 0.08,
+    REST_SPEED: 0.2,
+    REST_MS: 800,
+    MAX_SHOT_MS: 8000,
+    PORTAL_COOLDOWN_MS: 250,
+    PREVIEW_MS: 1200,
+    OUT_MARGIN: 40,
+    RESTITUTION: 0.55,
+    POST: 12,
+  };
+
+  // ---------- levels (hand-made). Rect = top-left x,y,w,h. Movers/portals/stars use centres. ----------
+  const G = C.GROUND_Y;
+  const LEVELS = [
+    { name: 'First Kick', hint: 'Drag to aim. Hit a star, then score!', balls: 3, ball: { x: 170, y: G - 14 },
+      goal: { x: 1060, y: 560, w: 150, h: 120 }, stars: [{ x: 600, y: 360 }],
+      solution: { angle: 52, power: 0.66 } },
+    { name: 'Double Star', balls: 3, ball: { x: 170, y: G - 14 },
+      goal: { x: 1080, y: 560, w: 140, h: 120 }, stars: [{ x: 430, y: 420 }, { x: 760, y: 330 }],
+      solution: { angle: 50, power: 0.70 } },
+    { name: 'Sky Goal', balls: 3, ball: { x: 170, y: G - 14 },
+      goal: { x: 1050, y: 320, w: 150, h: 130 }, stars: [{ x: 420, y: 401 }, { x: 640, y: 269 }, { x: 870, y: 262 }],
+      solution: { angle: 50, power: 0.78 } },
+    // --- walls ---
+    { name: 'The Wall', hint: 'Walls block the ball.', balls: 3, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 620, y: 470, w: 40, h: 210 }],
+      goal: { x: 1070, y: 560, w: 150, h: 120 }, stars: [{ x: 640, y: 330 }],
+      solution: { angle: 54, power: 0.66 } },
+    { name: 'Over and Under', balls: 3, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 500, y: 520, w: 40, h: 160 }, { x: 800, y: -400, w: 40, h: 820 }],
+      goal: { x: 1080, y: 560, w: 140, h: 120 }, stars: [{ x: 520, y: 430 }, { x: 820, y: 480 }],
+      solution: { angle: 44, power: 0.66 } },
+    { name: 'Low Ceiling', hint: 'Mind the ceiling!', balls: 3, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 800, y: 460, w: 40, h: 220 }, { x: 380, y: -400, w: 900, h: 600 }],
+      goal: { x: 1100, y: 560, w: 140, h: 120 }, stars: [{ x: 905, y: 445 }],
+      solution: { angle: 56, power: 0.70 } },
+    // --- boxes ---
+    { name: 'Box Stack', hint: 'Boxes can be knocked over.', balls: 3, ball: { x: 170, y: G - 14 },
+      boxes: [{ x: 900, y: G - 44, w: 44, h: 44 }, { x: 900, y: G - 88, w: 44, h: 44 }, { x: 900, y: G - 132, w: 44, h: 44 }],
+      goal: { x: 1080, y: 560, w: 140, h: 120 }, stars: [{ x: 560, y: 380 }],
+      solution: { angle: 48, power: 0.66 } },
+    { name: 'Crate Ledge', balls: 3, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 880, y: 470, w: 400, h: 24 }],
+      boxes: [{ x: 960, y: 426, w: 44, h: 44 }, { x: 960, y: 382, w: 44, h: 44 }],
+      goal: { x: 1100, y: 350, w: 140, h: 120 }, stars: [{ x: 500, y: 340 }, { x: 760, y: 262 }],
+      solution: { angle: 52, power: 0.76 } },
+    { name: 'Warehouse', balls: 3, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 560, y: 400, w: 40, h: 280 }, { x: 560, y: -400, w: 720, h: 600 }],
+      boxes: [{ x: 880, y: G - 60, w: 60, h: 60 }, { x: 895, y: G - 100, w: 40, h: 40 }],
+      goal: { x: 1100, y: 560, w: 140, h: 120 }, stars: [{ x: 580, y: 302 }, { x: 800, y: 315 }],
+      solution: { angle: 54, power: 0.70 } },
+    // --- moving platforms ---
+    { name: 'Elevator', hint: 'Time your kick around moving platforms.', balls: 3, ball: { x: 170, y: G - 14 },
+      movers: [{ w: 30, h: 150, from: { x: 900, y: 360 }, to: { x: 900, y: 600 }, period: 3000 }],
+      goal: { x: 1080, y: 560, w: 140, h: 120 }, stars: [{ x: 560, y: 545 }],
+      solution: { angle: 30, power: 0.62 } },
+    { name: 'Slider', balls: 3, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 700, y: 430, w: 40, h: 250 }],
+      movers: [{ w: 200, h: 24, from: { x: 480, y: 330 }, to: { x: 900, y: 330 }, period: 4000 }],
+      goal: { x: 1080, y: 560, w: 140, h: 120 }, stars: [{ x: 720, y: 360 }, { x: 960, y: 450 }],
+      solution: { angle: 46, power: 0.70 } },
+    { name: 'Gatekeeper', balls: 2, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 640, y: 560, w: 40, h: 120 }, { x: 900, y: -400, w: 40, h: 800 }],
+      movers: [{ w: 30, h: 110, from: { x: 1010, y: 380 }, to: { x: 1010, y: 600 }, period: 2600 }],
+      goal: { x: 1100, y: 560, w: 140, h: 120 }, stars: [{ x: 650, y: 440 }, { x: 815, y: 570 }],
+      solution: { angle: 50, power: 0.58 } },
+    // --- portals ---
+    { name: 'Wormhole', hint: 'Portals teleport the ball.', balls: 3, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 640, y: -400, w: 40, h: 1080 }],
+      portals: [[{ x: 480, y: 420, angle: 0 }, { x: 800, y: 420, angle: 0 }]],
+      goal: { x: 1080, y: 560, w: 140, h: 120 }, stars: [{ x: 330, y: 455 }, { x: 905, y: 480 }],
+      solution: { angle: 60, power: 0.52 } },
+    { name: 'Twist', balls: 2, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 560, y: -400, w: 40, h: 1080 }, { x: 900, y: 400, w: 380, h: 30 }],
+      portals: [[{ x: 250, y: 300, angle: 90 }, { x: 700, y: 520, angle: 0 }]],
+      goal: { x: 1100, y: 560, w: 140, h: 120 }, stars: [{ x: 250, y: 420 }, { x: 860, y: 560 }],
+      solution: { angle: 76, power: 0.82 } },
+    { name: 'Grand Finale', balls: 2, ball: { x: 170, y: G - 14 },
+      walls: [{ x: 600, y: -400, w: 40, h: 1080 }],
+      boxes: [{ x: 1010, y: G - 44, w: 44, h: 44 }, { x: 1010, y: G - 88, w: 44, h: 44 }],
+      movers: [{ w: 24, h: 100, from: { x: 880, y: 300 }, to: { x: 880, y: 560 }, period: 2400 }],
+      portals: [[{ x: 420, y: 330, angle: 45 }, { x: 700, y: 260, angle: 0 }]],
+      goal: { x: 1100, y: 560, w: 140, h: 120 }, stars: [{ x: 330, y: 420 }, { x: 800, y: 285 }, { x: 1000, y: 445 }],
+      solution: { angle: 60, power: 0.66 } },
+  ];
+
+  // ---------- small helpers ----------
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const rad = (d) => d * Math.PI / 180;
+  /** rotate a screen-space velocity (y down) by deg in math convention (counter-clockwise on screen) */
+  function rotateVel(v, deg) {
+    const r = rad(deg), ux = v.x, uy = -v.y;
+    const nx = ux * Math.cos(r) - uy * Math.sin(r), ny = ux * Math.sin(r) + uy * Math.cos(r);
+    return { x: nx, y: -ny };
+  }
+  /** distance from point c to segment a-b */
+  function segDist(a, b, c) {
+    const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+    let t = l2 > 0 ? ((c.x - a.x) * dx + (c.y - a.y) * dy) / l2 : 0;
+    t = clamp(t, 0, 1);
+    return Math.hypot(a.x + dx * t - c.x, a.y + dy * t - c.y);
+  }
+  /** triangle wave: platform goes from -> to -> from once per period */
+  function moverPos(m, tMs) {
+    const ph = ((tMs % m.period) + m.period) % m.period / m.period;
+    const k = ph < 0.5 ? ph * 2 : 2 - ph * 2;
+    return { x: m.from.x + (m.to.x - m.from.x) * k, y: m.from.y + (m.to.y - m.from.y) * k };
+  }
+  function launchVelocity(angle, power) {
+    const s = clamp(power, 0, 1) * C.MAX_SPEED;
+    return { x: Math.cos(rad(angle)) * s, y: -Math.sin(rad(angle)) * s };
+  }
+  function aimFromDrag(dx, dy) {
+    const len = Math.hypot(dx, dy);
+    return { angle: len ? Math.atan2(-dy, dx) * 180 / Math.PI : 45, power: clamp(len / C.MAX_DRAG, 0, 1) };
+  }
+  function inGoal(goal, p) { return p.x > goal.x && p.x < goal.x + goal.w && p.y > goal.y && p.y < goal.y + goal.h; }
+  /** solid pieces of the goal frame as rects (open side faces left) */
+  function goalParts(goal) {
+    const P = C.POST, parts = [
+      { x: goal.x - 6, y: goal.y - P, w: goal.w + 6 + P, h: P, kind: 'bar' },       // crossbar
+      { x: goal.x + goal.w, y: goal.y - P, w: P, h: goal.h + P, kind: 'post' },     // back post
+    ];
+    if (goal.y + goal.h < C.GROUND_Y - 1) parts.push({ x: goal.x - 6, y: goal.y + goal.h, w: goal.w + 6 + P, h: P, kind: 'base' });
+    return parts;
+  }
+  function allPortals(level) {
+    const out = [];
+    (level.portals || []).forEach((pair, pi) => pair.forEach((p, k) => out.push({ ...p, pair: pi, end: k, link: out.length + (k === 0 ? 1 : -1) })));
+    return out;
+  }
+
+  // ---------- physics world (matter.js only) ----------
+  function buildWorld(level, opts = {}) {
+    const { Engine, Bodies, Composite, Body } = MJ();
+    const t = opts.t || 0, withMovers = opts.movers !== false;
+    const engine = Engine.create({ enableSleeping: false });
+    engine.gravity.x = 0; engine.gravity.y = 1;
+    const st = (r, label) => {
+      const b = Bodies.rectangle(r.x + r.w / 2, r.y + r.h / 2, r.w, r.h, { isStatic: true, label, friction: 0.4, restitution: 0 });
+      if (r.angle) Body.setAngle(b, rad(r.angle));
+      return b;
+    };
+    const ground = st({ x: -600, y: C.GROUND_Y, w: 1280 + 1200, h: 200 }, 'ground');
+    const walls = (level.walls || []).map((r) => st(r, 'wall'));
+    const goal = goalParts(level.goal).map((r) => st(r, 'goal'));
+    const boxes = (level.boxes || []).map((r) => Bodies.rectangle(r.x + r.w / 2, r.y + r.h / 2, r.w, r.h,
+      { label: 'box', density: 0.0005, friction: 0.5, frictionStatic: 0.8, restitution: 0.1 }));
+    const movers = withMovers ? (level.movers || []).map((m) => {
+      const p = moverPos(m, t);
+      const b = Bodies.rectangle(p.x, p.y, m.w, m.h, { isStatic: true, label: 'mover', friction: 0.2, restitution: 0 });
+      b.moverDef = m;
+      return b;
+    }) : [];
+    Composite.add(engine.world, [ground, ...walls, ...goal, ...boxes, ...movers]);
+    return { engine, ground, walls, goal, boxes, movers, level };
+  }
+
+  /** Set up one shot (a fresh copy of the level + launched ball). opts: { t0: level time in ms, movers: bool } */
+  function createShot(level, angle, power, opts = {}) {
+    const { Bodies, Composite, Body } = MJ();
+    const t0 = opts.t0 || 0;
+    const world = buildWorld(level, { t: t0, movers: opts.movers });
+    const ball = Bodies.circle(level.ball.x, level.ball.y, C.BALL_R,
+      { label: 'ball', restitution: C.RESTITUTION, friction: 0.05, frictionStatic: 0.2, frictionAir: 0.006, density: 0.002 });
+    Composite.add(world.engine.world, ball);
+    Body.setVelocity(ball, launchVelocity(angle, power));
+    const portals = allPortals(level).map((p) => ({ ...p, inside: false, cd: 0 }));
+    return { world, ball, level, t0, t: 0, starsHit: (level.stars || []).map(() => false), portals,
+             restMs: 0, ended: false, endReason: null, goal: false, teleports: 0, starEvents: [], teleportEvents: [] };
+  }
+  function starCount(sim) { return sim.starsHit.filter(Boolean).length; }
+
+  /** Advance one fixed step. Mutates sim (it owns its private matter world). Returns sim. */
+  function stepShot(sim) {
+    if (sim.ended) return sim;
+    const { Engine, Body } = MJ();
+    sim.t += C.STEP_MS;
+    const T = sim.t0 + sim.t;
+    for (const b of sim.world.movers) {
+      const p = moverPos(b.moverDef, T), q = b.position;
+      const v = { x: p.x - q.x, y: p.y - q.y };
+      Body.setPosition(b, p);
+      Body.setVelocity(b, v);
+    }
+    const ball = sim.ball;
+    const prev = { x: ball.position.x, y: ball.position.y };
+    Engine.update(sim.world.engine, C.STEP_MS);
+    const pos = { x: ball.position.x, y: ball.position.y };
+    // stars (swept, each star at most once per shot)
+    (sim.level.stars || []).forEach((s, i) => {
+      if (!sim.starsHit[i] && segDist(prev, pos, s) <= C.BALL_R + C.STAR_R) { sim.starsHit[i] = true; sim.starEvents.push(i); }
+    });
+    // portals: update arming, then trigger at most one
+    for (const p of sim.portals) {
+      const d = Math.hypot(pos.x - p.x, pos.y - p.y);
+      if (p.inside) { if (d > C.PORTAL_R) { p.inside = false; p.cd = C.PORTAL_COOLDOWN_MS; } }
+      else if (p.cd > 0) p.cd = Math.max(0, p.cd - C.STEP_MS);
+    }
+    for (const p of sim.portals) {
+      if (p.inside || p.cd > 0) continue;
+      if (segDist(prev, pos, p) > C.PORTAL_R) continue;
+      const out = sim.portals[p.link];
+      const v = rotateVel(ball.velocity, out.angle - p.angle);
+      Body.setPosition(ball, { x: out.x, y: out.y });
+      Body.setVelocity(ball, v);
+      p.inside = false; p.cd = C.PORTAL_COOLDOWN_MS;
+      out.inside = true; out.cd = 0;
+      sim.teleports++; sim.teleportEvents.push(sim.t);
+      pos.x = out.x; pos.y = out.y;
+      break;
+    }
+    const speed = Math.hypot(ball.velocity.x, ball.velocity.y);
+    if (inGoal(sim.level.goal, pos)) {
+      sim.ended = true; sim.goal = starCount(sim) > 0; sim.endReason = sim.goal ? 'goal' : 'goalNoStar';
+    } else if (pos.x < -C.OUT_MARGIN || pos.x > 1280 + C.OUT_MARGIN || pos.y > 720 + C.OUT_MARGIN) {
+      sim.ended = true; sim.endReason = 'out';
+    } else {
+      sim.restMs = speed < C.REST_SPEED ? sim.restMs + C.STEP_MS : 0;
+      if (sim.restMs >= C.REST_MS - 1e-6) { sim.ended = true; sim.endReason = 'rest'; }
+      else if (sim.t >= C.MAX_SHOT_MS - 1e-6) { sim.ended = true; sim.endReason = 'timeout'; }
+    }
+    return sim;
+  }
+
+  function simulateShot(level, angle, power, maxMs = C.MAX_SHOT_MS, opts = {}) {
+    const sim = createShot(level, angle, power, opts);
+    const trace = [];
+    while (!sim.ended && sim.t < maxMs - 1e-6) { stepShot(sim); trace.push({ x: sim.ball.position.x, y: sim.ball.position.y }); }
+    return { goal: sim.goal, starsHit: starCount(sim), endReason: sim.ended ? sim.endReason : 'maxMs', t: sim.t,
+             pos: { x: sim.ball.position.x, y: sim.ball.position.y }, teleports: sim.teleports, trace, starEvents: sim.starEvents.slice() };
+  }
+
+  /** Dotted-line preview: ball positions for the first 1.2 s (moving platforms left out). */
+  function previewPath(level, angle, power, ms = C.PREVIEW_MS) {
+    const sim = createShot(level, angle, power, { movers: false });
+    const n = Math.round(ms / C.STEP_MS), pts = [];
+    for (let i = 0; i < n && !sim.ended; i++) { stepShot(sim); pts.push({ x: sim.ball.position.x, y: sim.ball.position.y }); }
+    return pts;
+  }
+
+  // ---------- level flow (pure state machine) ----------
+  function newLevelState(idx) {
+    return { level: idx, ballsLeft: LEVELS[idx].balls, phase: 'aim', rating: 0, points: 0, shots: 0 };
+  }
+  function canShoot(s) { return s.phase === 'aim' && s.ballsLeft > 0; }
+  /** returns the next state, or null when a shot is not allowed (ball already in flight, level over, no balls) */
+  function beginShot(s) { return canShoot(s) ? { ...s, ballsLeft: s.ballsLeft - 1, phase: 'flight', shots: s.shots + 1 } : null; }
+  function endShot(s, r) {
+    if (s.phase !== 'flight') return s;
+    if (r.goal && r.starsHit >= 1) {
+      const rating = Math.min(3, r.starsHit);
+      return { ...s, phase: 'won', rating, points: 100 * rating + 50 * s.ballsLeft };
+    }
+    return { ...s, phase: s.ballsLeft > 0 ? 'aim' : 'lost' };
+  }
+  // progress: { stars: [best rating per level] }
+  function normProgress(p) {
+    const stars = LEVELS.map((_, i) => { const v = p && Array.isArray(p.stars) ? p.stars[i] : 0; return Number.isFinite(v) ? clamp(Math.floor(v), 0, 3) : 0; });
+    return { stars };
+  }
+  function recordResult(p, idx, rating) {
+    const n = normProgress(p); n.stars[idx] = Math.max(n.stars[idx], rating); return n;
+  }
+  function isUnlocked(p, idx) { const n = normProgress(p); return idx === 0 || n.stars[idx - 1] > 0; }
+  function nextUnplayed(p) { const n = normProgress(p); const i = n.stars.findIndex((s) => s === 0); return i < 0 ? 0 : i; }
+  function recordSession(best, idx, points) { const b = { ...best }; b[idx] = Math.max(b[idx] || 0, points); return b; }
+  function sessionScore(best) { return Object.values(best).reduce((a, b) => a + b, 0); }
+
+  return { C, LEVELS, clamp, rotateVel, segDist, moverPos, launchVelocity, aimFromDrag, inGoal, goalParts, allPortals,
+           buildWorld, createShot, stepShot, simulateShot, previewPath, starCount,
+           newLevelState, canShoot, beginShot, endShot, normProgress, recordResult, isUnlocked, nextUnplayed,
+           recordSession, sessionScore };
+})();
+
+/* ##### GAME-SPECIFIC: logic self-tests (run by verify.py via window.__game.selfTest()) ##### */
+const TESTS = (() => {
+  const Lg = Logic, C = Logic.C, LV = Logic.LEVELS;
+  const lvl = (over) => ({ name: 't', balls: 3, ball: { x: 170, y: C.GROUND_Y - 14 }, goal: { x: 1080, y: 560, w: 140, h: 120 }, stars: [], ...over });
+  function rng32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  const has = (l, k) => Array.isArray(l[k]) && l[k].length > 0;
+  return [
+    ['15 levels with 1-3 stars, 2-3 balls, valid layout', () => {
+      assertEq(LV.length, 15, 'level count');
+      LV.forEach((l, i) => {
+        assert(l.stars.length >= 1 && l.stars.length <= 3, `L${i + 1} stars`);
+        assert(l.balls === 2 || l.balls === 3, `L${i + 1} balls`);
+        assert(l.goal.x > 600 && l.goal.x + l.goal.w <= 1280 && l.goal.y + l.goal.h <= C.GROUND_Y, `L${i + 1} goal`);
+        assert(l.ball.y + C.BALL_R <= C.GROUND_Y + 0.01, `L${i + 1} ball above ground`);
+        (l.portals || []).forEach((pr) => assertEq(pr.length, 2, 'portal pairs'));
+        assert(typeof l.solution.angle === 'number' && l.solution.power > 0 && l.solution.power <= 1, `L${i + 1} solution`);
+      });
+      assert(LV.some((l) => l.balls === 2), 'some levels have 2 balls');
+    }],
+    ['a new element every ~3 levels: plain -> walls -> boxes -> movers -> portals', () => {
+      const first = (k) => LV.findIndex((l) => has(l, k));
+      assertEq([0, 1, 2].map((i) => ['walls', 'boxes', 'movers', 'portals'].some((k) => has(LV[i], k))), [false, false, false], 'L1-3 plain');
+      assertEq([first('walls'), first('boxes'), first('movers'), first('portals')], [3, 6, 9, 12], 'first appearance');
+    }],
+    ['every stored solution scores a valid goal (headless matter.js)', () => {
+      LV.forEach((l, i) => {
+        const r = Lg.simulateShot(l, l.solution.angle, l.solution.power);
+        assert(r.goal && r.endReason === 'goal' && r.starsHit >= 1, `L${i + 1} ${l.name}: ${r.endReason} stars=${r.starsHit}`);
+      });
+    }],
+    ['stored solutions are robust (small aim error still scores)', () => {
+      let ok = 0, n = 0;
+      LV.forEach((l) => { for (const [da, dp] of [[1, 0], [0, -0.005]]) { n++; if (Lg.simulateShot(l, l.solution.angle + da, l.solution.power + dp, 4000).goal) ok++; } });
+      assert(ok / n >= 0.7, `only ${ok}/${n} perturbed solutions scored`);
+    }],
+    ['goal without a star is NOT counted', () => {
+      const l = LV[0];
+      const r = Lg.simulateShot(l, 40, 0.6);
+      assertEq([r.endReason, r.goal, r.starsHit], ['goalNoStar', false, 0], 'L1 40deg/0.6');
+      const s = Lg.endShot(Lg.beginShot(Lg.newLevelState(0)), { goal: true, starsHit: 0 });
+      assertEq(s.phase, 'aim', 'forged goal without star must not win');
+      const noStars = { ...l, stars: [] };
+      const r2 = Lg.simulateShot(noStars, l.solution.angle, l.solution.power);
+      assertEq([r2.endReason, r2.goal], ['goalNoStar', false], 'solution without stars');
+    }],
+    ['a star is counted once, even when the ball rests on it', () => {
+      const l = lvl({ stars: [{ x: 170, y: C.GROUND_Y - 20 }, { x: 900, y: 200 }] });
+      const sim = Lg.createShot(l, 0, 0);
+      for (let i = 0; i < 90; i++) Lg.stepShot(sim);
+      assertEq(sim.starEvents, [0], 'star events');
+      assertEq(Lg.starCount(sim), 1, 'count');
+      const r = Lg.simulateShot(LV[2], LV[2].solution.angle, LV[2].solution.power);
+      assertEq(new Set(r.starEvents).size, r.starEvents.length, 'no duplicate star events');
+      assert(r.starsHit <= LV[2].stars.length, 'starsHit <= stars');
+    }],
+    ['fast ball cannot skip a star (swept test)', () => {
+      const l = lvl({ stars: [{ x: 700, y: C.GROUND_Y - 330 }] });
+      const pts = Lg.simulateShot({ ...l, stars: [] }, 30, 1, 1500).trace;
+      let k = 0; while (k < pts.length - 1 && pts[k + 1].x < 700) k++;
+      const a = pts[k], b = pts[k + 1], y = a.y + (b.y - a.y) * (700 - a.x) / (b.x - a.x);
+      const r = Lg.simulateShot({ ...l, stars: [{ x: 700, y: y - (C.BALL_R + C.STAR_R - 2) }] }, 30, 1, 1500);
+      assertEq(r.starsHit, 1, 'star at the edge of the fast path');
+    }],
+    ['portal: exits linked portal with same speed, rotated by angle difference', () => {
+      const v = Lg.rotateVel({ x: 10, y: 0 }, 90);
+      assert(Math.abs(v.x) < 1e-9 && Math.abs(v.y + 10) < 1e-9, 'right -> up ' + JSON.stringify(v));
+      const l = lvl({ portals: [[{ x: 400, y: 400, angle: 0 }, { x: 900, y: 300, angle: 90 }]] });
+      const sim = Lg.createShot(l, 0, 0);
+      Matter.Body.setPosition(sim.ball, { x: 370, y: 400 }); Matter.Body.setVelocity(sim.ball, { x: 12, y: 0 });
+      Lg.stepShot(sim);
+      assertEq(sim.teleports, 1, 'teleported');
+      assert(Math.abs(sim.ball.position.x - 900) < 1e-6 && Math.abs(sim.ball.position.y - 300) < 1e-6, 'at exit centre');
+      const sp = Math.hypot(sim.ball.velocity.x, sim.ball.velocity.y);
+      assert(sim.ball.velocity.y < -11 && Math.abs(sim.ball.velocity.x) < 0.5, 'now moving up ' + JSON.stringify(sim.ball.velocity));
+      assert(Math.abs(sp - Math.hypot(12 * (1 - 0.006), C.STEP_MS * C.STEP_MS * 0.001)) < 0.05, 'speed kept ' + sp);
+    }],
+    ['portal ping-pong impossible (250 ms re-arm after exit)', () => {
+      // B sends the ball straight back into A: A must stay disarmed until 250 ms after the ball left it
+      const l = lvl({ portals: [[{ x: 400, y: 400, angle: 0 }, { x: 560, y: 400, angle: 180 }]] });
+      const sim = Lg.createShot(l, 0, 0);
+      Matter.Body.setPosition(sim.ball, { x: 370, y: 400 }); Matter.Body.setVelocity(sim.ball, { x: 14, y: 0 });
+      for (let i = 0; i < 120 && !sim.ended; i++) Lg.stepShot(sim);
+      assert(sim.teleports >= 1, 'first teleport happened');
+      for (let i = 1; i < sim.teleportEvents.length; i++) assert(sim.teleportEvents[i] - sim.teleportEvents[i - 1] >= C.PORTAL_COOLDOWN_MS, 'teleports too close: ' + sim.teleportEvents);
+      assert(sim.teleports <= 3, 'too many teleports ' + sim.teleports);
+      // exit portal does not re-trigger while the ball is still inside it
+      const l2 = lvl({ portals: [[{ x: 400, y: 400, angle: 0 }, { x: 800, y: 400, angle: 0 }]] });
+      const s2 = Lg.createShot(l2, 0, 0);
+      Matter.Body.setPosition(s2.ball, { x: 385, y: 400 }); Matter.Body.setVelocity(s2.ball, { x: 1, y: 0 });
+      for (let i = 0; i < 20; i++) Lg.stepShot(s2);
+      assertEq(s2.teleports, 1, 'slow ball in exit portal re-triggered');
+    }],
+    ['stars reset between balls (each shot starts with 0 stars)', () => {
+      const l = LV[1];
+      const sim1 = Lg.createShot(l, 52, 0.95);   // grazes the first star then flies out
+      while (!sim1.ended) Lg.stepShot(sim1);
+      assert(Lg.starCount(sim1) >= 1 && !sim1.goal, `setup: stars ${Lg.starCount(sim1)} ${sim1.endReason}`);
+      let s = Lg.endShot(Lg.beginShot(Lg.newLevelState(1)), { goal: sim1.goal, starsHit: Lg.starCount(sim1) });
+      assertEq([s.phase, s.ballsLeft], ['aim', 2], 'next ball');
+      const sim2 = Lg.createShot(l, 0, 0);
+      assertEq(Lg.starCount(sim2), 0, 'fresh shot has no stars');
+      const noStarGoal = Lg.simulateShot(l, 40, 0.62);
+      assertEq(noStarGoal.endReason, 'goalNoStar', 'second ball without star must not score');
+    }],
+    ['cannot shoot while a ball is in flight / after level end', () => {
+      const s0 = Lg.newLevelState(0);
+      const s1 = Lg.beginShot(s0);
+      assertEq([s1.phase, s1.ballsLeft], ['flight', 2]);
+      assertEq(Lg.beginShot(s1), null, 'second shot during flight');
+      const won = Lg.endShot(s1, { goal: true, starsHit: 1 });
+      assertEq(Lg.beginShot(won), null, 'shot after win');
+      assertEq(Lg.endShot(s0, { goal: true, starsHit: 3 }), s0, 'endShot without a shot is ignored');
+    }],
+    ['shots always end: rest, out, timeout (seeded random shots on every level)', () => {
+      const r0 = Lg.simulateShot(LV[0], 45, 0.01);
+      assert(r0.endReason === 'rest' && r0.t <= C.REST_MS + 400, 'tiny kick rests quickly ' + r0.endReason + ' ' + r0.t);
+      const out = Lg.simulateShot(LV[0], 180, 1);
+      assertEq(out.endReason, 'out', 'kick backwards leaves the screen');
+      const rnd = rng32(7);
+      for (let i = 0; i < 24; i++) {
+        const l = LV[i % LV.length];
+        const r = Lg.simulateShot(l, -30 + rnd() * 140, rnd());
+        assert(['goal', 'goalNoStar', 'out', 'rest', 'timeout'].includes(r.endReason) && r.t <= C.MAX_SHOT_MS + 1e-6, `bad end ${r.endReason} ${r.t}`);
+        assert(Number.isFinite(r.pos.x) && Number.isFinite(r.pos.y), 'NaN position');
+        assert(!r.goal || r.starsHit >= 1, 'goal without star');
+      }
+    }],
+    ['a ball that never rests is stopped after 8 s', () => {
+      const sim = Lg.createShot(lvl({}), 0, 0);
+      while (!sim.ended) { Matter.Body.setPosition(sim.ball, { x: 640, y: 400 }); Matter.Body.setVelocity(sim.ball, { x: 1, y: -0.2 }); Lg.stepShot(sim); }
+      assertEq(sim.endReason, 'timeout');
+      assert(Math.abs(sim.t - C.MAX_SHOT_MS) < C.STEP_MS, 'ended at 8 s: ' + sim.t);
+    }],
+    ['trajectory preview matches the real shot after 1.2 s (<2 px)', () => {
+      for (const i of [0, 6, 7, 12]) {
+        const l = LV[i], a = l.solution.angle, p = l.solution.power;
+        const pv = Lg.previewPath(l, a, p);
+        const real = Lg.simulateShot(l, a, p, C.PREVIEW_MS).trace;
+        const A = pv[pv.length - 1], B = real[pv.length - 1];
+        assert(Math.hypot(A.x - B.x, A.y - B.y) < 2, `L${i + 1} preview ${JSON.stringify(A)} vs real ${JSON.stringify(B)}`);
+      }
+      const pv = Lg.previewPath(LV[0], 45, 0.5);
+      assert(pv.length === Math.round(C.PREVIEW_MS / C.STEP_MS), 'preview covers 1.2 s: ' + pv.length);
+    }],
+    ['ball bounces with restitution 0.55 on the ground', () => {
+      const l = lvl({ ball: { x: 400, y: 300 } });
+      const sim = Lg.createShot(l, 0, 0);
+      let vDown = 0, vUp = 0;
+      for (let i = 0; i < 200; i++) { const v = sim.ball.velocity.y; Lg.stepShot(sim); if (v > 0 && sim.ball.velocity.y < 0) { vDown = v; vUp = -sim.ball.velocity.y; break; } }
+      assert(vDown > 5, 'fell ' + vDown);
+      const e = vUp / vDown;
+      assert(e > 0.45 && e < 0.65, 'restitution ' + e.toFixed(3));
+    }],
+    ['boxes are dynamic and get knocked over', () => {
+      const l = LV[6];
+      const sim = Lg.createShot(l, 20, 0.8);
+      while (!sim.ended) Lg.stepShot(sim);
+      const moved = sim.world.boxes.some((b, i) => { const r = l.boxes[i]; return Math.hypot(b.position.x - (r.x + r.w / 2), b.position.y - (r.y + r.h / 2)) > 10 || Math.abs(b.angle) > 0.2; });
+      assert(moved, 'no box moved');
+    }],
+    ['moving platform blocks the ball and moves back and forth', () => {
+      const m = { w: 30, h: 200, from: { x: 600, y: 500 }, to: { x: 600, y: 300 }, period: 2000 };
+      assertEq([Lg.moverPos(m, 0), Lg.moverPos(m, 1000), Lg.moverPos(m, 2000), Lg.moverPos(m, 500)], [{ x: 600, y: 500 }, { x: 600, y: 300 }, { x: 600, y: 500 }, { x: 600, y: 400 }]);
+      const l = lvl({ movers: [{ ...m, from: { x: 600, y: 560 }, to: { x: 600, y: 560 } }] });
+      const r = Lg.simulateShot(l, 5, 0.6);
+      assert(Math.max(...r.trace.map((q) => q.x)) < 600, 'ball passed through the platform');
+      const free = Lg.simulateShot({ ...l, movers: [] }, 5, 0.6);
+      assert(Math.max(...free.trace.map((q) => q.x)) > 700, 'control shot should pass');
+    }],
+    ['level result: rating = stars on the scoring shot, points = 100*stars + 50*balls left', () => {
+      let s = Lg.beginShot(Lg.newLevelState(2));
+      s = Lg.endShot(s, { goal: true, starsHit: 3 });
+      assertEq([s.phase, s.rating, s.points], ['won', 3, 300 + 100]);
+      let t = Lg.newLevelState(0);
+      t = Lg.endShot(Lg.beginShot(t), { goal: false, starsHit: 1 });
+      t = Lg.endShot(Lg.beginShot(t), { goal: false, starsHit: 0 });
+      t = Lg.endShot(Lg.beginShot(t), { goal: true, starsHit: 1 });
+      assertEq([t.phase, t.rating, t.points, t.ballsLeft], ['won', 1, 100, 0]);
+      let u = Lg.newLevelState(11);
+      assertEq(u.ballsLeft, 2, 'L12 has 2 balls');
+      u = Lg.endShot(Lg.beginShot(u), { goal: false, starsHit: 2 });
+      u = Lg.endShot(Lg.beginShot(u), { goal: false, starsHit: 0 });
+      assertEq([u.phase, Lg.canShoot(u)], ['lost', false], 'out of balls -> try again');
+    }],
+    ['progress: best stars kept, unlocks, next unplayed, garbage-safe', () => {
+      let p = Lg.normProgress(null);
+      assertEq([Lg.isUnlocked(p, 0), Lg.isUnlocked(p, 1), Lg.nextUnplayed(p)], [true, false, 0]);
+      p = Lg.recordResult(p, 0, 2); p = Lg.recordResult(p, 0, 1);
+      assertEq([p.stars[0], Lg.isUnlocked(p, 1), Lg.isUnlocked(p, 2), Lg.nextUnplayed(p)], [2, true, false, 1]);
+      const bad = Lg.normProgress({ stars: ['x', 9, -1, null] });
+      assertEq(bad.stars.slice(0, 4), [0, 3, 0, 0]); assertEq(bad.stars.length, 15);
+      const all = { stars: LV.map(() => 1) };
+      assertEq(Lg.nextUnplayed(all), 0, 'all cleared -> level 1');
+      const before = JSON.stringify(p); Lg.recordResult(p, 3, 3); assertEq(JSON.stringify(p), before, 'no mutation');
+    }],
+    ['session score keeps the best result per level (no farming)', () => {
+      let b = {};
+      b = Lg.recordSession(b, 0, 200); b = Lg.recordSession(b, 0, 150); b = Lg.recordSession(b, 1, 250); b = Lg.recordSession(b, 0, 300);
+      assertEq(Lg.sessionScore(b), 550);
+    }],
+    ['aim from drag: direction and capped power', () => {
+      const a = Lg.aimFromDrag(150, -150);
+      assert(Math.abs(a.angle - 45) < 1e-9 && Math.abs(a.power - Math.hypot(150, 150) / C.MAX_DRAG) < 1e-9, JSON.stringify(a));
+      assertEq(Lg.aimFromDrag(900, 0), { angle: 0, power: 1 }, 'capped');
+      assert(Math.abs(Lg.aimFromDrag(0, -10).angle - 90) < 1e-9, 'up');
+      const v = Lg.launchVelocity(90, 1); assert(Math.abs(v.x) < 1e-9 && Math.abs(v.y + C.MAX_SPEED) < 1e-9, 'launch up');
+    }],
+    ['deterministic and does not mutate level data', () => {
+      const l = LV[12], before = JSON.stringify(l);
+      const r1 = Lg.simulateShot(l, 50, 0.7), r2 = Lg.simulateShot(l, 50, 0.7);
+      assertEq([r1.pos, r1.endReason, r1.t], [r2.pos, r2.endReason, r2.t]);
+      assertEq(JSON.stringify(l), before, 'level mutated');
+    }],
+  ];
+})();
+
+/* ##### GAME-SPECIFIC: the game scene ##### */
+const COL = {
+  sky: 0x8fd3ff, skyLow: 0xc4ebff, ground: 0x5cb85c, groundDark: 0x3f8f3f, wall: 0x8a8f98, wallEdge: 0x5d626b,
+  box: 0xa0662b, boxEdge: 0x6b3f16, mover: 0x6c7a89, moverEdge: 0x3d4652, portalA: 0x9b59ff, portalB: 0xff8c1a,
+  star: 0xffd23f, starEdge: 0xc98f00, goal: 0xffffff, net: 0xdfe7ef, ink: 0x1d2433, ball: 0xffffff,
+};
+function drawStarShape(g, x, y, r, color, edge = null) {
+  g.star(x, y, 5, r, r * 0.48, 0).fill(color);
+  if (edge != null) g.star(x, y, 5, r, r * 0.48, 0).stroke({ width: 3, color: edge });
+  return g;
+}
+function loadProgress() { return Logic.normProgress(Store.get('progress', null)); }
+
+class GameScene extends GameSceneBase {
+  enter(data = {}) {
+    this.startLevel = Number.isInteger(data.level) ? data.level : null;
+    super.enter(data);
+  }
+  initGame() {
+    const C = Logic.C;
+    this.progress = loadProgress();
+    this.sessionBest = {};
+    this.acc = 0; this.levelT = 0; this.sim = null; this.drag = null; this.cooldown = 0;
+    this.aim = { angle: 45, power: 0.55 }; this.aimShown = false; this.aimKey = ''; this.seenStarEvents = 0;
+    this.lastEnd = null;
+    // static background
+    const bg = new Graphics();
+    bg.rect(0, 0, W, H).fill(COL.sky);
+    bg.rect(0, H * 0.45, W, C.GROUND_Y - H * 0.45).fill({ color: COL.skyLow, alpha: 0.5 });
+    bg.rect(0, C.GROUND_Y, W, H - C.GROUND_Y).fill(COL.ground);
+    bg.rect(0, C.GROUND_Y, W, 5).fill(COL.groundDark);
+    this.levelLayer = new Container();
+    this.dynLayer = new Container();
+    this.fx = new Graphics();
+    this.popLayer = new Container();
+    this.board.addChild(bg, this.levelLayer, this.dynLayer, this.fx, this.popLayer);
+    // level info (between the shell's score boxes and the pause button)
+    const infoBox = makePanel(500, 96, THEME.panel, 18); infoBox.position.set(820, 80);
+    this.levelText = makeText('', 30, THEME.text, '800'); this.levelText.position.set(820, 58);
+    this.ballsG = new Graphics(); this.ballsG.position.set(820, 104);
+    this.hintText = makeText('', 22, 0xffffff, '700'); this.hintText.position.set(W / 2, C.GROUND_Y + 21);
+    this.msgText = makeText('', 44, COL.ink, '800'); this.msgText.position.set(W / 2, 250); this.msgText.visible = false;
+    this.board.addChild(infoBox, this.levelText, this.ballsG, this.hintText, this.msgText);
+    this.bindPointer();
+    const start = this.startLevel != null && Logic.isUnlocked(this.progress, this.startLevel) ? this.startLevel : Logic.nextUnplayed(this.progress);
+    this.loadLevel(start);
+  }
+
+  /* ---------- pointer aiming (GoalShot style: press and hold, aim from the BALL toward the pointer, release) ---------- */
+  aimAt(p) {
+    const b = this.level.ball;
+    this.aim = Logic.aimFromDrag(p.x - b.x, p.y - b.y);
+    this.aimShown = this.aim.power >= Logic.C.MIN_POWER;
+    this.drawAim();
+  }
+  bindPointer() {
+    const stage = Scenes.app.stage;
+    const local = (e) => Scenes.root.toLocal(e.global);
+    this._pd = (e) => {
+      if (!this.canAim()) return;
+      let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+      this.drag = true; this.aimAt(local(e));
+    };
+    this._pm = (e) => {
+      if (!this.drag) return;
+      if (!this.canAim()) { this.drag = null; return; }
+      this.aimAt(local(e));
+    };
+    this._pu = (e) => {
+      if (!this.drag) return;
+      this.drag = null;
+      if (!this.canAim()) return;
+      this.aimAt(local(e));
+      if (this.aim.power >= Logic.C.MIN_POWER) this.shoot(this.aim.angle, this.aim.power);
+      else { this.aimShown = false; this.drawAim(); }
+    };
+    stage.on('pointerdown', this._pd); stage.on('pointermove', this._pm);
+    stage.on('pointerup', this._pu); stage.on('pointerupoutside', this._pu);
+  }
+  cleanup() {
+    // quitting mid-run (pause -> Main Menu) still records the session score
+    if (this.state !== 'over' && this.score > 0) { this.state = 'over'; HighScores.add(this.score); }
+    const stage = Scenes.app?.stage;
+    if (stage && this._pd) { stage.off('pointerdown', this._pd); stage.off('pointermove', this._pm); stage.off('pointerup', this._pu); stage.off('pointerupoutside', this._pu); }
+  }
+  canAim() {
+    return this.state === 'playing' && !this.overlay && !Scenes.busy && Scenes.current === this && !this.sim && this.cooldown <= 0 && Logic.canShoot(this.ls);
+  }
+
+  /* ---------- level setup ---------- */
+  loadLevel(idx) {
+    this.levelIdx = idx; this.level = Logic.LEVELS[idx]; this.ls = Logic.newLevelState(idx);
+    this.levelT = 0; this.sim = null; this.drag = null; this.cooldown = 0; this.acc = 0; this.lastEnd = null;
+    this.aimShown = false; this.aimKey = '';
+    this.levelLayer.removeChildren().forEach((c) => c.destroy({ children: true }));
+    this.dynLayer.removeChildren().forEach((c) => c.destroy({ children: true }));
+    this.popLayer.removeChildren().forEach((c) => c.destroy({ children: true }));
+    this.msgText.visible = false;
+    const L = this.level, C = Logic.C;
+    const g = new Graphics();
+    // goal: net, then frame
+    const gl = L.goal;
+    g.rect(gl.x, gl.y, gl.w, gl.h).fill({ color: 0xffffff, alpha: 0.18 });
+    for (let x = gl.x + 14; x < gl.x + gl.w; x += 14) g.moveTo(x, gl.y).lineTo(x, gl.y + gl.h);
+    for (let y = gl.y + 14; y < gl.y + gl.h; y += 14) g.moveTo(gl.x, y).lineTo(gl.x + gl.w, y);
+    g.stroke({ width: 1.5, color: COL.net, alpha: 0.9 });
+    for (const r of Logic.goalParts(gl)) g.rect(r.x, r.y, r.w, r.h).fill(COL.goal).stroke({ width: 2, color: 0x9aa4ad });
+    this.levelLayer.addChild(g);
+    // walls
+    for (const w of L.walls || []) {
+      const wg = new Graphics();
+      wg.rect(-w.w / 2, -w.h / 2, w.w, w.h).fill(COL.wall).stroke({ width: 3, color: COL.wallEdge });
+      wg.position.set(w.x + w.w / 2, w.y + w.h / 2); wg.rotation = (w.angle || 0) * Math.PI / 180;
+      this.levelLayer.addChild(wg);
+    }
+    // portals (ring + small arrow showing the exit direction)
+    Logic.allPortals(L).forEach((p) => {
+      const pg = new Graphics(), col = p.end === 0 ? COL.portalA : COL.portalB;
+      pg.circle(0, 0, C.PORTAL_R).fill({ color: col, alpha: 0.18 });
+      pg.circle(0, 0, C.PORTAL_R).stroke({ width: 7, color: col });
+      pg.circle(0, 0, C.PORTAL_R - 11).stroke({ width: 2, color: col, alpha: 0.6 });
+      pg.poly([C.PORTAL_R + 14, 0, C.PORTAL_R + 3, -7, C.PORTAL_R + 3, 7]).fill(col);
+      pg.position.set(p.x, p.y); pg.rotation = -p.angle * Math.PI / 180;
+      this.levelLayer.addChild(pg);
+    });
+    // stars
+    this.starViews = L.stars.map((s) => {
+      const sg = drawStarShape(new Graphics(), 0, 0, C.STAR_R + 2, COL.star, COL.starEdge);
+      sg.position.set(s.x, s.y);
+      this.levelLayer.addChild(sg);
+      return sg;
+    });
+    // kicker (stick figure): foot line at the ball's resting height
+    const fx = L.ball.x - 30, fy = L.ball.y + C.BALL_R;
+    const k = new Graphics();
+    k.moveTo(fx - 4, fy - 48).lineTo(fx - 14, fy).stroke({ width: 7, color: COL.ink, cap: 'round' });                  // standing leg
+    k.moveTo(fx - 4, fy - 48).lineTo(fx - 4, fy - 98).stroke({ width: 7, color: COL.ink, cap: 'round' });              // body
+    k.moveTo(fx - 4, fy - 88).lineTo(fx - 30, fy - 62).moveTo(fx - 4, fy - 88).lineTo(fx + 18, fy - 70).stroke({ width: 6, color: COL.ink, cap: 'round' });
+    k.circle(fx - 4, fy - 114, 14).fill(0xffe0bd).stroke({ width: 4, color: COL.ink });
+    this.kickLeg = new Graphics();
+    this.kickLeg.moveTo(0, 0).lineTo(16, 46).stroke({ width: 7, color: COL.ink, cap: 'round' });
+    this.kickLeg.position.set(fx - 4, fy - 48);
+    this.levelLayer.addChild(k, this.kickLeg);
+    // dynamic views
+    this.boxViews = (L.boxes || []).map((b) => {
+      const bg = new Graphics();
+      bg.rect(-b.w / 2, -b.h / 2, b.w, b.h).fill(COL.box).stroke({ width: 3, color: COL.boxEdge });
+      bg.moveTo(-b.w / 2 + 4, -b.h / 2 + 4).lineTo(b.w / 2 - 4, b.h / 2 - 4).moveTo(b.w / 2 - 4, -b.h / 2 + 4).lineTo(-b.w / 2 + 4, b.h / 2 - 4).stroke({ width: 2, color: COL.boxEdge, alpha: 0.7 });
+      this.dynLayer.addChild(bg);
+      return bg;
+    });
+    this.moverViews = (L.movers || []).map((m) => {
+      const mg = new Graphics();
+      mg.roundRect(-m.w / 2, -m.h / 2, m.w, m.h, 6).fill(COL.mover).stroke({ width: 3, color: COL.moverEdge });
+      this.dynLayer.addChild(mg);
+      return mg;
+    });
+    this.ballView = new Graphics();
+    this.ballView.circle(0, 0, C.BALL_R).fill(COL.ball).stroke({ width: 2.5, color: 0x222222 });
+    this.ballView.poly([0, -5, 4.8, -1.5, 3, 4, -3, 4, -4.8, -1.5]).fill(0x222222);
+    this.dynLayer.addChild(this.ballView);
+    // texts
+    const t = `Level ${idx + 1} · ${L.name}`;
+    if (this.levelText.text !== t) this.levelText.text = t;
+    fitText(this.levelText, 470);
+    this.hintText.visible = true;
+    this.hintText.text = L.hint || 'Hit at least one star, then land the ball in the goal';
+    fitText(this.hintText, W - 80);
+    this.resetForNextBall();
+    this.drawBalls();
+  }
+  resetForNextBall() {
+    this.sim = null; this.seenStarEvents = 0;
+    this.starViews.forEach((s) => { Tween.kill(s); s.visible = true; s.alpha = 1; s.scale.set(1); });
+    this.syncViews();
+    this.drawAim();
+  }
+  drawBalls() {
+    const g = this.ballsG; g.clear();
+    const n = this.level.balls, gap = 34, x0 = -((n - 1) * gap) / 2;
+    for (let i = 0; i < n; i++) {
+      const live = i < this.ls.ballsLeft;
+      g.circle(x0 + i * gap, 0, 12).fill(live ? COL.ball : 0x3a3452).stroke({ width: 2.5, color: live ? 0x222222 : 0x5a5372 });
+    }
+  }
+
+  /* ---------- aim preview ---------- */
+  drawAim() {
+    const g = this.fx; g.clear();
+    if (!this.aimShown || !this.canAim()) { this.aimKey = ''; return; }
+    const { angle, power } = this.aim;
+    const b = this.level.ball, r = angle * Math.PI / 180;
+    const pts = Logic.previewPath(this.level, angle, power);
+    pts.forEach((p, i) => { if (i % 3 === 2) g.circle(p.x, p.y, 4.5).fill({ color: 0xffffff, alpha: 0.95 - 0.6 * i / pts.length }); });
+    const len = 36 + power * 110, ex = b.x + Math.cos(r) * len, ey = b.y - Math.sin(r) * len;
+    g.moveTo(b.x, b.y).lineTo(ex, ey).stroke({ width: 5, color: THEME.danger, cap: 'round' });
+    const hx = Math.cos(r), hy = -Math.sin(r);
+    g.poly([ex + hx * 14, ey + hy * 14, ex - hy * 9, ey + hx * 9, ex + hy * 9, ey - hx * 9]).fill(THEME.danger);
+    this.aimKey = angle.toFixed(3) + ':' + power.toFixed(3);
+  }
+
+  /* ---------- shooting ---------- */
+  /** Kick the ball. Returns false (and does nothing) if a shot is not allowed right now. */
+  shoot(angle, power) {
+    if (!this.canAim()) return false;
+    const ns = Logic.beginShot(this.ls);
+    if (!ns) return false;
+    this.ls = ns;
+    this.sim = Logic.createShot(this.level, angle, power, { t0: this.levelT });
+    this.acc = 0; this.seenStarEvents = 0; this.aimShown = false; this.fx.clear();
+    this.hintText.visible = false;
+    Sfx.play('hit');
+    Tween.kill(this.kickLeg); this.kickLeg.rotation = 0;
+    Tween.to(this.kickLeg, { rotation: -1.0 }, 80).then(() => { if (!this.kickLeg.destroyed) Tween.to(this.kickLeg, { rotation: 0 }, 220); });
+    this.drawBalls();
+    return true;
+  }
+  onShotEnded() {
+    const sim = this.sim;
+    const result = { goal: sim.goal, starsHit: Logic.starCount(sim) };
+    this.lastEnd = sim.endReason;
+    this.levelT = sim.t0 + sim.t;
+    this.ls = Logic.endShot(this.ls, result);
+    if (this.ls.phase === 'won') this.recordClear();   // saved now; only the panel waits for the cooldown
+    const msg = sim.endReason === 'goal' ? 'GOAL!' : sim.endReason === 'goalNoStar' ? 'No star - no goal!' : 'Missed!';
+    this.flash(msg, sim.endReason === 'goal' ? THEME.accent : COL.ink);
+    Sfx.play(sim.endReason === 'goal' ? 'win' : 'lose');
+    this.cooldown = sim.endReason === 'goal' ? 1000 : 800;
+  }
+  flash(text, color) {
+    this.msgText.text = text; this.msgText.style.fill = color; this.msgText.visible = true;
+    this.msgText.alpha = 1; this.msgText.scale.set(0.4);
+    Tween.to(this.msgText, { scale: 1 }, 260, Ease.outBack);
+  }
+  recordClear() {
+    const s = this.ls;
+    this.progress = Logic.recordResult(this.progress, this.levelIdx, s.rating);
+    Store.set('progress', this.progress);
+    this.sessionBest = Logic.recordSession(this.sessionBest, this.levelIdx, s.points);
+    this.setScore(Logic.sessionScore(this.sessionBest));
+  }
+  /** R key and Pause -> Restart: replay the CURRENT level; the session score is kept and nothing is recorded. */
+  restart() {
+    if (this.state === 'over') return;
+    this.hideAllOverlays();
+    this.state = 'playing';
+    this.loadLevel(this.levelIdx);
+  }
+  afterCooldown() {
+    this.msgText.visible = false;
+    const s = this.ls;
+    if (s.phase === 'won') {
+      const last = this.levelIdx >= Logic.LEVELS.length - 1;
+      const sub = `+${s.points} points  (${s.rating} star${s.rating > 1 ? 's' : ''} x 100 + ${s.ballsLeft} ball${s.ballsLeft === 1 ? '' : 's'} left x 50)`;
+      const btns = last
+        ? [['Finish', () => this.endGame({ won: true, delay: 200 })], ['Replay Level', () => { this.hideOverlay(); this.loadLevel(this.levelIdx); }, { variant: 'secondary' }]]
+        : [['Next Level', () => { this.hideOverlay(); this.loadLevel(this.levelIdx + 1); }],
+           ['Replay Level', () => { this.hideOverlay(); this.loadLevel(this.levelIdx); }, { variant: 'secondary' }],
+           ['End Run', () => this.endGame({ won: false, delay: 200 }), { variant: 'secondary' }]];
+      this.showPanel(last ? 'All Levels Cleared!' : `Level ${this.levelIdx + 1} Complete!`, s.rating, this.level.stars.length, sub, btns);
+    } else if (s.phase === 'lost') {
+      this.showPanel('Try again', 0, 0, 'Out of balls - hit a star before the goal!', [
+        ['Retry Level', () => { this.hideOverlay(); this.loadLevel(this.levelIdx); }],
+        ['End Run', () => this.endGame({ won: false, delay: 200 }), { variant: 'secondary' }],
+      ]);
+      this.sim = null; this.syncViews();
+    } else {
+      this.resetForNextBall();
+    }
+  }
+  showPanel(title, rating, total, sub, buttons) {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.55 });
+    dim.eventMode = 'static'; dim.on('pointertap', (e) => e.stopPropagation());
+    const ph = 150 + (total > 0 ? 80 : 0) + 50 + buttons.length * 82 + 10, top = H / 2 - ph / 2;
+    const panel = makePanel(760, ph); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 54, THEME.text, '800'); fitText(t, 680); t.position.set(W / 2, top + 70);
+    o.addChild(dim, panel, t);
+    let y = top + 140;
+    if (total > 0) {
+      const sg = new Graphics();
+      for (let i = 0; i < total; i++) drawStarShape(sg, W / 2 + (i - (total - 1) / 2) * 84, y + 10, 32, i < rating ? COL.star : 0x4a4366, i < rating ? COL.starEdge : null);
+      o.addChild(sg); y += 80;
+    }
+    const s = makeText(sub, 24, THEME.textDim, '600'); fitText(s, 680); s.position.set(W / 2, y); o.addChild(s);
+    const col = buttonColumn(buttons, W / 2, y + 76, 14, { h: 68, w: 340, size: 30 });
+    o.addChild(col);
+    this.overlay = o; o.panelTitle = title;
+    this.view.addChild(o);
+  }
+
+  /* ---------- input + loop ---------- */
+  handleInput(a, source) {
+    if (source !== 'key') return;              // pointer aiming is handled by the drag listeners
+    if (!this.canAim()) return;
+    const C = Logic.C;
+    if (a === 'up' || a === 'down') this.aim = { ...this.aim, angle: Logic.clamp(this.aim.angle + (a === 'up' ? 2 : -2), -80, 170) };
+    else if (a === 'left' || a === 'right') this.aim = { ...this.aim, power: Logic.clamp(this.aim.power + (a === 'right' ? 0.02 : -0.02), C.MIN_POWER, 1) };
+    else if (a === 'action' || a === 'confirm') { this.shoot(this.aim.angle, this.aim.power); return; }
+    else return;
+    this.aimShown = true; this.drawAim();
+  }
+  tick(dtMs) {
+    const C = Logic.C;
+    if (this.cooldown > 0) {
+      this.cooldown -= dtMs;
+      if (this.cooldown <= 0) { this.cooldown = 0; this.afterCooldown(); }
+      return;
+    }
+    if (this.sim && !this.sim.ended) {
+      this.acc += dtMs;
+      while (this.acc >= C.STEP_MS && !this.sim.ended) {
+        this.acc -= C.STEP_MS;
+        Logic.stepShot(this.sim);
+        while (this.seenStarEvents < this.sim.starEvents.length) {
+          const sv = this.starViews[this.sim.starEvents[this.seenStarEvents++]];
+          Sfx.play('score');
+          Tween.to(sv, { scale: 1.6, alpha: 0 }, 220).then(() => { if (!sv.destroyed) sv.visible = false; });
+        }
+      }
+      this.levelT = this.sim.t0 + this.sim.t;
+      if (this.sim.ended) this.onShotEnded();
+    } else if (!this.sim) {
+      this.levelT += dtMs;
+    }
+    this.syncViews();
+  }
+  syncViews() {
+    const L = this.level, sim = this.sim;
+    if (sim) {
+      sim.world.boxes.forEach((b, i) => { this.boxViews[i].position.set(b.position.x, b.position.y); this.boxViews[i].rotation = b.angle; });
+      sim.world.movers.forEach((b, i) => this.moverViews[i].position.set(b.position.x, b.position.y));
+      this.ballView.position.set(sim.ball.position.x, sim.ball.position.y); this.ballView.rotation = sim.ball.angle;
+    } else {
+      (L.boxes || []).forEach((r, i) => { this.boxViews[i].position.set(r.x + r.w / 2, r.y + r.h / 2); this.boxViews[i].rotation = 0; });
+      (L.movers || []).forEach((m, i) => { const p = Logic.moverPos(m, this.levelT); this.moverViews[i].position.set(p.x, p.y); });
+      this.ballView.position.set(L.ball.x, L.ball.y); this.ballView.rotation = 0;
+    }
+  }
+  debugState() {
+    const sim = this.sim;
+    return {
+      ...super.debugState(),
+      level: this.levelIdx + 1, levelIndex: this.levelIdx, levelName: this.level?.name,
+      phase: this.ls?.phase, ballsLeft: this.ls?.ballsLeft, rating: this.ls?.rating, inFlight: !!(sim && !sim.ended),
+      cooldown: this.cooldown, lastEnd: this.lastEnd,
+      shotStars: sim ? Logic.starCount(sim) : 0, starsVisible: this.starViews ? this.starViews.filter((s) => s.visible).length : 0,
+      ball: sim ? { x: Math.round(sim.ball.position.x), y: Math.round(sim.ball.position.y) } : { ...this.level.ball },
+      aim: this.aim, aimShown: this.aimShown, levelT: Math.round(this.levelT),
+      progress: this.progress?.stars, sessionBest: this.sessionBest,
+      overlay: this.overlay ? (this.overlay.panelTitle || 'overlay') : null,
+    };
+  }
+}
+
+/* ---------- extra scenes (landscape layouts) ---------- */
+class LevelSelectScene extends Scene {
+  enter() {
+    const prog = loadProgress();
+    const title = makeText('Levels', 64, THEME.text, '800'); title.position.set(W / 2, 64);
+    const total = prog.stars.reduce((a, b) => a + b, 0), max = Logic.LEVELS.reduce((a, l) => a + l.stars.length, 0);
+    const tot = makeText(`${total} / ${max} stars`, 26, THEME.accent, '700'); tot.position.set(W / 2, 122);
+    this.view.addChild(title, tot);
+    const cols = 5, tw = 170, th = 118, gx = 26, gy = 22;
+    const x0 = W / 2 - ((cols - 1) * (tw + gx)) / 2, y0 = 230;
+    Logic.LEVELS.forEach((lv, i) => {
+      const unlocked = Logic.isUnlocked(prog, i);
+      const c = new Container();
+      c.position.set(x0 + (i % cols) * (tw + gx), y0 + Math.floor(i / cols) * (th + gy));
+      const bg = new Graphics();
+      const draw = (col) => { bg.clear(); bg.roundRect(-tw / 2, -th / 2, tw, th, 18).fill(col); };
+      draw(unlocked ? THEME.secondary : 0x26213a);
+      const num = makeText(String(i + 1), 40, unlocked ? THEME.text : THEME.textDim, '800'); num.position.set(0, -20);
+      const st = new Graphics();
+      lv.stars.forEach((_, k) => drawStarShape(st, (k - (lv.stars.length - 1) / 2) * 34, 30, 13, k < prog.stars[i] ? COL.star : 0x4a4366));
+      c.addChild(bg, num, st);
+      if (unlocked) {
+        c.isButton = true; c.label = 'button:Level ' + (i + 1); c.btnText = 'Level ' + (i + 1);
+        c.eventMode = 'static'; c.cursor = 'pointer'; c.hitArea = new Rectangle(-tw / 2, -th / 2, tw, th);
+        c.on('pointerover', () => draw(THEME.secondaryHover)); c.on('pointerout', () => draw(THEME.secondary));
+        c.on('pointertap', (e) => { e.stopPropagation(); if (Scenes.busy) return; Sfx.unlock(); Sfx.play('click'); Scenes.go('game', { level: i }); });
+      } else {
+        c.alpha = 0.6;
+        const lock = new Graphics();
+        lock.roundRect(-11, -24, 22, 18, 3).fill(THEME.textDim);
+        lock.moveTo(-6, -24).lineTo(-6, -31).arc(0, -31, 6, Math.PI, 0).lineTo(6, -24).stroke({ width: 3, color: THEME.textDim });
+        lock.position.set(tw / 2 - 26, -th / 2 + 36);
+        c.addChild(lock);
+      }
+      this.view.addChild(c);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary', w: 300, h: 68, size: 30 });
+    back.position.set(W / 2, 664);
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+GAME_HOOKS.menuButtons.push(['Levels', () => Scenes.go('levels')]);
+GAME_HOOKS.scenes.levels = LevelSelectScene;
+
+/* ##### END GAME-SPECIFIC ##### */
+
+/* ---------- test helpers ---------- */
+function assert(cond, msg = 'assertion failed') { if (!cond) throw new Error(msg); }
+function assertEq(a, b, msg = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg} expected ${B} got ${A}`); }
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const app = new Application();
+  await app.init({
+    resizeTo: window,
+    background: THEME.outerBg,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preference: 'webgl',
+  });
+  document.getElementById('app').appendChild(app.canvas);
+
+  const root = new Container(); root.label = 'root';
+  root.addChild(makeBackground());
+  const sceneLayer = new Container(); sceneLayer.label = 'scenes';
+  root.addChild(sceneLayer);
+  app.stage.addChild(root);
+
+  const mask = new Graphics(); mask.rect(0, 0, W, H).fill(0xffffff);
+  root.addChild(mask); root.mask = mask;       // nothing draws outside the play area
+
+  function layout() {
+    const sw = app.screen.width, sh = app.screen.height;
+    const s = Math.min(sw / W, sh / H);
+    root.scale.set(s);
+    root.position.set(Math.round((sw - W * s) / 2), Math.round((sh - H * s) / 2));
+    app.stage.hitArea = app.screen;
+  }
+  layout();
+  window.addEventListener('resize', () => requestAnimationFrame(() => { app.resize(); layout(); }));
+
+  Scenes.app = app; Scenes.root = sceneLayer;
+  Scenes.register('menu', MenuScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+  for (const [name, cls] of Object.entries(GAME_HOOKS.scenes)) Scenes.register(name, cls);
+
+  Input.init();
+  initSwipe(app, root);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden(); });
+
+  app.ticker.add((ticker) => {
+    const dt = Math.min(ticker.deltaMS, 50);  // clamp: no huge jumps after tab switch
+    Tween.update(dt);
+    Scenes.current?.update(dt);
+  });
+
+  await Scenes.go('menu');
+
+  /* test hook used by scripts/verify.py (harmless in production) */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },          // for checks.js: direct access to the live scene (set up boards, read fields)
+    inputStats() { return { ...Scenes.inputStats }; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    boardObjects() { const b = Scenes.current?.board; let n = 0; const walk = (c) => { if (!c.visible) return; n++; c.children.forEach(walk); }; if (b) walk(b); return n - (b ? 1 : 0); },
+    buttons() {
+      const out = [];
+      const walk = (c) => {
+        if (!c.visible || c.destroyed) return;
+        if (c.isButton) { const p = c.getGlobalPosition(); out.push({ label: c.btnText, x: p.x, y: p.y }); }
+        for (const ch of c.children) walk(ch);
+      };
+      walk(app.stage);
+      return out;
+    },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endGame) { s.endGame({ delay: 0 }); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+  };
+})().catch((e) => showFatal(e.message || String(e)));
+</script>
+</body>
+</html>

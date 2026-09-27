@@ -1,0 +1,1428 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Halma</title><!-- GAME-SPECIFIC: set to CONFIG.title (galleries read this tag) -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14121f; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #fatal { position: fixed; inset: auto 12px 12px 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fatal"></div>
+<script type="module">
+/* =====================================================================
+   PIXIJS GAME SHELL (PixiJS v8, single file, no build step)
+   Sections marked  ##### GAME-SPECIFIC #####  are the only parts that
+   change per game. Everything else is the tested framework:
+   scenes, menu, pause, game over, play again, high scores, sound,
+   input (keys + swipe + tap), tweens, responsive scaling, test hook.
+   ===================================================================== */
+import { Application, Container, Graphics, Text, Rectangle } from '/vendor/pixi.min.mjs';
+
+/* ---------- fatal error overlay (never a silent blank screen) ---------- */
+const fatalBox = document.getElementById('fatal');
+function showFatal(msg) { fatalBox.style.display = 'block'; fatalBox.textContent = 'Error: ' + msg; }
+window.addEventListener('error', (e) => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ##### GAME-SPECIFIC: CONFIG ##### */
+const CONFIG = {
+  id: 'halma',               // unique per game: namespaces saved scores
+  title: 'Halma',
+  subtitle: 'Move all your pieces to the other side',
+  width: 720, height: 1280,    // design resolution (portrait). Landscape games: 1280 x 720
+  maxHighScores: 10,
+  keyRepeat: false,            // true for continuous-movement games (e.g. paddle), false for turn/grid games
+  scoreLabel: 'Score',
+  lowerIsBetter: false,        // true for time-based games (fastest time wins)
+};
+const THEME = {
+  outerBg: 0x14121f,           // letterbox color outside the play area
+  bg: 0x1f1b2e,                // play-area background
+  panel: 0x2b2640,
+  primary: 0x7c5cff,
+  primaryHover: 0x9479ff,
+  secondary: 0x3a3452,
+  secondaryHover: 0x4a4366,
+  danger: 0xff5c7a,
+  text: 0xf4f1ff,
+  textDim: 0xa9a3c4,
+  accent: 0xffd166,
+  font: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+};
+/* Optional hooks, filled in the GAME-SPECIFIC scene section AFTER your classes are defined:
+     GAME_HOOKS.menuButtons.push(['Levels', () => Scenes.go('levels')]);   // extra menu buttons (between Play and High Scores)
+     GAME_HOOKS.scenes.levels = LevelSelectScene;                          // extra scenes, registered at boot
+   GameScene may define gameOverData() { return { extraLine: 'Gold medal' }; } to add a line to the Game Over screen. */
+const GAME_HOOKS = { menuButtons: [], scenes: {} };
+/* ##### END CONFIG ##### */
+
+const W = CONFIG.width, H = CONFIG.height;
+const LAND = W > H;   // landscape layout for the shared screens
+
+/* ---------- safe storage (localStorage may throw: private mode, sandboxed iframes) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fallback = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fallback : JSON.parse(raw); }
+      catch { return fallback; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+/* ---------- high scores ---------- */
+const HighScores = {
+  list() {
+    const l = Store.get('highscores', []);
+    return Array.isArray(l) ? l.filter((e) => e && Number.isFinite(e.score)) : [];
+  },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  better(a, b) { return CONFIG.lowerIsBetter ? a < b : a > b; },
+  /** Adds a score. Returns { rank (1-based or 0 if not ranked), isBest }. */
+  add(score) {
+    if (!Number.isFinite(score) || (!CONFIG.lowerIsBetter && score <= 0)) return { rank: 0, isBest: false };
+    const prevBest = this.list()[0];
+    const entry = { score, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list();
+    l.push(entry);
+    l.sort((a, b) => (CONFIG.lowerIsBetter ? a.score - b.score : b.score - a.score) || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    const isBest = rank === 1 && (!prevBest || this.better(score, prevBest.score));
+    return { rank, isBest };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* ---------- sound (WebAudio synth: no asset files needed) ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'move': this.tone(300, 0.04, 'sine', 0.06); break;
+      case 'score': this.tone(880, 0.07, 'triangle', 0.12, 1320); break;
+      case 'merge': this.tone(520, 0.09, 'sine', 0.12, 780); break;
+      case 'hit': this.tone(180, 0.08, 'square', 0.08); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.14, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- tweens (driven by app.ticker; promise-based; safe on destroyed targets) ---------- */
+const Ease = {
+  linear: (t) => t,
+  outQuad: (t) => 1 - (1 - t) * (1 - t),
+  outCubic: (t) => 1 - Math.pow(1 - t, 3),
+  inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  outBack: (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const Tween = {
+  active: new Set(),
+  /** props: numeric fields of target; 'scale' sets scale.x and scale.y together. */
+  to(target, props, ms = 200, ease = Ease.outCubic) {
+    return new Promise((resolve) => {
+      const from = {};
+      for (const k of Object.keys(props)) from[k] = k === 'scale' ? target.scale.x : target[k];
+      const tw = { target, props, from, ms: Math.max(1, ms), t: 0, ease, resolve };
+      this.active.add(tw);
+    });
+  },
+  apply(tw, p) {
+    const e = tw.ease(p);
+    for (const k of Object.keys(tw.props)) {
+      const v = tw.from[k] + (tw.props[k] - tw.from[k]) * e;
+      if (k === 'scale') tw.target.scale.set(v); else tw.target[k] = v;
+    }
+  },
+  update(dtMs) {
+    for (const tw of [...this.active]) {
+      if (tw.target.destroyed) { this.active.delete(tw); tw.resolve(); continue; }
+      tw.t += dtMs;
+      const p = Math.min(1, tw.t / tw.ms);
+      this.apply(tw, p);
+      if (p >= 1) { this.active.delete(tw); tw.resolve(); }
+    }
+  },
+  /** Jump every running tween (optionally only one target's) to its end state. */
+  finish(target = null) {
+    for (const tw of [...this.active]) {
+      if (target && tw.target !== target) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  /** Scale up to `peak` and back (merge/score pop). */
+  pop(target, peak = 1.15, ms = 140) {
+    const base = target.scale.x;
+    return this.to(target, { scale: base * peak }, ms, (t) => Math.sin(Math.PI * t));   // up and back in one tween; finishing lands on base
+  },
+  /** Finish only tweens whose target is `container` or inside it (e.g. this.board). Prefer this over finish(). */
+  finishWithin(container) {
+    for (const tw of [...this.active]) {
+      let n = tw.target, inside = false;
+      while (n) { if (n === container) { inside = true; break; } n = n.parent; }
+      if (!inside && !tw.target.destroyed) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  kill(target) { for (const tw of [...this.active]) if (tw.target === target) { this.active.delete(tw); tw.resolve(); } },
+  get busy() { return this.active.size > 0; },
+};
+
+/* ---------- UI helpers ---------- */
+function makeText(text, size = 32, color = THEME.text, weight = '600', extra = {}) {
+  const t = new Text({ text: String(text), style: { fontFamily: THEME.font, fontSize: size, fill: color, fontWeight: weight, align: 'center', ...extra } });
+  t.anchor.set(0.5);
+  return t;
+}
+/** Shrink a Text uniformly so it fits maxW (and optional maxH). Call after setting .text. */
+function fitText(t, maxW, maxH = Infinity) {
+  t.scale.set(1);
+  const s = Math.min(1, maxW / Math.max(1, t.width), maxH / Math.max(1, t.height));
+  t.scale.set(s);
+  return t;
+}
+function makePanel(w, h, color = THEME.panel, radius = 24, alpha = 1) {
+  const g = new Graphics();
+  g.roundRect(-w / 2, -h / 2, w, h, radius).fill({ color, alpha });
+  return g;
+}
+function makeButton(label, onTap, opts = {}) {
+  const { w = 360, h = 88, size = 34, variant = 'primary' } = opts;
+  const base = variant === 'primary' ? THEME.primary : variant === 'danger' ? THEME.danger : THEME.secondary;
+  const hover = variant === 'primary' ? THEME.primaryHover : variant === 'danger' ? 0xff7a93 : THEME.secondaryHover;
+  const c = new Container();
+  c.isButton = true;
+  c.label = 'button:' + label;
+  const bg = new Graphics();
+  const draw = (col) => { bg.clear(); bg.roundRect(-w / 2, -h / 2, w, h, Math.min(28, h / 2)).fill(col); };
+  draw(base);
+  const t = makeText(label, size, THEME.text, '700');
+  c.addChild(bg, t);
+  c.eventMode = 'static';
+  c.cursor = 'pointer';
+  c.hitArea = new Rectangle(-w / 2, -h / 2, w, h);
+  c.on('pointerover', () => { draw(hover); c.scale.set(1.03); });
+  c.on('pointerout', () => { draw(base); c.scale.set(1); });
+  c.on('pointerdown', () => c.scale.set(0.96));
+  c.on('pointerup', () => c.scale.set(1.03));
+  c.on('pointerupoutside', () => { draw(base); c.scale.set(1); });
+  c.on('pointertap', (e) => {
+    e.stopPropagation();
+    if (Scenes.busy || c.disabled) return;
+    Sfx.unlock(); Sfx.play('click');
+    onTap(e);
+  });
+  c.setText = (s) => { t.text = String(s); c.btnText = String(s); };
+  c.btnText = label;
+  return c;
+}
+/** Vertical stack of buttons centered at (x, y). */
+function buttonColumn(defs, x, y, gap = 24, opts = {}) {
+  const col = new Container();
+  const h = opts.h || 88;
+  defs.forEach(([label, fn, o], i) => {
+    const b = makeButton(label, fn, { ...opts, ...(o || {}) });
+    b.position.set(0, i * (h + gap));
+    col.addChild(b);
+  });
+  col.position.set(x, y);
+  return col;
+}
+
+/* ---------- input: keyboard + swipe + actions ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'action', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();                       // stop arrows/space scrolling the page
+      Sfx.unlock();
+      const wasHeld = this.held.has(a);
+      this.held.add(a);
+      if (e.repeat && !CONFIG.keyRepeat) return;
+      if (wasHeld && !e.repeat) return;
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+  },
+  isDown(a) { return this.held.has(a); },
+};
+/** Swipe detection on the whole screen (stage hitArea = app.screen). */
+function initSwipe(app, root) {
+  let start = null;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointerdown', (e) => {
+    Sfx.unlock(); start = { x: e.global.x, y: e.global.y, t: performance.now() };
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+    const p = root.toLocal(e.global);
+    Scenes.dispatch('press', 'pointer', { x: p.x, y: p.y });   // instant: use for flap/jump/shoot games
+  });
+  const end = (e) => {
+    if (!start) return;
+    const dx = (e.global.x - start.x) / root.scale.x, dy = (e.global.y - start.y) / root.scale.y;
+    const dt = performance.now() - start.t;
+    start = null;
+    const dist = Math.hypot(dx, dy);
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }   // presses on buttons are not game input
+    if (dist < 25 && dt < 500) {               // a tap anywhere: 'tap' action with design-space position
+      const p = root.toLocal(e.global);
+      Scenes.dispatch('tap', 'pointer', { x: p.x, y: p.y });
+      return;
+    }
+    if (dist < 40 || dt > 1000) return;         // design-space pixels; ignore slow drags
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    Scenes.dispatch(dir, 'swipe');
+  };
+  app.stage.on('pointerup', end);
+  app.stage.on('pointerupoutside', end);
+}
+
+/* ---------- scenes ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.view = new Container(); this.view.label = 'scene:' + name; }
+  enter(_data) {}
+  exit() {}
+  update(_dtMs) {}
+  onAction(_action, _source, _pos) {}
+  onHidden() {}
+}
+const Scenes = {
+  app: null, root: null, current: null, busy: false, registry: {},
+  register(name, cls) { this.registry[name] = cls; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const old = this.current;
+      if (old) {
+        await Tween.to(old.view, { alpha: 0 }, 140);
+        old.exit();
+        Tween.kill(old.view);
+        this.root.removeChild(old.view);
+        old.view.destroy({ children: true });
+      }
+      const Cls = this.registry[name];
+      const scene = new Cls(name);
+      this.current = scene;
+      scene.view.alpha = 0;
+      this.root.addChild(scene.view);
+      scene.enter(data);
+      await Tween.to(scene.view, { alpha: 1 }, 160);
+    } finally {
+      this.busy = false;
+    }
+  },
+  inputStats: {},
+  dispatch(action, source, pos = null) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, pos);
+  },
+};
+
+/* ---------- shared background ---------- */
+function makeBackground() {
+  const g = new Graphics();
+  g.rect(0, 0, W, H).fill(THEME.bg);
+  return g;
+}
+function soundLabel() { return Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+
+/* ---------- Menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    // Portrait: one centered column. Landscape (W > H): text on the left, buttons on the right.
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const ty = LAND ? H * 0.34 : H * 0.24;
+    const title = makeText(CONFIG.title, 96, THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, ty);
+    const sub = makeText(CONFIG.subtitle, 30, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: textW - 40 });
+    fitText(sub, textW - 40, 80);
+    sub.position.set(cx, ty + 90);
+    const best = HighScores.best();
+    const bestT = makeText(best ? `Best: ${formatScore(best)}` : 'No high score yet', 32, THEME.accent, '700');
+    bestT.position.set(cx, ty + 160);
+    const defs = [
+      ['Play', () => Scenes.go('game')],
+      ...GAME_HOOKS.menuButtons.map(([label, fn]) => [label, fn, { variant: 'secondary' }]),
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      [soundLabel(), () => { Sfx.setMuted(!Sfx.muted); this.onMuteChanged(); }, { variant: 'secondary' }],
+    ];
+    const bh = defs.length > 4 ? 76 : 88, gap = defs.length > 4 ? 18 : 24;
+    const colH = defs.length * bh + (defs.length - 1) * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.min(H * 0.55, H - 150 - colH + bh / 2);
+    const col = buttonColumn(defs, LAND ? W * 0.72 : W / 2, colTop, gap, { h: bh });
+    this.soundBtn = col.children[col.children.length - 1];
+    const hint = makeText('Enter to play  ·  M to mute', 24, THEME.textDim, '500');
+    hint.position.set(cx, H - 60);
+    this.view.addChild(title, sub, bestT, col, hint);
+  }
+  onMuteChanged() { this.soundBtn?.setText(soundLabel()); }
+  onAction(a) { if (a === 'confirm' || a === 'action') Scenes.go('game'); }
+}
+
+/* ---------- High scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const top = LAND ? 70 : 150;
+    const title = makeText('High Scores', LAND ? 60 : 72, THEME.text, '800');
+    title.position.set(W / 2, top);
+    const rowH = LAND ? 52 : 64;
+    const panelTop = top + (LAND ? 60 : 100);
+    const room = Math.floor((H - panelTop - 200) / rowH);             // rows that fit above the Back button
+    const rows = Math.max(3, Math.min(CONFIG.maxHighScores, room));
+    const panelW = LAND ? Math.min(W - 120, 760) : W - 120;
+    const panelH = 60 + rows * rowH;
+    const panel = makePanel(panelW, panelH);
+    panel.position.set(W / 2, panelTop + panelH / 2);
+    this.view.addChild(title, panel);
+    const list = HighScores.list().slice(0, rows);
+    if (!list.length) {
+      const none = makeText('No scores yet. Go play!', 34, THEME.textDim, '500');
+      none.position.set(W / 2, panelTop + panelH / 2);
+      this.view.addChild(none);
+    }
+    const left = W / 2 - panelW / 2 + 50, right = W / 2 + panelW / 2 - 50;
+    list.forEach((e, i) => {
+      const y = panelTop + 30 + rowH / 2 + i * rowH;
+      const color = i === 0 ? THEME.accent : THEME.text;
+      const r = makeText(`${i + 1}.`, 32, color, '700'); r.anchor.set(0, 0.5); r.position.set(left, y);
+      const sc = makeText(formatScore(e.score), 32, color, '700'); sc.position.set(W / 2, y);
+      const d = makeText(e.date || '', 22, THEME.textDim, '500'); d.anchor.set(1, 0.5); d.position.set(right, y);
+      this.view.addChild(r, sc, d);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, Math.min(H - 70, panelTop + panelH + 90));
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- Game over ---------- */
+class GameOverScene extends Scene {
+  /** data: { score, rank, isBest, won, extraLine? } — extraLine comes from GameScene.gameOverData() (e.g. "Gold medal"). */
+  enter({ score = 0, rank = 0, isBest = false, won = false, extraLine = '' } = {}) {
+    this.score = score;
+    this.enteredAt = performance.now();
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const y0 = LAND ? H * 0.2 : H * 0.2;
+    const title = makeText(won ? 'You Win!' : 'Game Over', 92, won ? THEME.accent : THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, y0);
+    const label = makeText(CONFIG.scoreLabel, 30, THEME.textDim, '600');
+    label.position.set(cx, y0 + 100);
+    const sc = makeText(formatScore(score), 110, THEME.text, '800');
+    fitText(sc, textW);
+    sc.position.set(cx, y0 + 185);
+    const bestLine = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${formatScore(HighScores.best())}`;
+    const b = makeText(bestLine, 36, isBest ? THEME.accent : THEME.textDim, '700');
+    b.position.set(cx, y0 + 275);
+    this.view.addChild(title, label, sc, b);
+    if (extraLine) {
+      const ex = makeText(extraLine, 30, THEME.text, '600', { wordWrap: true, wordWrapWidth: textW });
+      fitText(ex, textW, 80);
+      ex.position.set(cx, y0 + 330);
+      this.view.addChild(ex);
+    }
+    const bh = 88, gap = 24, colH = 3 * bh + 2 * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.max(y0 + (extraLine ? 420 : 370), H - 140 - colH + bh / 2);
+    const col = buttonColumn([
+      ['Play Again', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], LAND ? W * 0.72 : W / 2, colTop, gap);
+    this.view.addChild(col);
+    if (isBest) { b.scale.set(0.2); Tween.to(b, { scale: 1 }, 450, Ease.outBack); }
+  }
+  onAction(a) {
+    if (performance.now() - this.enteredAt < 800) return;   // grace period: a late Space/tap from the game must not skip this screen
+    if (a === 'confirm' || a === 'restart') Scenes.go('game'); else if (a === 'pause') Scenes.go('menu');
+  }
+}
+
+/* ---------- Game scene: framework part (HUD, pause, end) ---------- */
+class GameSceneBase extends Scene {
+  enter() {
+    this.score = 0;
+    this.state = 'playing';              // 'playing' | 'paused' | 'over'
+    this.board = new Container();        // put all game visuals in here
+    this.board.label = 'board';
+    this.hud = new Container();
+    this.overlay = null;
+    this.view.addChild(this.board, this.hud);
+    this.buildHud();
+    this.initGame();
+    this.renderScore();
+  }
+  buildHud() {
+    const scoreBox = makePanel(220, 96, THEME.panel, 18); scoreBox.position.set(150, 80);
+    const bestBox = makePanel(220, 96, THEME.panel, 18); bestBox.position.set(390, 80);
+    const sl = makeText(CONFIG.scoreLabel.toUpperCase(), 20, THEME.textDim, '700'); sl.position.set(150, 56);
+    const bl = makeText('BEST', 20, THEME.textDim, '700'); bl.position.set(390, 56);
+    this.scoreText = makeText('0', 40, THEME.text, '800'); this.scoreText.position.set(150, 96);
+    this.bestText = makeText(formatScore(HighScores.best()), 40, THEME.text, '800'); this.bestText.position.set(390, 96);
+    const pause = makeButton('II', () => this.togglePause(), { w: 96, h: 96, size: 34, variant: 'secondary' });
+    pause.label = 'button:Pause';
+    pause.position.set(W - 90, 80);
+    this.hud.addChild(scoreBox, bestBox, sl, bl, this.scoreText, this.bestText, pause);
+  }
+  addScore(n) {
+    if (this.state === 'over') return;
+    this.score += n;
+    this.renderScore();
+  }
+  setScore(n) { this.score = n; this.renderScore(); }
+  renderScore() {
+    this.scoreText.text = formatScore(this.score);
+    const best = HighScores.best();
+    const shown = CONFIG.lowerIsBetter ? best : Math.max(best, this.score);
+    this.bestText.text = formatScore(shown);
+  }
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedOverlay = this.overlay;               // keep e.g. a win overlay underneath; restored on resume
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => this.restart(), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ]);
+  }
+  resume() {
+    this.hideOverlay();
+    if (this.savedOverlay && !this.savedOverlay.destroyed) { this.savedOverlay.visible = true; this.overlay = this.savedOverlay; }
+    this.savedOverlay = null;
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  showOverlay(title, buttons, subtitle = '') {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.6 });
+    dim.eventMode = 'static';                         // swallow clicks to the game underneath
+    dim.on('pointertap', (e) => e.stopPropagation());
+    const panelH = 218 + buttons.length * 112 + (subtitle ? 40 : 0);
+    const panel = makePanel(W - 140, panelH); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 64, THEME.text, '800'); fitText(t, W - 220); t.position.set(W / 2, H / 2 - panelH / 2 + 90);
+    o.addChild(dim, panel, t);
+    if (subtitle) { const s = makeText(subtitle, 28, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 220 }); s.position.set(W / 2, t.y + 70); o.addChild(s); }
+    const col = buttonColumn(buttons, W / 2, t.y + (subtitle ? 180 : 140));
+    o.addChild(col);
+    this.overlay = o;
+    this.view.addChild(o);
+  }
+  hideOverlay() { if (this.overlay) { this.overlay.destroy({ children: true }); this.overlay = null; } }
+  hideAllOverlays() { this.hideOverlay(); if (this.savedOverlay) { this.savedOverlay.destroy({ children: true }); this.savedOverlay = null; } }
+  /** Call exactly when the game ends. Idempotent. */
+  endGame({ won = false, delay = 500 } = {}) {
+    if (this.state === 'over') return;
+    this.state = 'over';
+    this.hideAllOverlays();
+    Sfx.play(won ? 'win' : 'lose');
+    const { rank, isBest } = HighScores.add(this.score);
+    const score = this.score;
+    const extra = this.gameOverData?.() || {};      // optional: return { extraLine: 'Gold medal' }
+    wait(delay).then(() => { if (Scenes.current === this) Scenes.go('gameover', { score, rank, isBest, won, ...extra }); });
+  }
+  onAction(a, source, pos) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.overlay) return;                       // game-specific overlay (e.g. win) is showing: only its buttons act
+    if (a === 'restart' && this.state === 'playing') return this.restart();
+    if (this.state !== 'playing') return;
+    this.handleInput(a, source, pos);
+  }
+  update(dtMs) {
+    if (this.state !== 'paused' && this.timers?.length) {          // this.later() timers: frozen while paused, dropped with the scene
+      for (const t of [...this.timers]) { t.left -= dtMs; if (t.left <= 0) { this.timers.splice(this.timers.indexOf(t), 1); t.fn(); } }
+    }
+    if (this.state === 'playing') this.tick(dtMs);
+  }
+  /** Run fn after ms of game time. Paused time doesn't count; cancelled if the scene is left. Use for result panels, delayed spawns, AI turns. */
+  later(ms, fn) { (this.timers ||= []).push({ left: ms, fn }); }
+  /** R key and Pause→Restart. Default: fresh game. Level-based games override to replay the CURRENT level (keep run score as it was at level start). */
+  restart() { Scenes.go('game'); }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+  exit() { this.cleanup?.(); }
+  /** Override in GameScene to also expose game data, e.g. { ...super.debugState(), grid: this.grid } (verify.py and play-tests read it). */
+  debugState() { return { state: this.state, score: this.score }; }
+}
+
+/* ---------- timing helper: resolves after ms of ticker time ---------- */
+function wait(ms) {
+  return new Promise((resolve) => {
+    let t = 0;
+    const fn = (ticker) => { t += ticker.deltaMS; if (t >= ms) { Scenes.app.ticker.remove(fn); resolve(); } };
+    Scenes.app.ticker.add(fn);
+  });
+}
+
+/* ##### GAME-SPECIFIC: formatting ##### */
+function formatScore(n) { return String(Math.round(n)); }
+
+/* ##### GAME-SPECIFIC: pure game logic (NO Pixi here; unit-tested below) ##### */
+/* RULE DECISIONS (where the spec is silent or self-contradictory)
+   - Squares are indexed i = row*8 + col, row 0 at the top. You (1) start bottom-left, the computer (2) top-right.
+   - A jump chain is found with a BFS over landing squares, so each destination keeps its SHORTEST path and a
+     chain can never revisit a square. The moving piece's origin square counts as empty during its own chain
+     (it cannot be jumped over or landed on again).
+   - A step and a jump chain may reach the same square; the step (shorter path) is kept.
+   - Goal-camp rule applies to pieces that START the turn inside their goal camp: every landing square of the
+     turn must be inside the goal. A piece starting outside may pass through goal squares mid-chain and end
+     anywhere (it only becomes locked once it ends a turn inside).
+   - Pieces may re-enter their own starting camp (subject to the anti-stalling rule).
+   - Win: all 10 goal squares hold your pieces. Anti-spoiling: the goal camp is completely full, holds at least
+     one of your pieces, and the opponent has already made 40+ moves (any enemy piece sitting there after its
+     owner's 40th move is a blocker, so it cannot deny the win). If both players' conditions hold, the player who
+     just moved wins.
+   - Anti-stalling: checked exactly once per player, right after that player's 40th move: if any of their pieces is
+     still in their own starting camp at that moment, they lose. Re-entering your own camp later is legal.
+     A forced pass counts as a move (turn) for both the 40-move rule and your score.
+   - Score = max(100, 1000 - 10 * your moves) on a win, 0 on a loss.
+   - AI: 2-ply alpha-beta (its move, your best reply). Cost per side = sum of (Chebyshev distance to the far goal
+     corner + 0.1 * Manhattan tiebreak) - 1.5 per piece in goal + 0.5 * the straggler's distance + a home-camp
+     penalty that grows after move 20. The AI slightly penalises recreating a position it already produced
+     (avoids shuffling back and forth in the endgame). Hard time cap 250 ms (returns the best move so far).
+*/
+function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+const Logic = (() => {
+  const N = 8, STALL = 40;
+  const DIRS = [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]];
+  const HOME = { 1: new Uint8Array(64), 2: new Uint8Array(64) };
+  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+    if ((7 - r) + c <= 3) HOME[1][r * 8 + c] = 1;          // bottom-left triangle 4+3+2+1
+    if (r + (7 - c) <= 3) HOME[2][r * 8 + c] = 1;          // top-right triangle (180 deg rotation)
+  }
+  const GOAL = { 1: HOME[2], 2: HOME[1] };
+  const listOf = (m) => { const l = []; for (let i = 0; i < 64; i++) if (m[i]) l.push(i); return l; };
+  const HOME_LIST = { 1: listOf(HOME[1]), 2: listOf(HOME[2]) };
+  const GOAL_LIST = { 1: HOME_LIST[2], 2: HOME_LIST[1] };
+  const CORNER = { 1: [0, 7], 2: [7, 0] };                   // far goal corner per player
+  const DIST = { 1: new Float64Array(64), 2: new Float64Array(64) };
+  for (const p of [1, 2]) for (let i = 0; i < 64; i++) {
+    const dr = Math.abs((i >> 3) - CORNER[p][0]), dc = Math.abs((i & 7) - CORNER[p][1]);
+    DIST[p][i] = Math.max(dr, dc) + 0.1 * (dr + dc);
+  }
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+  /** All moves of the piece on square i. withPath=false skips path building (AI inner loop). */
+  function genFrom(board, i, out, withPath = true) {
+    const p = board[i];
+    if (p !== 1 && p !== 2) return out;
+    const goal = GOAL[p], inside = goal[i] === 1;
+    const r0 = i >> 3, c0 = i & 7;
+    const stepped = new Uint8Array(64);
+    for (const [dr, dc] of DIRS) {
+      const r = r0 + dr, c = c0 + dc;
+      if (r < 0 || r >= N || c < 0 || c >= N) continue;
+      const t = r * 8 + c;
+      if (board[t] !== 0) continue;
+      if (inside && !goal[t]) continue;
+      stepped[t] = 1;
+      out.push(withPath ? { from: i, to: t, path: [i, t] } : { from: i, to: t });
+    }
+    const visited = new Uint8Array(64); visited[i] = 1;
+    const prev = withPath ? new Int8Array(64).fill(-1) : null;
+    const q = [i];
+    for (let qi = 0; qi < q.length; qi++) {
+      const pos = q[qi], pr = pos >> 3, pc = pos & 7;
+      for (const [dr, dc] of DIRS) {
+        const r2 = pr + 2 * dr, c2 = pc + 2 * dc;
+        if (r2 < 0 || r2 >= N || c2 < 0 || c2 >= N) continue;  // never off the board
+        const o = (pr + dr) * 8 + (pc + dc), l = r2 * 8 + c2;
+        if (o === i || board[o] === 0) continue;             // must jump over a piece (origin is vacated)
+        if (visited[l] || board[l] !== 0) continue;          // no revisits, landing must be empty
+        if (inside && !goal[l]) continue;                    // locked in goal: every landing stays inside
+        visited[l] = 1; q.push(l);
+        if (withPath) prev[l] = pos;
+        if (stepped[l]) continue;                            // the step already reaches it (shorter)
+        if (withPath) {
+          const path = [l]; let x = l; while (x !== i) { x = prev[x]; path.push(x); }
+          out.push({ from: i, to: l, path: path.reverse() });
+        } else out.push({ from: i, to: l });
+      }
+    }
+    return out;
+  }
+  function gen(board, p, withPath = true) {
+    const out = [];
+    for (let i = 0; i < 64; i++) if (board[i] === p) genFrom(board, i, out, withPath);
+    return out;
+  }
+  function applyMove(board, move) {
+    const b = board.slice();
+    b[move.to] = b[move.from]; b[move.from] = 0;
+    return b;
+  }
+  function hasHome(board, p) { for (const i of HOME_LIST[p]) if (board[i] === p) return true; return false; }
+  /** { winner: 0/1/2, reason: ''|'goal'|'spoil'|'stall' } */
+  function result(board, mc = [0, 0, 0], lastMover = 0) {
+    const order = lastMover === 2 ? [2, 1] : [1, 2];
+    for (const p of order) {
+      let full = true, own = 0;
+      for (const i of GOAL_LIST[p]) { const v = board[i]; if (!v) { full = false; break; } if (v === p) own++; }
+      if (!full) continue;
+      if (own === GOAL_LIST[p].length) return { winner: p, reason: 'goal' };
+      if (own > 0 && (mc[3 - p] || 0) >= STALL) return { winner: p, reason: 'spoil' };   // anti-spoiling
+    }
+    // anti-stalling: only at the moment a player's count reaches exactly 40 (right after their 40th move)
+    for (const p of order) if ((mc[p] || 0) === STALL && hasHome(board, p)) return { winner: 3 - p, reason: 'stall' };
+    return { winner: 0, reason: '' };
+  }
+  function winner(board, mc = [0, 0, 0], lastMover = 0) { return result(board, mc, lastMover).winner; }
+  function cost(board, p, made = 0) {
+    const d = DIST[p], goal = GOAL[p], home = HOME[p];
+    // before move 40: leaving the home camp is urgent (rule check at move 40). After it, pieces at home are
+    // harmless for the stall rule but become blockers the opponent can win past (anti-spoiling): mild penalty.
+    const homePen = made < STALL ? 1 + 6 * Math.max(0, (made - 12) / 28) : 0.5;
+    let s = 0, mx = 0;
+    for (let i = 0; i < 64; i++) {
+      if (board[i] !== p) continue;
+      const v = d[i]; s += v; if (v > mx) mx = v;
+      if (goal[i]) s -= 1.5;
+      if (home[i]) s += homePen;
+    }
+    return s + 0.5 * mx;
+  }
+  let OPP_W = 0.35;
+  function evaluate(board, me, mc = [0, 0, 0]) { return OPP_W * cost(board, 3 - me, mc[3 - me] || 0) - cost(board, me, mc[me] || 0); }
+  const key = (b) => b.join('');
+
+  /** 2-ply alpha-beta. Returns a full legal move {from,to,path} or null (no legal move -> pass). */
+  function aiMove(board, mc = [0, 0, 0], me = 2, opts = {}) {
+    const opp = 3 - me, t0 = now(), limit = opts.timeLimit ?? 250, hist = opts.history;
+    const mine = gen(board, me, false);
+    if (!mine.length) return null;
+    const mc1 = [0, mc[1] || 0, mc[2] || 0]; mc1[me]++;
+    const mc2 = mc1.slice(); mc2[opp]++;
+    const dMe = DIST[me], dOpp = DIST[opp];
+    mine.sort((a, b) => (dMe[b.from] - dMe[b.to]) - (dMe[a.from] - dMe[a.to]));   // most progress first
+    let best = mine[0], bestV = -Infinity;
+    for (const m of mine) {
+      const b = applyMove(board, m);
+      const w = winner(b, mc1, me);
+      if (w === me) { best = m; break; }
+      let v;
+      if (w === opp) v = -1e6;
+      else {
+        const replies = gen(b, opp, false);
+        if (!replies.length) v = evaluate(b, me, mc1);
+        else {
+          replies.sort((a, c) => (dOpp[c.from] - dOpp[c.to]) - (dOpp[a.from] - dOpp[a.to]));
+          v = Infinity;
+          for (const r of replies) {
+            const b2 = applyMove(b, r);
+            const w2 = winner(b2, mc2, opp);
+            const val = w2 === opp ? -1e6 : w2 === me ? 1e6 : evaluate(b2, me, mc2);
+            if (val < v) v = val;
+            if (v <= bestV) break;                              // alpha cut: this move can't beat best
+          }
+        }
+      }
+      if (hist && hist.has(key(b))) v -= 0.75;
+      if (v > bestV) { bestV = v; best = m; }
+      if (now() - t0 > limit) break;
+    }
+    return genFrom(board, best.from, [], true).find((x) => x.to === best.to);
+  }
+
+  function newState() { return { board: initialBoard(), turn: 1, moveCounts: [0, 0, 0], winner: 0, reason: '', lastMove: null }; }
+  function initialBoard() {
+    const b = new Array(64).fill(0);
+    for (const i of HOME_LIST[1]) b[i] = 1;
+    for (const i of HOME_LIST[2]) b[i] = 2;
+    return b;
+  }
+  /** Validated move: returns the new state, or null if it is not that player's turn / game over / illegal. */
+  function tryMove(s, player, from, to) {
+    if (!s || s.winner || s.turn !== player || s.board[from] !== player) return null;
+    const move = genFrom(s.board, from, [], true).find((m) => m.to === to);
+    if (!move) return null;
+    const board = applyMove(s.board, move);
+    const moveCounts = s.moveCounts.slice(); moveCounts[player]++;
+    const res = result(board, moveCounts, player);
+    return { board, turn: 3 - player, moveCounts, winner: res.winner, reason: res.reason, lastMove: move };
+  }
+  /** Forced pass: only allowed when the player has no legal move. */
+  function pass(s, player) {
+    if (!s || s.winner || s.turn !== player || gen(s.board, player, false).length) return null;
+    const moveCounts = s.moveCounts.slice(); moveCounts[player]++;
+    const res = result(s.board, moveCounts, player);
+    return { board: s.board.slice(), turn: 3 - player, moveCounts, winner: res.winner, reason: res.reason, lastMove: null };
+  }
+  function score(playerMoves, won) { return won ? Math.max(100, 1000 - 10 * playerMoves) : 0; }
+
+  /** Headless AI-vs-AI game (tests). A few random opening moves from rng make seeds differ. */
+  function simulate(seed, maxMoves = 300, randomOpening = 2) {
+    const rng = mulberry32(seed);
+    let s = newState(); let total = 0;
+    const hist = { 1: new Set(), 2: new Set() };
+    while (!s.winner && total < maxMoves) {
+      const p = s.turn;
+      let m;
+      if (s.moveCounts[p] < randomOpening) { const ms = gen(s.board, p, false); m = ms.length ? ms[Math.floor(rng() * ms.length)] : null; }
+      else m = aiMove(s.board, s.moveCounts, p, { history: hist[p] });
+      const ns = m ? tryMove(s, p, m.from, m.to) : pass(s, p);
+      if (!ns) throw new Error('simulate: illegal move/pass by ' + p);
+      s = ns; total++;
+      hist[p].add(key(s.board));
+    }
+    return { winner: s.winner, total, state: s };
+  }
+
+  return { N, STALL, DIRS, HOME, GOAL, HOME_LIST, GOAL_LIST, CORNER, genFrom, legalMoves: gen, movesFrom: (b, i) => genFrom(b, i, [], true),
+    setOppW: (w) => { OPP_W = w; }, applyMove, winner, result, hasHome, cost, evaluate, aiMove, initialBoard, newState, tryMove, pass, score, simulate, key };
+})();
+
+/* ##### GAME-SPECIFIC: logic self-tests (run by verify.py via window.__game.selfTest()) ##### */
+const T_ = {
+  sq: (r, c) => r * 8 + c,
+  board(pieces) { const b = new Array(64).fill(0); for (const [r, c, p] of pieces) b[r * 8 + c] = p; return b; },
+  tos(moves, from) { return moves.filter((m) => from == null || m.from === from).map((m) => m.to).sort((a, b) => a - b); },
+  randomPosition(rng, maxPlies = 70) {
+    let s = Logic.newState();
+    const n = Math.floor(rng() * maxPlies);
+    for (let j = 0; j < n && !s.winner; j++) {
+      const p = s.turn, ms = Logic.legalMoves(s.board, p, false);
+      const ns = ms.length ? (() => { const m = ms[Math.floor(rng() * ms.length)]; return Logic.tryMove(s, p, m.from, m.to); })() : Logic.pass(s, p);
+      s = ns;
+    }
+    return s;
+  },
+};
+const TESTS = [
+  ['initial board: 10 pieces each in 4+3+2+1 camps, 180-degree symmetric', () => {
+    const b = Logic.initialBoard(), sq = T_.sq;
+    assertEq(b.filter((v) => v === 1).length, 10); assertEq(b.filter((v) => v === 2).length, 10);
+    for (const [r, c] of [[7, 0], [7, 1], [7, 2], [7, 3], [6, 0], [6, 1], [6, 2], [5, 0], [5, 1], [4, 0]]) {
+      assertEq(b[sq(r, c)], 1, `player at ${r},${c}`);
+      assertEq(b[sq(7 - r, 7 - c)], 2, `computer at ${7 - r},${7 - c}`);
+    }
+    assertEq(Logic.GOAL_LIST[1], Logic.HOME_LIST[2]); assertEq(Logic.GOAL_LIST[2], Logic.HOME_LIST[1]);
+    assertEq(Logic.newState().turn, 1, 'you move first');
+  }],
+  ['step: all 8 adjacent empty squares, ends the turn', () => {
+    const sq = T_.sq, b = T_.board([[4, 4, 1]]);
+    assertEq(T_.tos(Logic.legalMoves(b, 1)), [sq(3, 3), sq(3, 4), sq(3, 5), sq(4, 3), sq(4, 5), sq(5, 3), sq(5, 4), sq(5, 5)]);
+    const m = Logic.legalMoves(b, 1).find((x) => x.to === sq(3, 3));
+    assertEq(m.path, [sq(4, 4), sq(3, 3)]);
+  }],
+  ['jumps need a piece to jump over (no jumping over empty squares)', () => {
+    const sq = T_.sq, b = T_.board([[4, 4, 1]]);
+    assert(!Logic.legalMoves(b, 1).some((m) => m.to === sq(2, 4) || m.to === sq(2, 2) || m.to === sq(6, 6)), 'jumped over empty square');
+  }],
+  ['jump over own and enemy pieces in all 8 directions; jumped pieces stay', () => {
+    const sq = T_.sq;
+    const around = [[3, 3, 2], [3, 4, 1], [3, 5, 2], [4, 3, 1], [4, 5, 2], [5, 3, 1], [5, 4, 2], [5, 5, 1]];
+    const b = T_.board([[4, 4, 1], ...around]);
+    const tos = T_.tos(Logic.movesFrom(b, sq(4, 4)));
+    for (const t of [sq(2, 2), sq(2, 4), sq(2, 6), sq(4, 2), sq(4, 6), sq(6, 2), sq(6, 4), sq(6, 6)]) assert(tos.includes(t), 'missing jump to ' + t);
+    const m = Logic.movesFrom(b, sq(4, 4)).find((x) => x.to === sq(2, 4));
+    const nb = Logic.applyMove(b, m);
+    assertEq(nb[sq(3, 4)], 1, 'jumped piece removed'); assertEq(nb[sq(4, 4)], 0); assertEq(nb[sq(2, 4)], 1);
+    assertEq(nb.filter((v) => v).length, 9);
+  }],
+  ['no jumping off the board', () => {
+    const sq = T_.sq, b = T_.board([[0, 0, 1], [0, 1, 2], [1, 0, 2], [1, 1, 2], [7, 7, 2], [7, 6, 1], [6, 7, 1]]);
+    const all = [...Logic.movesFrom(b, sq(0, 0)), ...Logic.legalMoves(b, 1)];
+    for (const m of all) { assert(m.to >= 0 && m.to < 64, 'off board index'); for (const p of m.path) assert(p >= 0 && p < 64); }
+    assertEq(T_.tos(Logic.movesFrom(b, sq(0, 0))), [sq(0, 2), sq(2, 0), sq(2, 2)]);
+    // no row wrap-around: a piece on col 7 cannot "jump" to col 1 of the next row
+    const w = T_.board([[5, 7, 1], [5, 6, 2]]);
+    assertEq(T_.tos(Logic.movesFrom(w, sq(5, 7)).filter((m) => Math.abs((m.to & 7) - 7) === 2)), [sq(5, 5)]);
+    for (const m of Logic.movesFrom(w, sq(5, 7))) assert(Math.abs((m.to & 7) - 7) <= 2, "wrapped around a row edge");
+  }],
+  ['chain jump: multi-hop with full path, jumped pieces stay', () => {
+    const sq = T_.sq, b = T_.board([[6, 0, 1], [5, 1, 2], [3, 3, 1], [1, 5, 2]]);
+    const m = Logic.movesFrom(b, sq(6, 0)).find((x) => x.to === sq(0, 6));
+    assert(m, 'chain destination missing');
+    assertEq(m.path, [sq(6, 0), sq(4, 2), sq(2, 4), sq(0, 6)]);
+    const nb = Logic.applyMove(b, m);
+    assertEq([nb[sq(5, 1)], nb[sq(3, 3)], nb[sq(1, 5)], nb[sq(6, 0)], nb[sq(0, 6)]], [2, 1, 2, 0, 1]);
+    for (let k = 1; k < m.path.length; k++) {
+      const a = m.path[k - 1], c = m.path[k], dr = (c >> 3) - (a >> 3), dc = (c & 7) - (a & 7);
+      assert(Math.max(Math.abs(dr), Math.abs(dc)) === 2 && (dr % 2 === 0) && (dc % 2 === 0), 'each hop is a jump');
+      assert(b[(a >> 3) + dr / 2 << 3 | ((a & 7) + dc / 2)] !== 0, 'hop over a piece');
+    }
+  }],
+  ['chain jump that loops back terminates, never revisits, one move per destination', () => {
+    const sq = T_.sq;
+    // ring of pieces lets a chain run around a square and come back to its start
+    const b = T_.board([[2, 2, 1], [2, 3, 2], [3, 4, 2], [4, 3, 2], [3, 2, 2], [2, 5, 1], [5, 5, 1], [4, 5, 2], [5, 4, 2]]);
+    const ms = Logic.movesFrom(b, sq(2, 2));
+    const tos = ms.map((m) => m.to);
+    assertEq(new Set(tos).size, tos.length, 'duplicate destinations');
+    assert(!tos.includes(sq(2, 2)), 'move back to origin');
+    for (const m of ms) assertEq(new Set(m.path).size, m.path.length, 'path revisits a square');
+    assert(tos.includes(sq(4, 4)), 'loop square reachable');
+  }],
+  ['dedupe keeps the shortest path (step beats a chain to the same square)', () => {
+    const sq = T_.sq;
+    // (4,4) can step to (3,4), or jump (4,4)->(2,4)?? no: build a 2-hop chain ending adjacent to the origin
+    // (4,4) reaches (2,4) only by the 2-hop chain (4,4)->(2,2)->(2,4)
+    const b = T_.board([[4, 4, 1], [3, 3, 2], [2, 3, 2], [3, 5, 2]]);
+    const ms = Logic.movesFrom(b, sq(4, 4));
+    for (const m of ms) {
+      const dup = ms.filter((x) => x.to === m.to); assertEq(dup.length, 1, 'duplicate to ' + m.to);
+    }
+    const m24 = ms.find((x) => x.to === sq(2, 4));
+    assert(m24, 'reachable via chain'); assertEq(m24.path.length, 3, 'shortest chain has 2 hops');
+    // a square reachable by a 1-hop jump and a 3-hop chain keeps the 1-hop path
+    const b2 = T_.board([[4, 0, 1], [4, 1, 2], [3, 1, 2], [2, 2, 2], [3, 3, 2]]);
+    const m2 = Logic.movesFrom(b2, sq(4, 0)).find((x) => x.to === sq(4, 2));
+    assertEq(m2.path, [sq(4, 0), sq(4, 2)]);
+  }],
+  ['goal camp: a piece inside may not step or jump out, chain landings stay inside', () => {
+    const sq = T_.sq;
+    // player piece at (3,7) is in its goal; (4,7)/(4,6)/(3,6) are outside the goal
+    const b = T_.board([[3, 7, 1], [2, 7, 2], [3, 6, 2], [4, 6, 2]]);
+    for (const m of Logic.movesFrom(b, sq(3, 7))) for (const p of m.path) assert(Logic.GOAL[1][p], 'left the goal via ' + p);
+    assert(!Logic.movesFrom(b, sq(3, 7)).some((m) => m.to === sq(4, 7)), 'stepped out of goal');
+    // (3,7) jumping over (2,7) -> (1,7) inside: allowed; over (3,6) -> (3,5): outside, forbidden
+    const tos = T_.tos(Logic.movesFrom(b, sq(3, 7)));
+    assert(tos.includes(sq(1, 7)), 'in-goal jump allowed'); assert(!tos.includes(sq(3, 5)), 'jumped out of goal');
+    // intermediate landing outside, final square inside: still forbidden
+    const c = T_.board([[1, 5, 1], [2, 5, 2], [3, 4, 2], [3, 5, 0], [3, 6, 2], [2, 7, 0]]);
+    // chain (1,5) -> (3,5) [outside] -> (3,7) [inside] must not exist
+    assert(!Logic.movesFrom(c, sq(1, 5)).some((m) => m.to === sq(3, 7)), 'chain via outside square');
+    // same for the computer in its goal (bottom-left)
+    const d = T_.board([[4, 0, 2], [5, 0, 1]]);
+    assert(!Logic.movesFrom(d, sq(4, 0)).some((m) => !Logic.GOAL[2][m.to]), 'computer left its goal');
+    assertEq(Logic.tryMove({ ...Logic.newState(), board: b }, 1, sq(3, 7), sq(4, 7)), null, 'tryMove accepted leaving goal');
+  }],
+  ['piece outside its goal may chain through goal squares (rule decision)', () => {
+    const sq = T_.sq;
+    const b = T_.board([[4, 5, 1], [3, 6, 2], [2, 6, 2]]);
+    // (4,5) -> (2,7) [goal] -> (2,5) [outside]
+    const m = Logic.movesFrom(b, sq(4, 5)).find((x) => x.to === sq(2, 5));
+    assert(m, 'pass-through chain missing'); assertEq(m.path, [sq(4, 5), sq(2, 7), sq(2, 5)]);
+  }],
+  ['win: all 10 goal squares held by own pieces', () => {
+    const b = new Array(64).fill(0);
+    for (const i of Logic.GOAL_LIST[1]) b[i] = 1;
+    b[T_.sq(7, 7)] = 2;
+    assertEq(Logic.winner(b, [0, 30, 30], 1), 1);
+    const c = new Array(64).fill(0);
+    for (const i of Logic.GOAL_LIST[2]) c[i] = 2;
+    assertEq(Logic.winner(c, [0, 30, 30], 2), 2);
+    c[Logic.GOAL_LIST[2][0]] = 0; assertEq(Logic.winner(c, [0, 30, 30], 2), 0, '9 of 10 is not a win');
+  }],
+  ['anti-spoiling: full goal partly held by the opponent', () => {
+    const b = new Array(64).fill(0);
+    const g = Logic.GOAL_LIST[1];
+    g.forEach((i, k) => { b[i] = k < 8 ? 1 : 2; });              // 8 own + 2 enemy spoilers
+    b[T_.sq(5, 3)] = 1; b[T_.sq(5, 4)] = 1;                        // own pieces locked out
+    for (let k = 0; k < 8; k++) b[T_.sq(7 - Math.floor(k / 4), 4 + (k % 4))] = 2;  // other enemy pieces, outside both camps
+    assertEq(b.filter((v) => v === 1).length, 10); assertEq(b.filter((v) => v === 2).length, 10);
+    assertEq(Logic.winner(b, [0, 20, 20], 1), 0, 'no early win while spoilers may still leave');
+    assertEq(Logic.winner(b, [0, 41, 40], 1), 1, 'spoilers after 40 moves: player wins');
+    const e = b.slice(); e[g[8]] = 0; e[T_.sq(6, 3)] = 2;             // one spoiler left: goal no longer full
+    assertEq(Logic.winner(e, [0, 20, 20], 1), 0, 'not full -> no win');
+  }],
+  ['anti-stalling: piece still home after your 40th move loses', () => {
+    const b = new Array(64).fill(0);
+    b[T_.sq(7, 0)] = 1; b[T_.sq(3, 3)] = 2;
+    assertEq(Logic.winner(b, [0, 39, 39], 1), 0);
+    assertEq(Logic.winner(b, [0, 40, 39], 1), 2, 'player stalled -> computer wins');
+    const c = new Array(64).fill(0);
+    c[T_.sq(0, 7)] = 2; c[T_.sq(3, 3)] = 1;
+    assertEq(Logic.winner(c, [0, 40, 40], 2), 1, 'computer stalled -> player wins');
+  }],
+  ['anti-stalling applies only at the 40th move: re-entering your own camp later is legal', () => {
+    const sq = T_.sq;
+    // regression: the rule used to fire after every move >= 40
+    const b = new Array(64).fill(0);
+    b[sq(3, 3)] = 1; b[sq(2, 2)] = 2;
+    const s = { board: b, turn: 1, moveCounts: [0, 44, 44], winner: 0, reason: '', lastMove: null };
+    b[sq(3, 0)] = 1;                                                // step (3,0)->(4,0) re-enters the home camp
+    const ns = Logic.tryMove(s, 1, sq(3, 0), sq(4, 0));
+    assert(ns && ns.board[sq(4, 0)] === 1, 'move refused');
+    assertEq(ns.winner, 0, 'lost for re-entering own camp after move 40');
+    assertEq(Logic.winner(ns.board, [0, 45, 45], 1), 0);
+    assertEq(Logic.winner(ns.board, [0, 41, 40], 2), 0, 'stale count > 40 still triggered');
+    // exactly at the 40th move it does fire, with reason 'stall'
+    const s39 = { ...s, moveCounts: [0, 39, 39], board: Logic.initialBoard() };
+    const lost = Logic.tryMove(s39, 1, sq(4, 0), sq(3, 0));
+    assertEq([lost.winner, lost.reason], [2, 'stall']);
+    // and for the computer at its 40th move
+    const c = Logic.initialBoard();
+    const s2 = { board: c, turn: 2, moveCounts: [0, 40, 39], winner: 0, reason: '', lastMove: null };
+    const lost2 = Logic.tryMove(s2, 2, sq(3, 7), sq(4, 7));
+    assertEq([lost2.winner, lost2.reason], [1, 'stall']);
+  }],
+  ['anti-spoiling still works with the one-shot 40-move rule (blockers that re-entered after 40)', () => {
+    const b = new Array(64).fill(0), g = Logic.GOAL_LIST[1];
+    g.forEach((i, k) => { b[i] = k < 8 ? 1 : 2; });
+    b[T_.sq(5, 3)] = 1; b[T_.sq(5, 4)] = 1;
+    for (let k = 0; k < 8; k++) b[T_.sq(7 - Math.floor(k / 4), 4 + (k % 4))] = 2;
+    assertEq(Logic.result(b, [0, 50, 55], 1), { winner: 1, reason: 'spoil' }, 'blockers after move 40 must not deny the win');
+    assertEq(Logic.result(b, [0, 30, 30], 1), { winner: 0, reason: '' }, 'before 40 the camp is not yet a spoil');
+    // the stall rule alone (count > 40) must not decide it
+    const e = b.slice(); e[g[8]] = 0; e[T_.sq(6, 3)] = 2;
+    assertEq(Logic.result(e, [0, 50, 55], 1), { winner: 0, reason: '' });
+  }],
+  ['AI evaluation: home-camp penalty is urgent before move 40, mild after it', () => {
+    const b = new Array(64).fill(0); b[T_.sq(0, 7)] = 2;           // one computer piece in its home corner
+    const h = (made) => { const x = b.slice(); return Logic.cost(x, 2, made); };
+    const away = (made) => { const x = new Array(64).fill(0); x[T_.sq(4, 4)] = 2; return Logic.cost(x, 2, made); };
+    assert(h(38) - away(38) > h(10) - away(10), 'penalty should grow towards move 40');
+    assert(h(45) - away(45) < h(38) - away(38), 'penalty should drop after move 40');
+    // at 39 moves with a piece at home the AI must leave the camp (else it loses at move 40)
+    const s = Logic.initialBoard();
+    for (const i of Logic.HOME_LIST[2]) s[i] = 0;
+    const onlyHome = T_.sq(3, 7); s[onlyHome] = 2;
+    for (const [r, c] of [[3, 3], [3, 4], [4, 3], [4, 4], [5, 5], [2, 3], [2, 2], [3, 2], [4, 2]]) s[T_.sq(r, c)] = 2;
+    for (const i of Logic.HOME_LIST[1]) s[i] = 1;
+    const m = Logic.aiMove(s, [0, 39, 39], 2);
+    assert(m.from === onlyHome && !Logic.HOME[2][m.to], 'AI did not leave its camp on move 40: ' + JSON.stringify(m));
+  }],
+  ['turn order: moves on the wrong turn, illegal moves and moves after game end are rejected', () => {
+    const s = Logic.newState(), sq = T_.sq;
+    assertEq(Logic.tryMove(s, 2, sq(3, 7), sq(4, 7)), null, 'computer moved on your turn');
+    assertEq(Logic.tryMove(s, 1, sq(4, 0), sq(2, 0)), null, 'illegal jump accepted');
+    assertEq(Logic.tryMove(s, 1, sq(3, 3), sq(3, 4)), null, 'moving an empty square');
+    const s1 = Logic.tryMove(s, 1, sq(4, 0), sq(3, 0));
+    assert(s1 && s1.turn === 2 && s1.moveCounts[1] === 1, 'legal move');
+    assertEq(Logic.tryMove(s1, 1, sq(3, 0), sq(2, 0)), null, 'player moved during computer turn');
+    assertEq(Logic.tryMove({ ...s1, winner: 1, turn: 1 }, 1, sq(3, 0), sq(2, 0)), null, 'move after game end');
+  }],
+  ['pass only when no legal move; a pass counts as a move', () => {
+    const sq = T_.sq;
+    assertEq(Logic.pass(Logic.newState(), 1), null, 'pass with legal moves');
+    // player piece in corner (7,0) completely boxed in
+    const b = T_.board([[7, 0, 1], [6, 0, 2], [6, 1, 2], [7, 1, 2], [5, 0, 2], [5, 2, 2], [7, 2, 2]]);
+    assertEq(Logic.legalMoves(b, 1).length, 0);
+    const s = Logic.pass({ ...Logic.newState(), board: b }, 1);
+    assert(s && s.turn === 2 && s.moveCounts[1] === 1, 'pass switches turn');
+  }],
+  ['logic functions do not mutate inputs', () => {
+    const s = Logic.newState(), before = JSON.stringify(s);
+    Logic.legalMoves(s.board, 1); Logic.applyMove(s.board, { from: 32, to: 24 }); Logic.winner(s.board, s.moveCounts);
+    Logic.aiMove(s.board, s.moveCounts, 2); Logic.tryMove(s, 1, 32, 24);
+    assertEq(JSON.stringify(s), before);
+  }],
+  ['AI takes an immediate win', () => {
+    const b = new Array(64).fill(0);
+    const g = Logic.GOAL_LIST[2];
+    for (const i of g) b[i] = 2;
+    const hole = T_.sq(4, 0); b[hole] = 0; b[T_.sq(3, 1)] = 2;   // one step away from winning
+    b[T_.sq(2, 5)] = 1;
+    const m = Logic.aiMove(b, [0, 30, 30], 2);
+    assertEq(m.to, hole, 'AI missed the win');
+  }],
+  ['AI property: 200 random positions, every AI move is legal', () => {
+    const rng = mulberry32(12345);
+    let checked = 0;
+    for (let k = 0; k < 200; k++) {
+      const s = T_.randomPosition(rng);
+      if (s.winner) continue;
+      const m = Logic.aiMove(s.board, s.moveCounts, 2);
+      const legal = Logic.legalMoves(s.board, 2);
+      if (!legal.length) { assertEq(m, null, 'AI moved with no legal moves'); continue; }
+      assert(m && legal.some((x) => x.from === m.from && x.to === m.to), 'illegal AI move ' + JSON.stringify(m));
+      assertEq(m.path[0], m.from); assertEq(m.path[m.path.length - 1], m.to);
+      checked++;
+    }
+    assert(checked > 150, 'too few positions checked: ' + checked);
+  }],
+  ['AI answers within 300 ms', () => {
+    const rng = mulberry32(777);
+    let worst = 0;
+    for (let k = 0; k < 25; k++) {
+      const s = T_.randomPosition(rng, 60);
+      const t = performance.now(); Logic.aiMove(s.board, s.moveCounts, 2); worst = Math.max(worst, performance.now() - t);
+    }
+    assert(worst < 300, 'AI took ' + worst.toFixed(0) + ' ms');
+  }],
+  ['AI vs AI: 3 seeded games end with a winner within 300 moves', () => {
+    for (const seed of [1, 2, 3]) {
+      const r = Logic.simulate(seed, 300);
+      assert(r.winner === 1 || r.winner === 2, `seed ${seed}: no winner after ${r.total} moves`);
+      assert(r.total <= 300);
+    }
+  }],
+  ['score: 1000 - 10 per move, min 100, 0 on a loss', () => {
+    assertEq(Logic.score(30, true), 700); assertEq(Logic.score(95, true), 100); assertEq(Logic.score(200, true), 100);
+    assertEq(Logic.score(30, false), 0);
+  }],
+];
+
+/* ##### GAME-SPECIFIC: the game scene ##### */
+const HV = {
+  cell: 80, bx: 40, by: 300,
+  light: 0xeccb96, dark: 0xc8955c, frame: 0x6b3f1d, frameEdge: 0x4a2a12,
+  blue: 0x2f6fe0, blueRim: 0xd6e5ff, red: 0xd83a3a, redRim: 0xffd6d6,
+  dot: 0x22b04a, last: 0xffb020, cursor: 0xffffff,
+};
+class GameScene extends GameSceneBase {
+  initGame() {
+    this.gs = Logic.newState();
+    this.selected = -1; this.targets = [];
+    this.cursor = Logic.HOME_LIST[1][0]; this.cursorShown = false;
+    this.aiDelay = 0; this.animating = false; this.moveId = 0;
+    this.aiHistory = new Set(); this.lastAi = null; this.msg = '';
+    this.pieceViews = new Map();
+
+    this.turnText = makeText('', 40, THEME.text, '800'); this.turnText.position.set(W / 2, 200);
+    this.countText = makeText('', 26, THEME.textDim, '600'); this.countText.position.set(W / 2, 250);
+    const bg = new Graphics();
+    const S = HV.cell * 8;
+    bg.roundRect(HV.bx - 16, HV.by - 16, S + 32, S + 32, 18).fill(HV.frame).stroke({ width: 4, color: HV.frameEdge });
+    for (let i = 0; i < 64; i++) {
+      const r = i >> 3, c = i & 7;
+      bg.rect(HV.bx + c * HV.cell, HV.by + r * HV.cell, HV.cell, HV.cell).fill((r + c) % 2 ? HV.dark : HV.light);
+      if (Logic.HOME[1][i]) bg.rect(HV.bx + c * HV.cell, HV.by + r * HV.cell, HV.cell, HV.cell).fill({ color: HV.blue, alpha: 0.2 });
+      if (Logic.HOME[2][i]) bg.rect(HV.bx + c * HV.cell, HV.by + r * HV.cell, HV.cell, HV.cell).fill({ color: HV.red, alpha: 0.2 });
+    }
+    this.markLayer = new Graphics();
+    this.dotLayer = new Graphics();
+    this.pieceLayer = new Container(); this.pieceLayer.sortableChildren = true;
+    this.msgText = makeText('', 30, THEME.accent, '700'); this.msgText.position.set(W / 2, HV.by + S + 70);
+    const hint = makeText('Tap a blue piece, then a green dot', 26, THEME.textDim, '500'); hint.position.set(W / 2, HV.by + S + 125);
+    const hint2 = makeText('Fill the red corner before the computer fills yours', 22, THEME.textDim, '500');
+    fitText(hint2, W - 60); hint2.position.set(W / 2, HV.by + S + 170);
+    this.board.addChild(this.turnText, this.countText, bg, this.markLayer, this.pieceLayer, this.dotLayer, this.msgText, hint, hint2);
+    this.syncView();
+    this.updateTexts();
+  }
+  cellCenter(i) { return { x: HV.bx + (i & 7) * HV.cell + HV.cell / 2, y: HV.by + (i >> 3) * HV.cell + HV.cell / 2 }; }
+  cellAt(pos) {
+    if (!pos) return -1;
+    const c = Math.floor((pos.x - HV.bx) / HV.cell), r = Math.floor((pos.y - HV.by) / HV.cell);
+    return r >= 0 && r < 8 && c >= 0 && c < 8 ? r * 8 + c : -1;
+  }
+  makePiece(p) {
+    const g = new Graphics();
+    g.circle(0, 4, 31).fill({ color: 0x000000, alpha: 0.28 });
+    g.circle(0, 0, 30).fill(p === 1 ? HV.blue : HV.red).stroke({ width: 4, color: p === 1 ? HV.blueRim : HV.redRim });
+    g.circle(-9, -10, 9).fill({ color: 0xffffff, alpha: 0.28 });
+    return g;
+  }
+  /** Rebuild every view from logic (the view can never drift from this.gs). */
+  syncView() {
+    for (const v of this.pieceViews.values()) { Tween.kill(v); v.destroy(); }
+    this.pieceViews.clear();
+    this.pieceLayer.removeChildren();
+    const b = this.gs.board;
+    for (let i = 0; i < 64; i++) {
+      if (!b[i]) continue;
+      const v = this.makePiece(b[i]), p = this.cellCenter(i);
+      v.position.set(p.x, p.y);
+      if (i === this.selected) { v.scale.set(1.1); v.y -= 4; v.zIndex = 5; }
+      this.pieceLayer.addChild(v); this.pieceViews.set(i, v);
+    }
+    this.drawMarks();
+  }
+  drawMarks() {
+    const g = this.markLayer; g.clear();
+    const box = (i, w, color, alpha = 1) => {
+      const x = HV.bx + (i & 7) * HV.cell, y = HV.by + (i >> 3) * HV.cell;
+      g.rect(x + w / 2 + 1, y + w / 2 + 1, HV.cell - w - 2, HV.cell - w - 2).stroke({ width: w, color, alpha });
+    };
+    if (this.lastAi) {
+      const pts = this.lastAi.path.map((i) => this.cellCenter(i));
+      g.moveTo(pts[0].x, pts[0].y); for (const p of pts.slice(1)) g.lineTo(p.x, p.y);
+      g.stroke({ width: 4, color: HV.last, alpha: 0.55 });
+      box(this.lastAi.from, 4, HV.last, 0.7); box(this.lastAi.to, 6, HV.last);
+    }
+    if (this.selected >= 0) box(this.selected, 5, HV.dot);
+    if (this.cursorShown && this.cursor >= 0) box(this.cursor, 4, HV.cursor);
+    const d = this.dotLayer; d.clear();
+    for (const m of this.targets) { const p = this.cellCenter(m.to); d.circle(p.x, p.y, 12).fill(HV.dot).stroke({ width: 3, color: 0xffffff, alpha: 0.8 }); }
+  }
+  updateTexts() {
+    const s = this.gs, mc = s.moveCounts;
+    let t, col;
+    if (s.winner) { t = s.winner === 1 ? 'You win!' : 'Computer wins'; col = s.winner === 1 ? THEME.accent : HV.red; }
+    else if (s.turn === 1) { t = 'Your turn'; col = 0x7fb0ff; }
+    else { t = 'Computer is thinking...'; col = 0xff8a8a; }
+    if (this.turnText.text !== t) this.turnText.text = t;
+    this.turnText.style.fill = col;
+    const c = `Moves  You ${mc[1]}  ·  Computer ${mc[2]}`;
+    if (this.countText.text !== c) this.countText.text = c;
+    let m = this.msg;
+    if (!m && !s.winner && Logic.hasHome(s.board, 1) && mc[1] >= 30 && mc[1] < Logic.STALL) m = `Leave your camp by move ${Logic.STALL}!`;
+    if (this.msgText.text !== m) { this.msgText.text = m; fitText(this.msgText, W - 60); }
+  }
+  select(i) {
+    this.selected = i;
+    this.targets = Logic.movesFrom(this.gs.board, i);
+    this.cursor = i;
+    Sfx.play('click');
+    this.syncView();
+  }
+  deselect() {
+    if (this.selected < 0 && !this.targets.length) return;
+    this.selected = -1; this.targets = [];
+    this.syncView();
+  }
+  /** Pausing finishes any running move animation instantly (tweens are global and would keep playing). */
+  togglePause() {
+    if (this.state === 'playing' && this.animating) this.skipAnim();
+    super.togglePause();
+  }
+  skipAnim() {
+    this.moveId++;
+    Tween.finishWithin(this.board);
+    this.animating = false;
+    this.syncView();
+  }
+  clickSquare(i) {
+    if (this.state !== 'playing' || this.gs.winner) return;
+    if (this.animating) this.skipAnim();
+    if (this.gs.turn !== 1) return;                 // computer's turn: taps do nothing
+    if (i < 0) return this.deselect();
+    const b = this.gs.board;
+    if (b[i] === 1) { if (i === this.selected) return this.deselect(); return this.select(i); }
+    if (this.selected >= 0 && this.targets.some((m) => m.to === i)) return this.playerMove(i);
+    this.deselect();
+  }
+  playerMove(to) {
+    const ns = Logic.tryMove(this.gs, 1, this.selected, to);
+    this.selected = -1; this.targets = [];
+    if (!ns) { this.syncView(); return; }
+    this.gs = ns; this.msg = '';
+    this.cursor = to;
+    Sfx.play('move');
+    this.animateMove(ns.lastMove);
+    this.afterMove(1);
+  }
+  async animateMove(move) {
+    const id = ++this.moveId;
+    this.animating = true;
+    this.syncView();
+    const v = this.pieceViews.get(move.to);
+    if (v) {
+      const p0 = this.cellCenter(move.path[0]);
+      v.position.set(p0.x, p0.y); v.zIndex = 10;
+      for (let k = 1; k < move.path.length; k++) {
+        const p = this.cellCenter(move.path[k]);
+        await Tween.to(v, { x: p.x, y: p.y }, move.path.length > 2 ? 170 : 150, Ease.inOutQuad);
+        if (id !== this.moveId || v.destroyed || this.board.destroyed) return;
+        if (move.path.length > 2) Sfx.play('move');
+      }
+    }
+    if (id !== this.moveId) return;
+    this.animating = false;
+    this.syncView();
+  }
+  afterMove(p) {
+    const s = this.gs;
+    if (s.winner) {
+      const won = s.winner === 1;
+      this.setScore(Logic.score(s.moveCounts[1], won));
+      const MSG = {
+        goal: ['All your pieces are home!', 'The computer filled your camp'],
+        spoil: ["Goal full - the computer's blockers don't count", "Computer's goal full - your blockers don't count"],
+        stall: [`The computer was still in its camp at move ${Logic.STALL}`, `A piece was still in your camp at move ${Logic.STALL}`],
+      };
+      this.msg = (MSG[s.reason] || MSG.goal)[won ? 0 : 1];
+      this.updateTexts();
+      const animMs = s.lastMove ? (s.lastMove.path.length - 1) * 170 : 0;
+      this.endGame({ won, delay: animMs + 1200 });
+      return;
+    }
+    if (s.turn === 2) { this.aiDelay = 400; this.updateTexts(); return; }
+    // player's turn: forced pass if no legal move
+    if (!Logic.legalMoves(s.board, 1, false).length) {
+      const ps = Logic.pass(s, 1);
+      if (ps) { this.gs = ps; this.msg = 'You have no legal move - pass'; this.afterMove(1); return; }
+    }
+    this.updateTexts();
+  }
+  doAi() {
+    const s = this.gs;
+    const m = Logic.aiMove(s.board, s.moveCounts, 2, { history: this.aiHistory });
+    let ns = m ? Logic.tryMove(s, 2, m.from, m.to) : Logic.pass(s, 2);
+    if (!ns) {                                        // safety net: never let the game hang
+      const legal = Logic.legalMoves(s.board, 2);
+      ns = legal.length ? Logic.tryMove(s, 2, legal[0].from, legal[0].to) : Logic.pass(s, 2);
+      if (!ns) return;
+    }
+    this.gs = ns;
+    if (ns.lastMove) {
+      this.lastAi = ns.lastMove;
+      this.aiHistory.add(Logic.key(ns.board));
+      Sfx.play('move');
+      this.animateMove(ns.lastMove);
+    } else { this.msg = 'Computer has no legal move - pass'; this.syncView(); }
+    this.afterMove(2);
+  }
+  handleInput(a, source, pos) {
+    if (a === 'tap') { this.cursorShown = false; return this.clickSquare(this.cellAt(pos)); }
+    if (a === 'left' || a === 'right' || a === 'up' || a === 'down') {
+      if (source === 'swipe') return;                 // swipes have no meaning on this board
+      if (!this.cursorShown) { this.cursorShown = true; this.drawMarks(); return; }
+      let r = this.cursor >> 3, c = this.cursor & 7;
+      if (a === 'left') c = Math.max(0, c - 1); else if (a === 'right') c = Math.min(7, c + 1);
+      else if (a === 'up') r = Math.max(0, r - 1); else r = Math.min(7, r + 1);
+      this.cursor = r * 8 + c; this.drawMarks();
+      return;
+    }
+    if (a === 'action' || a === 'confirm') {
+      if (!this.cursorShown) { this.cursorShown = true; this.drawMarks(); return; }
+      this.clickSquare(this.cursor);
+      this.cursorShown = true; this.drawMarks();
+    }
+  }
+  tick(dtMs) {
+    if (this.gs.turn === 2 && !this.gs.winner && !this.animating) {
+      this.aiDelay -= dtMs;
+      if (this.aiDelay <= 0) this.doAi();
+    }
+  }
+  debugState() {
+    const s = this.gs;
+    return { ...super.debugState(), board: s.board.slice(), turn: s.turn, moveCounts: s.moveCounts.slice(), winner: s.winner,
+      reason: s.reason || '', selected: this.selected, targets: this.targets.map((m) => m.to), lastAiMove: this.lastAi, animating: this.animating, msg: this.msg };
+  }
+}
+/* ##### END GAME-SPECIFIC ##### */
+
+/* ---------- test helpers ---------- */
+function assert(cond, msg = 'assertion failed') { if (!cond) throw new Error(msg); }
+function assertEq(a, b, msg = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg} expected ${B} got ${A}`); }
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const app = new Application();
+  await app.init({
+    resizeTo: window,
+    background: THEME.outerBg,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preference: 'webgl',
+  });
+  document.getElementById('app').appendChild(app.canvas);
+
+  const root = new Container(); root.label = 'root';
+  root.addChild(makeBackground());
+  const sceneLayer = new Container(); sceneLayer.label = 'scenes';
+  root.addChild(sceneLayer);
+  app.stage.addChild(root);
+
+  const mask = new Graphics(); mask.rect(0, 0, W, H).fill(0xffffff);
+  root.addChild(mask); root.mask = mask;       // nothing draws outside the play area
+
+  function layout() {
+    const sw = app.screen.width, sh = app.screen.height;
+    const s = Math.min(sw / W, sh / H);
+    root.scale.set(s);
+    root.position.set(Math.round((sw - W * s) / 2), Math.round((sh - H * s) / 2));
+    app.stage.hitArea = app.screen;
+  }
+  layout();
+  window.addEventListener('resize', () => requestAnimationFrame(() => { app.resize(); layout(); }));
+
+  Scenes.app = app; Scenes.root = sceneLayer;
+  Scenes.register('menu', MenuScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+  for (const [name, cls] of Object.entries(GAME_HOOKS.scenes)) Scenes.register(name, cls);
+
+  Input.init();
+  initSwipe(app, root);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden(); });
+
+  app.ticker.add((ticker) => {
+    const dt = Math.min(ticker.deltaMS, 50);  // clamp: no huge jumps after tab switch
+    Tween.update(dt);
+    Scenes.current?.update(dt);
+  });
+
+  await Scenes.go('menu');
+
+  /* test hook used by scripts/verify.py (harmless in production) */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },          // for checks.js: direct access to the live scene (set up boards, read fields)
+    inputStats() { return { ...Scenes.inputStats }; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    boardObjects() { const b = Scenes.current?.board; let n = 0; const walk = (c) => { if (!c.visible) return; n++; c.children.forEach(walk); }; if (b) walk(b); return n - (b ? 1 : 0); },
+    buttons() {
+      const out = [];
+      const walk = (c) => {
+        if (!c.visible || c.destroyed) return;
+        if (c.isButton) { const p = c.getGlobalPosition(); out.push({ label: c.btnText, x: p.x, y: p.y }); }
+        for (const ch of c.children) walk(ch);
+      };
+      walk(app.stage);
+      return out;
+    },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endGame) { s.endGame({ delay: 0 }); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+  };
+})().catch((e) => showFatal(e.message || String(e)));
+</script>
+</body>
+</html>

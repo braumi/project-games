@@ -1,0 +1,28 @@
+{
+  "name": "playbox",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "vendor": "mkdir -p public/vendor && cp node_modules/pixi.js/dist/pixi.min.mjs public/vendor/pixi.min.mjs && cp node_modules/matter-js/build/matter.min.js public/vendor/matter.min.js",
+    "postinstall": "npm run vendor"
+  },
+  "dependencies": {
+    "matter-js": "0.20.0",
+    "pixi.js": "8.21.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-router-dom": "^7.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.3",
+    "typescript": "~5.9.2",
+    "vite": "^7.1.7"
+  }
+}

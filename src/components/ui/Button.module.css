@@ -1,0 +1,19 @@
+.btn {
+  font: 700 14px/1 var(--body);
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 0;
+  cursor: pointer;
+  background: #22314f;
+  color: #e8eef8;
+}
+
+.primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.secondary {
+  background: #22314f;
+  color: #e8eef8;
+}

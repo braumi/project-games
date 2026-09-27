@@ -1,0 +1,1195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Subway Flap</title><!-- GAME-SPECIFIC: set to CONFIG.title (galleries read this tag) -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14121f; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #fatal { position: fixed; inset: auto 12px 12px 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fatal"></div>
+<script type="module">
+/* =====================================================================
+   PIXIJS GAME SHELL (PixiJS v8, single file, no build step)
+   Sections marked  ##### GAME-SPECIFIC #####  are the only parts that
+   change per game. Everything else is the tested framework:
+   scenes, menu, pause, game over, play again, high scores, sound,
+   input (keys + swipe + tap), tweens, responsive scaling, test hook.
+   ===================================================================== */
+import { Application, Container, Graphics, Text, Rectangle } from '/vendor/pixi.min.mjs';
+
+/* ---------- fatal error overlay (never a silent blank screen) ---------- */
+const fatalBox = document.getElementById('fatal');
+function showFatal(msg) { fatalBox.style.display = 'block'; fatalBox.textContent = 'Error: ' + msg; }
+window.addEventListener('error', (e) => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ##### GAME-SPECIFIC: CONFIG ##### */
+const CONFIG = {
+  id: 'subway-flap',           // unique per game: namespaces saved scores
+  title: 'Subway Flap',
+  subtitle: 'Tap to flap through the tunnel',
+  width: 720, height: 1280,    // design resolution (portrait). Landscape games: 1280 x 720
+  maxHighScores: 10,
+  keyRepeat: false,            // true for continuous-movement games (e.g. paddle), false for turn/grid games
+  scoreLabel: 'Score',
+  lowerIsBetter: false,        // true for time-based games (fastest time wins)
+};
+const THEME = {
+  outerBg: 0x14121f,           // letterbox color outside the play area
+  bg: 0x1f1b2e,                // play-area background
+  panel: 0x2b2640,
+  primary: 0x7c5cff,
+  primaryHover: 0x9479ff,
+  secondary: 0x3a3452,
+  secondaryHover: 0x4a4366,
+  danger: 0xff5c7a,
+  text: 0xf4f1ff,
+  textDim: 0xa9a3c4,
+  accent: 0xffd166,
+  font: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+};
+/* ##### END CONFIG ##### */
+
+const W = CONFIG.width, H = CONFIG.height;
+
+/* ---------- safe storage (localStorage may throw: private mode, sandboxed iframes) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fallback = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fallback : JSON.parse(raw); }
+      catch { return fallback; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+/* ---------- high scores ---------- */
+const HighScores = {
+  list() {
+    const l = Store.get('highscores', []);
+    return Array.isArray(l) ? l.filter((e) => e && Number.isFinite(e.score)) : [];
+  },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  better(a, b) { return CONFIG.lowerIsBetter ? a < b : a > b; },
+  /** Adds a score. Returns { rank (1-based or 0 if not ranked), isBest }. */
+  add(score) {
+    if (!Number.isFinite(score) || (!CONFIG.lowerIsBetter && score <= 0)) return { rank: 0, isBest: false };
+    const prevBest = this.list()[0];
+    const entry = { score, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list();
+    l.push(entry);
+    l.sort((a, b) => (CONFIG.lowerIsBetter ? a.score - b.score : b.score - a.score) || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    const isBest = rank === 1 && (!prevBest || this.better(score, prevBest.score));
+    return { rank, isBest };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* ---------- sound (WebAudio synth: no asset files needed) ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'move': this.tone(300, 0.04, 'sine', 0.06); break;
+      case 'score': this.tone(880, 0.07, 'triangle', 0.12, 1320); break;
+      case 'merge': this.tone(520, 0.09, 'sine', 0.12, 780); break;
+      case 'hit': this.tone(180, 0.08, 'square', 0.08); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.14, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- tweens (driven by app.ticker; promise-based; safe on destroyed targets) ---------- */
+const Ease = {
+  linear: (t) => t,
+  outQuad: (t) => 1 - (1 - t) * (1 - t),
+  outCubic: (t) => 1 - Math.pow(1 - t, 3),
+  inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  outBack: (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const Tween = {
+  active: new Set(),
+  /** props: numeric fields of target; 'scale' sets scale.x and scale.y together. */
+  to(target, props, ms = 200, ease = Ease.outCubic) {
+    return new Promise((resolve) => {
+      const from = {};
+      for (const k of Object.keys(props)) from[k] = k === 'scale' ? target.scale.x : target[k];
+      const tw = { target, props, from, ms: Math.max(1, ms), t: 0, ease, resolve };
+      this.active.add(tw);
+    });
+  },
+  apply(tw, p) {
+    const e = tw.ease(p);
+    for (const k of Object.keys(tw.props)) {
+      const v = tw.from[k] + (tw.props[k] - tw.from[k]) * e;
+      if (k === 'scale') tw.target.scale.set(v); else tw.target[k] = v;
+    }
+  },
+  update(dtMs) {
+    for (const tw of [...this.active]) {
+      if (tw.target.destroyed) { this.active.delete(tw); tw.resolve(); continue; }
+      tw.t += dtMs;
+      const p = Math.min(1, tw.t / tw.ms);
+      this.apply(tw, p);
+      if (p >= 1) { this.active.delete(tw); tw.resolve(); }
+    }
+  },
+  /** Jump every running tween (optionally only one target's) to its end state. */
+  finish(target = null) {
+    for (const tw of [...this.active]) {
+      if (target && tw.target !== target) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  /** Scale up to `peak` and back (merge/score pop). */
+  pop(target, peak = 1.15, ms = 140) {
+    const base = target.scale.x;
+    return this.to(target, { scale: base * peak }, ms, (t) => Math.sin(Math.PI * t));   // up and back in one tween; finishing lands on base
+  },
+  /** Finish only tweens whose target is `container` or inside it (e.g. this.board). Prefer this over finish(). */
+  finishWithin(container) {
+    for (const tw of [...this.active]) {
+      let n = tw.target, inside = false;
+      while (n) { if (n === container) { inside = true; break; } n = n.parent; }
+      if (!inside && !tw.target.destroyed) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  kill(target) { for (const tw of [...this.active]) if (tw.target === target) { this.active.delete(tw); tw.resolve(); } },
+  get busy() { return this.active.size > 0; },
+};
+
+/* ---------- UI helpers ---------- */
+function makeText(text, size = 32, color = THEME.text, weight = '600', extra = {}) {
+  const t = new Text({ text: String(text), style: { fontFamily: THEME.font, fontSize: size, fill: color, fontWeight: weight, align: 'center', ...extra } });
+  t.anchor.set(0.5);
+  return t;
+}
+/** Shrink a Text uniformly so it fits maxW (and optional maxH). Call after setting .text. */
+function fitText(t, maxW, maxH = Infinity) {
+  t.scale.set(1);
+  const s = Math.min(1, maxW / Math.max(1, t.width), maxH / Math.max(1, t.height));
+  t.scale.set(s);
+  return t;
+}
+function makePanel(w, h, color = THEME.panel, radius = 24, alpha = 1) {
+  const g = new Graphics();
+  g.roundRect(-w / 2, -h / 2, w, h, radius).fill({ color, alpha });
+  return g;
+}
+function makeButton(label, onTap, opts = {}) {
+  const { w = 360, h = 88, size = 34, variant = 'primary' } = opts;
+  const base = variant === 'primary' ? THEME.primary : variant === 'danger' ? THEME.danger : THEME.secondary;
+  const hover = variant === 'primary' ? THEME.primaryHover : variant === 'danger' ? 0xff7a93 : THEME.secondaryHover;
+  const c = new Container();
+  c.isButton = true;
+  c.label = 'button:' + label;
+  const bg = new Graphics();
+  const draw = (col) => { bg.clear(); bg.roundRect(-w / 2, -h / 2, w, h, Math.min(28, h / 2)).fill(col); };
+  draw(base);
+  const t = makeText(label, size, THEME.text, '700');
+  c.addChild(bg, t);
+  c.eventMode = 'static';
+  c.cursor = 'pointer';
+  c.hitArea = new Rectangle(-w / 2, -h / 2, w, h);
+  c.on('pointerover', () => { draw(hover); c.scale.set(1.03); });
+  c.on('pointerout', () => { draw(base); c.scale.set(1); });
+  c.on('pointerdown', () => c.scale.set(0.96));
+  c.on('pointerup', () => c.scale.set(1.03));
+  c.on('pointerupoutside', () => { draw(base); c.scale.set(1); });
+  c.on('pointertap', (e) => {
+    e.stopPropagation();
+    if (Scenes.busy || c.disabled) return;
+    Sfx.unlock(); Sfx.play('click');
+    onTap(e);
+  });
+  c.setText = (s) => { t.text = String(s); c.btnText = String(s); };
+  c.btnText = label;
+  return c;
+}
+/** Vertical stack of buttons centered at (x, y). */
+function buttonColumn(defs, x, y, gap = 24, opts = {}) {
+  const col = new Container();
+  const h = opts.h || 88;
+  defs.forEach(([label, fn, o], i) => {
+    const b = makeButton(label, fn, { ...opts, ...(o || {}) });
+    b.position.set(0, i * (h + gap));
+    col.addChild(b);
+  });
+  col.position.set(x, y);
+  return col;
+}
+
+/* ---------- input: keyboard + swipe + actions ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'action', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();                       // stop arrows/space scrolling the page
+      Sfx.unlock();
+      const wasHeld = this.held.has(a);
+      this.held.add(a);
+      if (e.repeat && !CONFIG.keyRepeat) return;
+      if (wasHeld && !e.repeat) return;
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+  },
+  isDown(a) { return this.held.has(a); },
+};
+/** Swipe detection on the whole screen (stage hitArea = app.screen). */
+function initSwipe(app, root) {
+  let start = null;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointerdown', (e) => {
+    Sfx.unlock(); start = { x: e.global.x, y: e.global.y, t: performance.now() };
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+    const p = root.toLocal(e.global);
+    Scenes.dispatch('press', 'pointer', { x: p.x, y: p.y });   // instant: use for flap/jump/shoot games
+  });
+  const end = (e) => {
+    if (!start) return;
+    const dx = (e.global.x - start.x) / root.scale.x, dy = (e.global.y - start.y) / root.scale.y;
+    const dt = performance.now() - start.t;
+    start = null;
+    const dist = Math.hypot(dx, dy);
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }   // presses on buttons are not game input
+    if (dist < 25 && dt < 500) {               // a tap anywhere: 'tap' action with design-space position
+      const p = root.toLocal(e.global);
+      Scenes.dispatch('tap', 'pointer', { x: p.x, y: p.y });
+      return;
+    }
+    if (dist < 40 || dt > 1000) return;         // design-space pixels; ignore slow drags
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    Scenes.dispatch(dir, 'swipe');
+  };
+  app.stage.on('pointerup', end);
+  app.stage.on('pointerupoutside', end);
+}
+
+/* ---------- scenes ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.view = new Container(); this.view.label = 'scene:' + name; }
+  enter(_data) {}
+  exit() {}
+  update(_dtMs) {}
+  onAction(_action, _source, _pos) {}
+  onHidden() {}
+}
+const Scenes = {
+  app: null, root: null, current: null, busy: false, registry: {},
+  register(name, cls) { this.registry[name] = cls; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const old = this.current;
+      if (old) {
+        await Tween.to(old.view, { alpha: 0 }, 140);
+        old.exit();
+        Tween.kill(old.view);
+        this.root.removeChild(old.view);
+        old.view.destroy({ children: true });
+      }
+      const Cls = this.registry[name];
+      const scene = new Cls(name);
+      this.current = scene;
+      scene.view.alpha = 0;
+      this.root.addChild(scene.view);
+      scene.enter(data);
+      await Tween.to(scene.view, { alpha: 1 }, 160);
+    } finally {
+      this.busy = false;
+    }
+  },
+  inputStats: {},
+  dispatch(action, source, pos = null) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, pos);
+  },
+};
+
+/* ---------- shared background ---------- */
+function makeBackground() {
+  const g = new Graphics();
+  g.rect(0, 0, W, H).fill(THEME.bg);
+  return g;
+}
+function soundLabel() { return Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+
+/* ---------- Menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    const title = makeText(CONFIG.title, 96, THEME.text, '800');
+    fitText(title, W - 80);
+    title.position.set(W / 2, H * 0.24);
+    const sub = makeText(CONFIG.subtitle, 30, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 120 });
+    fitText(sub, W - 120, 80);
+    sub.position.set(W / 2, H * 0.24 + 90);
+    const best = HighScores.best();
+    const bestT = makeText(best ? `Best: ${formatScore(best)}` : 'No high score yet', 32, THEME.accent, '700');
+    bestT.position.set(W / 2, H * 0.24 + 160);
+    this.soundBtn = null;
+    const col = buttonColumn([
+      ['Play', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      [soundLabel(), () => { Sfx.setMuted(!Sfx.muted); this.onMuteChanged(); }, { variant: 'secondary' }],
+    ], W / 2, H * 0.55);
+    this.soundBtn = col.children[2];
+    const hint = makeText('Enter to play  ·  M to mute', 24, THEME.textDim, '500');
+    hint.position.set(W / 2, H - 80);
+    this.view.addChild(title, sub, bestT, col, hint);
+  }
+  onMuteChanged() { this.soundBtn?.setText(soundLabel()); }
+  onAction(a) { if (a === 'confirm' || a === 'action') Scenes.go('game'); }
+}
+
+/* ---------- High scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const title = makeText('High Scores', 72, THEME.text, '800');
+    title.position.set(W / 2, 150);
+    const panelH = 80 + CONFIG.maxHighScores * 64;
+    const panel = makePanel(W - 120, panelH);
+    panel.position.set(W / 2, 250 + panelH / 2);
+    this.view.addChild(title, panel);
+    const list = HighScores.list();
+    if (!list.length) {
+      const none = makeText('No scores yet. Go play!', 34, THEME.textDim, '500');
+      none.position.set(W / 2, 250 + panelH / 2);
+      this.view.addChild(none);
+    }
+    list.forEach((e, i) => {
+      const y = 250 + 72 + i * 64;
+      const color = i === 0 ? THEME.accent : THEME.text;
+      const r = makeText(`${i + 1}.`, 34, color, '700'); r.anchor.set(0, 0.5); r.position.set(110, y);
+      const s = makeText(formatScore(e.score), 34, color, '700'); s.position.set(W / 2, y);
+      const d = makeText(e.date || '', 24, THEME.textDim, '500'); d.anchor.set(1, 0.5); d.position.set(W - 110, y);
+      this.view.addChild(r, s, d);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, Math.min(H - 110, 250 + panelH + 110));
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- Game over ---------- */
+class GameOverScene extends Scene {
+  enter({ score = 0, rank = 0, isBest = false, won = false, medal } = {}) {
+    this.score = score;
+    this.enteredAt = performance.now();
+    const title = makeText(won ? 'You Win!' : 'Game Over', 92, won ? THEME.accent : THEME.text, '800');
+    fitText(title, W - 80);
+    title.position.set(W / 2, H * 0.22);
+    const label = makeText(CONFIG.scoreLabel, 30, THEME.textDim, '600');
+    label.position.set(W / 2, H * 0.34);
+    const s = makeText(formatScore(score), 110, THEME.text, '800');
+    fitText(s, W - 80);
+    s.position.set(W / 2, H * 0.34 + 90);
+    const bestLine = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${formatScore(HighScores.best())}`;
+    const b = makeText(bestLine, 36, isBest ? THEME.accent : THEME.textDim, '700');
+    b.position.set(W / 2, H * 0.34 + 190);
+    const col = buttonColumn([
+      ['Play Again', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], W / 2, H * 0.62);
+    this.view.addChild(title, label, s, b, col);
+    if (medal !== undefined) {   // game-specific extra line (Subway Flap medals)
+      this.medalText = makeText(medal ? `${medal} medal` : 'No medal', 34, MEDAL_COLORS[medal] ?? THEME.textDim, '800');
+      this.medalText.position.set(W / 2, H * 0.34 + 250);
+      this.view.addChild(this.medalText);
+    }
+    if (isBest) { b.scale.set(0.2); Tween.to(b, { scale: 1 }, 450, Ease.outBack); }
+  }
+  onAction(a) {
+    if (performance.now() - this.enteredAt < 800) return;   // grace period: a late Space/tap from the game must not skip this screen
+    if (a === 'confirm' || a === 'restart') Scenes.go('game'); else if (a === 'pause') Scenes.go('menu');
+  }
+}
+
+/* ---------- Game scene: framework part (HUD, pause, end) ---------- */
+class GameSceneBase extends Scene {
+  enter() {
+    this.score = 0;
+    this.state = 'playing';              // 'playing' | 'paused' | 'over'
+    this.board = new Container();        // put all game visuals in here
+    this.board.label = 'board';
+    this.hud = new Container();
+    this.overlay = null;
+    this.view.addChild(this.board, this.hud);
+    this.buildHud();
+    this.initGame();
+    this.renderScore();
+  }
+  buildHud() {
+    const scoreBox = makePanel(220, 96, THEME.panel, 18); scoreBox.position.set(150, 80);
+    const bestBox = makePanel(220, 96, THEME.panel, 18); bestBox.position.set(390, 80);
+    const sl = makeText(CONFIG.scoreLabel.toUpperCase(), 20, THEME.textDim, '700'); sl.position.set(150, 56);
+    const bl = makeText('BEST', 20, THEME.textDim, '700'); bl.position.set(390, 56);
+    this.scoreText = makeText('0', 40, THEME.text, '800'); this.scoreText.position.set(150, 96);
+    this.bestText = makeText(formatScore(HighScores.best()), 40, THEME.text, '800'); this.bestText.position.set(390, 96);
+    const pause = makeButton('II', () => this.togglePause(), { w: 96, h: 96, size: 34, variant: 'secondary' });
+    pause.label = 'button:Pause';
+    pause.position.set(W - 90, 80);
+    this.hud.addChild(scoreBox, bestBox, sl, bl, this.scoreText, this.bestText, pause);
+  }
+  addScore(n) {
+    if (this.state === 'over') return;
+    this.score += n;
+    this.renderScore();
+  }
+  setScore(n) { this.score = n; this.renderScore(); }
+  renderScore() {
+    this.scoreText.text = formatScore(this.score);
+    const best = HighScores.best();
+    const shown = CONFIG.lowerIsBetter ? best : Math.max(best, this.score);
+    this.bestText.text = formatScore(shown);
+  }
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedOverlay = this.overlay;               // keep e.g. a win overlay underneath; restored on resume
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => Scenes.go('game'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ]);
+  }
+  resume() {
+    this.hideOverlay();
+    if (this.savedOverlay && !this.savedOverlay.destroyed) { this.savedOverlay.visible = true; this.overlay = this.savedOverlay; }
+    this.savedOverlay = null;
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  showOverlay(title, buttons, subtitle = '') {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.6 });
+    dim.eventMode = 'static';                         // swallow clicks to the game underneath
+    dim.on('pointertap', (e) => e.stopPropagation());
+    const panelH = 218 + buttons.length * 112 + (subtitle ? 40 : 0);
+    const panel = makePanel(W - 140, panelH); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 64, THEME.text, '800'); fitText(t, W - 220); t.position.set(W / 2, H / 2 - panelH / 2 + 90);
+    o.addChild(dim, panel, t);
+    if (subtitle) { const s = makeText(subtitle, 28, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 220 }); s.position.set(W / 2, t.y + 70); o.addChild(s); }
+    const col = buttonColumn(buttons, W / 2, t.y + (subtitle ? 180 : 140));
+    o.addChild(col);
+    this.overlay = o;
+    this.view.addChild(o);
+  }
+  hideOverlay() { if (this.overlay) { this.overlay.destroy({ children: true }); this.overlay = null; } }
+  hideAllOverlays() { this.hideOverlay(); if (this.savedOverlay) { this.savedOverlay.destroy({ children: true }); this.savedOverlay = null; } }
+  /** Call exactly when the game ends. Idempotent. */
+  endGame({ won = false, delay = 500 } = {}) {
+    if (this.state === 'over') return;
+    this.state = 'over';
+    this.hideAllOverlays();
+    Sfx.play(won ? 'win' : 'lose');
+    const { rank, isBest } = HighScores.add(this.score);
+    const score = this.score;
+    const extra = this.gameOverData ? this.gameOverData() : {};   // game-specific extra Game Over data (e.g. medal)
+    wait(delay).then(() => { if (Scenes.current === this) Scenes.go('gameover', { score, rank, isBest, won, ...extra }); });
+  }
+  onAction(a, source, pos) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.overlay) return;                       // game-specific overlay (e.g. win) is showing: only its buttons act
+    if (a === 'restart' && this.state === 'playing') return Scenes.go('game');
+    if (this.state !== 'playing') return;
+    this.handleInput(a, source, pos);
+  }
+  update(dtMs) { if (this.state === 'playing') this.tick(dtMs); }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+  exit() { this.cleanup?.(); }
+  /** Override in GameScene to also expose game data, e.g. { ...super.debugState(), grid: this.grid } (verify.py and play-tests read it). */
+  debugState() { return { state: this.state, score: this.score }; }
+}
+
+/* ---------- timing helper: resolves after ms of ticker time ---------- */
+function wait(ms) {
+  return new Promise((resolve) => {
+    let t = 0;
+    const fn = (ticker) => { t += ticker.deltaMS; if (t >= ms) { Scenes.app.ticker.remove(fn); resolve(); } };
+    Scenes.app.ticker.add(fn);
+  });
+}
+
+/* ##### GAME-SPECIFIC: formatting ##### */
+function formatScore(n) { return String(Math.round(n)); }
+
+/* ##### GAME-SPECIFIC: pure game logic (NO Pixi here; unit-tested below) ##### */
+/* RULE DECISIONS (where the spec is silent)
+   - Play area: ceiling band y 150..190, floor band y 1140..1280 (bottom 140 px). Death when the
+     hitbox circle touches either band (bird.y - R <= 190 or bird.y + R >= 1140).
+   - Hover: before the first flap the bird bobs around y = 640 (sin, amplitude 10 px, 1 Hz). The bob
+     lives in Logic (fixed step) so it is deterministic; the first flap starts from wherever the bob is.
+   - Flap order inside one fixed step: flap sets vy = -680, then gravity + clamp, then y += vy*dt.
+     A flap that arrives in a frame with no whole fixed step is kept (pendingFlap) for the next step.
+   - First pair enters at x = W + 200 (about 3 s of flight before the first pair reaches the bird,
+     like the original's "get ready" stretch). Pairs are spawned when their left edge would be
+     < W + 60, so they always slide in from off-screen. Left edges are 420 px apart.
+   - Gap height is fixed when a pair is spawned: max(230, 300 - 4 * score at spawn time).
+   - Safe band: the gap must keep >= 60 px of pillar at both ends (top of gap >= 250, bottom
+     of gap <= 1080). The gap center is uniform in [max(lo, prev-320), min(hi, prev+320)], where prev
+     starts at the hover height for the first pair.
+   - Score: +1 when the bird's center x (216) is past the pair's right edge (x + 120), once per pair.
+     Pairs are removed once fully off-screen (x + 120 < 0).
+   - Death: world stops scrolling at once; upward speed is cancelled (vy = max(0, vy)) so the bird
+     never flies up over the HUD after a ceiling/pillar hit; the bird keeps falling under gravity (falls through
+     pillars, no more collisions) until it rests on the floor; 0.6 s after touching the floor the
+     run is finished and the scene calls endGame(). Flaps after death are ignored.
+   - Rotation (visual only): angle = clamp(vy / 1100 * 90, -25, 90) degrees.
+   - Medals: Bronze >= 10, Silver >= 20, Gold >= 30, Platinum >= 40, else none.
+*/
+const MEDAL_COLORS = { Bronze: 0xd08a4a, Silver: 0xd6dbe2, Gold: 0xffd166, Platinum: 0xa8f0ff };
+const Logic = {
+  W: 720, H: 1280,
+  STEP: 1 / 120,
+  GRAVITY: 2200, FLAP_VY: -680, MAX_FALL: 1100,
+  BIRD_X: 720 * 0.3, R: 26, BIRD_SIZE: 64,
+  CEIL_TOP: 150, CEIL_Y: 190, FLOOR_Y: 1280 - 140,
+  PILLAR_W: 120, SPACING: 420, SPEED: 240,
+  GAP_START: 300, GAP_SHRINK: 4, GAP_MIN: 230, MAX_SHIFT: 320, SAFE_MARGIN: 60,
+  HOVER_Y: 640, HOVER_AMP: 10, HOVER_HZ: 1,
+  FIRST_SPAWN_X: 720 + 200, SPAWN_EDGE: 720 + 60,
+  DEATH_DELAY: 0.6,
+
+  mulberry32(a) {
+    return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  },
+
+  newWorld(_rng = Math.random) {
+    return {
+      bird: { y: Logic.HOVER_Y, vy: 0 },
+      pillars: [],
+      score: 0, started: false, dead: false,
+      nextSpawnX: Logic.FIRST_SPAWN_X,
+      lastGapY: Logic.HOVER_Y,
+      t: 0, acc: 0, pendingFlap: false, floorT: 0, dist: 0, spawned: 0,
+    };
+  },
+  clone(s) {
+    return { ...s, bird: { ...s.bird }, pillars: s.pillars.map((p) => ({ ...p })) };
+  },
+  gapHeightFor(score) { return Math.max(Logic.GAP_MIN, Logic.GAP_START - Logic.GAP_SHRINK * score); },
+  gapBand(gapH) {
+    return { lo: Logic.CEIL_Y + Logic.SAFE_MARGIN + gapH / 2, hi: Logic.FLOOR_Y - Logic.SAFE_MARGIN - gapH / 2 };
+  },
+  /** Next gap center: uniform in the safe band, at most MAX_SHIFT from the previous center. */
+  nextGap(prevY, gapH, rng) {
+    const b = Logic.gapBand(gapH);
+    const lo = Math.max(b.lo, prevY - Logic.MAX_SHIFT), hi = Math.min(b.hi, prevY + Logic.MAX_SHIFT);
+    if (lo > hi) return Math.min(b.hi, Math.max(b.lo, prevY));   // cannot happen with these constants
+    return lo + rng() * (hi - lo);
+  },
+  /** Rects of a pair: top pillar (ceiling to gap top) and bottom pillar (gap bottom to floor). */
+  pillarRects(p) {
+    const top = p.gapY - p.gapH / 2, bot = p.gapY + p.gapH / 2;
+    return [
+      { x: p.x, y: Logic.CEIL_Y, w: Logic.PILLAR_W, h: top - Logic.CEIL_Y },
+      { x: p.x, y: bot, w: Logic.PILLAR_W, h: Logic.FLOOR_Y - bot },
+    ];
+  },
+  circleRect(cx, cy, r, rc) {
+    const nx = Math.max(rc.x, Math.min(cx, rc.x + rc.w)), ny = Math.max(rc.y, Math.min(cy, rc.y + rc.h));
+    const dx = cx - nx, dy = cy - ny;
+    return dx * dx + dy * dy < r * r;
+  },
+  hitsCeiling(s) { return s.bird.y - Logic.R <= Logic.CEIL_Y; },
+  hitsFloor(s) { return s.bird.y + Logic.R >= Logic.FLOOR_Y; },
+  /** Collision of the (never rotated) hitbox circle with ceiling, floor or any pillar. */
+  collides(s) {
+    if (Logic.hitsCeiling(s) || Logic.hitsFloor(s)) return true;
+    for (const p of s.pillars) {
+      if (p.x > Logic.BIRD_X + Logic.R || p.x + Logic.PILLAR_W < Logic.BIRD_X - Logic.R) continue;
+      for (const rc of Logic.pillarRects(p)) if (Logic.circleRect(Logic.BIRD_X, s.bird.y, Logic.R, rc)) return true;
+    }
+    return false;
+  },
+  birdAngleDeg(vy) { return Math.max(-25, Math.min(90, vy / Logic.MAX_FALL * 90)); },
+  medal(score) {
+    return score >= 40 ? 'Platinum' : score >= 30 ? 'Gold' : score >= 20 ? 'Silver' : score >= 10 ? 'Bronze' : null;
+  },
+  finished(s) { return s.dead && s.floorT >= Logic.DEATH_DELAY - 1e-9; },
+
+  /** One fixed 1/120 s step. Mutates s (callers pass a copy). */
+  fixedStep(s, rng) {
+    const dt = Logic.STEP;
+    if (s.dead) {
+      s.pendingFlap = false;
+      const floorY = Logic.FLOOR_Y - Logic.R;
+      if (s.bird.y >= floorY) { s.bird.y = floorY; s.bird.vy = 0; s.floorT += dt; return; }
+      s.bird.vy = Math.min(Logic.MAX_FALL, s.bird.vy + Logic.GRAVITY * dt);
+      s.bird.y = Math.min(floorY, s.bird.y + s.bird.vy * dt);
+      return;
+    }
+    if (!s.started) {
+      s.t += dt;
+      if (!s.pendingFlap) { s.bird.y = Logic.HOVER_Y + Logic.HOVER_AMP * Math.sin(2 * Math.PI * Logic.HOVER_HZ * s.t); return; }
+      s.started = true;                       // the first flap starts the run and is itself a flap
+    }
+    if (s.pendingFlap) { s.bird.vy = Logic.FLAP_VY; s.pendingFlap = false; }
+    s.bird.vy = Math.min(Logic.MAX_FALL, s.bird.vy + Logic.GRAVITY * dt);
+    s.bird.y += s.bird.vy * dt;
+    // scroll world
+    const dx = Logic.SPEED * dt;
+    s.dist += dx;
+    for (const p of s.pillars) p.x -= dx;
+    s.nextSpawnX -= dx;
+    while (s.nextSpawnX < Logic.SPAWN_EDGE) {
+      const gapH = Logic.gapHeightFor(s.score);
+      const gapY = Logic.nextGap(s.lastGapY, gapH, rng);
+      s.pillars.push({ x: s.nextSpawnX, gapY, gapH, scored: false, id: s.spawned++ });
+      s.lastGapY = gapY;
+      s.nextSpawnX += Logic.SPACING;
+    }
+    if (Logic.collides(s)) { s.dead = true; s.bird.vy = Math.max(0, s.bird.vy); s.bird.y = Math.min(s.bird.y, Logic.FLOOR_Y - Logic.R); return; }
+    for (const p of s.pillars) {
+      if (!p.scored && Logic.BIRD_X > p.x + Logic.PILLAR_W) { p.scored = true; s.score += 1; }
+    }
+    s.pillars = s.pillars.filter((p) => p.x + Logic.PILLAR_W >= 0);
+  },
+  /** Frame step: returns a new state (input untouched). dt in seconds, fixed 1/120 s substeps. */
+  step(state, dt, flap = false, rng = Math.random) {
+    const s = Logic.clone(state);
+    if (flap && !s.dead) s.pendingFlap = true;
+    s.acc += dt;
+    while (s.acc >= Logic.STEP - 1e-9) { s.acc -= Logic.STEP; Logic.fixedStep(s, rng); }
+    return s;
+  },
+  nextPillar(s) {
+    return s.pillars.find((p) => p.x + Logic.PILLAR_W > Logic.BIRD_X - Logic.R) || null;
+  },
+  /** Test bot: flap when below the next gap center + 40 and not already rising fast. */
+  autopilot(s) {
+    const p = Logic.nextPillar(s);
+    const target = p ? p.gapY : (Logic.CEIL_Y + Logic.FLOOR_Y) / 2;
+    return s.bird.y > target + 40 && s.bird.vy > -100;
+  },
+};
+
+/* ##### GAME-SPECIFIC: logic self-tests (run by verify.py via window.__game.selfTest()) ##### */
+function simRun(seed, seconds, fps = 60, bot = Logic.autopilot, stopAtScore = Infinity) {
+  const rng = Logic.mulberry32(seed);
+  let s = Logic.newWorld(rng), maxPillars = 0, prevScore = 0;
+  s = Logic.step(s, 1 / fps, true, rng);
+  const frames = Math.round(seconds * fps);
+  for (let i = 0; i < frames && !s.dead && s.score < stopAtScore; i++) {
+    s = Logic.step(s, 1 / fps, bot(s), rng);
+    maxPillars = Math.max(maxPillars, s.pillars.length);
+    assert(s.score >= prevScore && s.score - prevScore <= 1, 'score jumped');
+    prevScore = s.score;
+    assert(Number.isFinite(s.bird.y) && Number.isFinite(s.bird.vy), 'NaN');
+  }
+  return { s, maxPillars };
+}
+function started(rng = Logic.mulberry32(1)) { return Logic.step(Logic.newWorld(rng), Logic.STEP, true, rng); }
+const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
+const TESTS = [
+  ['newWorld shape', () => {
+    const s = Logic.newWorld(Logic.mulberry32(1));
+    assertEq([s.started, s.dead, s.score, s.pillars.length, s.bird.vy], [false, false, 0, 0, 0]);
+    assert(typeof s.nextSpawnX === 'number' && typeof s.bird.y === 'number');
+    assertEq(Logic.BIRD_X, 216, 'bird x = 30% of width');
+  }],
+  ['hover before first flap: bob, no scroll, no pillars', () => {
+    const rng = Logic.mulberry32(2);
+    let s = Logic.newWorld(rng); const ys = [];
+    for (let i = 0; i < 600; i++) { s = Logic.step(s, 1 / 60, false, rng); ys.push(s.bird.y); }
+    assert(!s.started && !s.dead, 'started without input');
+    assertEq(s.pillars.length, 0); assertEq(s.nextSpawnX, Logic.FIRST_SPAWN_X); assertEq(s.dist, 0);
+    assert(Math.max(...ys) - Math.min(...ys) > 10, 'no bob');
+    assert(ys.every((y) => Math.abs(y - Logic.HOVER_Y) <= Logic.HOVER_AMP + 1e-9), 'bob too large');
+  }],
+  ['first flap starts the run and counts as a flap', () => {
+    const rng = Logic.mulberry32(3);
+    const s0 = Logic.newWorld(rng);
+    const s = Logic.step(s0, Logic.STEP, true, rng);
+    assert(s.started, 'not started');
+    assert(near(s.bird.vy, Logic.FLAP_VY + Logic.GRAVITY * Logic.STEP), 'first tap did not flap: vy=' + s.bird.vy);
+    assert(s.bird.y < s0.bird.y, 'did not rise');
+  }],
+  ['flap sets vy (not additive)', () => {
+    const rng = Logic.mulberry32(4);
+    const a = started(rng), b = Logic.clone(a), c = Logic.clone(a);
+    b.bird.vy = -500; c.bird.vy = 900;
+    const b2 = Logic.step(b, Logic.STEP, true, rng), c2 = Logic.step(c, Logic.STEP, true, rng);
+    assert(near(b2.bird.vy, c2.bird.vy) && near(b2.bird.vy, -680 + 2200 / 120), 'flap depends on previous vy');
+  }],
+  ['gravity 2200 and terminal fall 1100', () => {
+    const rng = Logic.mulberry32(5);
+    let s = started(rng); s.bird.vy = 0; s.bird.y = 300; s.pillars = []; s.nextSpawnX = 1e9;
+    s = Logic.step(s, 0.25, false, rng);
+    assert(near(s.bird.vy, 550, 1e-6), 'gravity wrong vy=' + s.bird.vy);
+    s = Logic.step(s, 0.5, false, rng);
+    assertEq(s.bird.vy, 1100, 'terminal velocity');
+  }],
+  ['rotation clamp -25..90 and hitbox ignores rotation', () => {
+    assertEq(Logic.birdAngleDeg(-680), -25); assertEq(Logic.birdAngleDeg(1100), 90); assertEq(Logic.birdAngleDeg(0), 0);
+    const s = started(); s.pillars = [{ x: Logic.BIRD_X - 60, gapY: 600, gapH: 230, scored: false }];
+    for (const y of [470, 520, 600, 690, 740]) {
+      const a = Logic.clone(s); a.bird.y = y; a.bird.vy = -680; const b = Logic.clone(a); b.bird.vy = 1100;
+      assertEq(Logic.collides(a), Logic.collides(b), 'collision depends on vy at y=' + y);
+    }
+  }],
+  ['ceiling collision detected', () => {
+    const s = started(); s.bird.y = Logic.CEIL_Y + Logic.R; assert(Logic.collides(s), 'touching ceiling not detected');
+    s.bird.y = Logic.CEIL_Y + Logic.R + 1; assert(!Logic.collides(s), 'false ceiling hit');
+    // fly into the ceiling by flapping constantly
+    const rng = Logic.mulberry32(6); let t = started(rng);
+    for (let i = 0; i < 600 && !t.dead; i++) t = Logic.step(t, 1 / 60, true, rng);
+    assert(t.dead, 'constant flapping never hit the ceiling');
+    assert(t.pillars.every((p) => p.x > Logic.BIRD_X + Logic.R), 'died on a pillar, not the ceiling');
+  }],
+  ['floor collision detected', () => {
+    const rng = Logic.mulberry32(7); let s = started(rng);
+    for (let i = 0; i < 300 && !s.dead; i++) s = Logic.step(s, 1 / 60, false, rng);
+    assert(s.dead, 'never died on floor');
+    const f = started(); f.bird.y = Logic.FLOOR_Y - Logic.R; assert(Logic.collides(f));
+  }],
+  ['circle-vs-rect pillar collision (corner case)', () => {
+    const s = started(); const p = { x: Logic.BIRD_X + 10, gapY: 600, gapH: 300, scored: false }; s.pillars = [p];
+    // gap top = 450. Corner at (226, 450). Bird center above-left diagonal: AABB overlaps but circle does not.
+    s.bird.y = 450 + 22; const dx = Logic.BIRD_X - p.x; // -10
+    assert(Math.hypot(dx, 22) < 26 === Logic.collides(s), 'corner mismatch');
+    s.bird.y = 450 + 26 + 3; p.x = Logic.BIRD_X + 20; assert(!Logic.collides(s), 'AABB-style false positive at corner');
+    s.bird.y = 600; p.x = Logic.BIRD_X - 60; assert(!Logic.collides(s), 'center of gap collides');
+    s.bird.y = 450 + 20; assert(Logic.collides(s), 'inside top pillar edge not detected');
+    s.bird.y = 750 - 20; assert(Logic.collides(s), 'bottom pillar not detected');
+  }],
+  ['gap height shrinks 4/point to min 230', () => {
+    assertEq([0, 1, 5, 17, 18, 100].map(Logic.gapHeightFor), [300, 296, 280, 232, 230, 230]);
+    const r = simRun(11, 400, 60, Logic.autopilot, 30).s;
+    for (const p of r.pillars) assert(p.gapH >= 230 && p.gapH <= 300);
+    assert(r.pillars.some((p) => p.gapH === 230), 'late pillars not at min gap');
+  }],
+  ['pair scored exactly once', () => {
+    const rng = Logic.mulberry32(8); let s = started(rng);
+    s.nextSpawnX = 1e9; s.pillars = [{ x: Logic.BIRD_X - Logic.PILLAR_W + 30, gapY: 600, gapH: 300, scored: false, id: 0 }];
+    s.bird.y = 600; s.bird.vy = 0;
+    let scoredAt = -1;
+    for (let i = 0; i < 120; i++) {
+      s = Logic.step(s, Logic.STEP, s.bird.y > 600 && s.bird.vy > -100, rng);
+      if (s.score === 1 && scoredAt < 0) { scoredAt = i; assert(s.pillars[0].x + 120 < Logic.BIRD_X, 'scored before right edge passed'); }
+    }
+    assert(!s.dead, 'died'); assertEq(s.score, 1, 'scored ' + s.score + ' times');
+  }],
+  ['spacing 420, speed 240, pillars come in from off-screen', () => {
+    const rng = Logic.mulberry32(9); let s = started(rng); let minSpawnX = Infinity; const seen = new Set();
+    for (let i = 0; i < 900 && !s.dead; i++) {
+      const before = s.pillars.map((p) => ({ id: p.id, x: p.x }));
+      s = Logic.step(s, 1 / 60, Logic.autopilot(s), rng);
+      for (const p of s.pillars) if (!seen.has(p.id)) { seen.add(p.id); minSpawnX = Math.min(minSpawnX, p.x); }
+      for (let k = 1; k < s.pillars.length; k++) assert(near(s.pillars[k].x - s.pillars[k - 1].x, 420, 1e-6), 'spacing');
+      if (!s.dead) for (const p of s.pillars) { const q = before.find((b) => b.id === p.id); if (q) assert(near(q.x - p.x, 4, 1e-6), 'speed not 240 px/s'); }
+    }
+    assert(minSpawnX >= Logic.W, 'pillar popped in on-screen at x=' + minSpawnX);
+  }],
+  ['gap always reachable (2000 pairs, |delta| <= 320, inside safe band)', () => {
+    const rng = Logic.mulberry32(10); let prev = Logic.HOVER_Y; let maxD = 0;
+    for (let i = 0; i < 2000; i++) {
+      const gapH = Logic.gapHeightFor(Math.floor(rng() * 40));
+      const y = Logic.nextGap(prev, gapH, rng); const b = Logic.gapBand(gapH);
+      maxD = Math.max(maxD, Math.abs(y - prev));
+      assert(y >= b.lo - 1e-9 && y <= b.hi + 1e-9, 'gap outside safe band');
+      assert(y - gapH / 2 > Logic.CEIL_Y && y + gapH / 2 < Logic.FLOOR_Y);
+      prev = y;
+    }
+    assert(maxD <= 320, 'gap moved ' + maxD); assert(maxD > 250, 'gap never moves far (rng unused?)');
+    // and in a real spawned world (consecutive pairs by id)
+    const rng2 = Logic.mulberry32(12); let s = started(rng2); const gaps = new Map();
+    for (let i = 0; i < 60 * 120 && !s.dead; i++) { s = Logic.step(s, 1 / 60, Logic.autopilot(s), rng2); for (const p of s.pillars) gaps.set(p.id, p.gapY); }
+    assert(gaps.size > 50, 'too few pairs');
+    for (let k = 1; k < gaps.size; k++) assert(Math.abs(gaps.get(k) - gaps.get(k - 1)) <= 320, 'spawned gap jump');
+  }],
+  ['death: world stops, bird falls to floor, finishes 0.6 s after landing', () => {
+    const rng = Logic.mulberry32(13); let s = started(rng);
+    s.pillars = [{ x: Logic.BIRD_X - 40, gapY: 700, gapH: 230, scored: false, id: 99 }]; s.bird.y = 560; s.bird.vy = 0; s.nextSpawnX = 2000;
+    s = Logic.step(s, Logic.STEP, false, rng);
+    assert(s.dead, 'pillar hit not detected');
+    const px = s.pillars[0].x, ns = s.nextSpawnX, sc = s.score;
+    let landedAt = -1;
+    for (let i = 0; i < 400; i++) {
+      s = Logic.step(s, Logic.STEP, false, rng);
+      if (landedAt < 0 && s.bird.y >= Logic.FLOOR_Y - Logic.R) landedAt = i;
+      if (landedAt >= 0 && i - landedAt < 70) assert(!Logic.finished(s), 'finished too early');
+      if (Logic.finished(s)) break;
+    }
+    assert(landedAt > 0, 'never landed'); assert(Logic.finished(s), 'never finished');
+    assert(s.bird.y === Logic.FLOOR_Y - Logic.R, 'bird not resting on floor');
+    assertEq([s.pillars[0].x, s.nextSpawnX, s.score], [px, ns, sc], 'world moved after death');
+  }],
+  ['input after death is ignored', () => {
+    const rng = Logic.mulberry32(14); let s = started(rng); s.bird.y = Logic.CEIL_Y + 10; s.bird.vy = -600;
+    s = Logic.step(s, Logic.STEP, false, rng); assert(s.dead);
+    for (let i = 0; i < 60; i++) {
+      const vyBefore = s.bird.vy;
+      s = Logic.step(s, 1 / 60, true, rng);
+      assert(s.bird.vy >= vyBefore || s.bird.vy === 0, 'flapped after death');
+      assert(!s.pendingFlap, 'flap queued after death');
+    }
+  }],
+  ['death while rising cancels upward speed (ceiling and pillar)', () => {
+    const rng = Logic.mulberry32(16); let s = started(rng); s.bird.y = Logic.CEIL_Y + Logic.R + 2; s.bird.vy = -680;
+    s = Logic.step(s, Logic.STEP, false, rng);
+    assert(s.dead && s.bird.vy >= 0, 'ceiling death kept vy ' + s.bird.vy);
+    let minY = s.bird.y; for (let i = 0; i < 120; i++) { s = Logic.step(s, 1 / 60, true, rng); minY = Math.min(minY, s.bird.y); }
+    assert(minY >= Logic.CEIL_Y, 'bird rose over the HUD: ' + minY);
+    let p = started(rng); p.nextSpawnX = 1e9; p.pillars = [{ x: Logic.BIRD_X - 60, gapY: 800, gapH: 230, scored: false, id: 0 }];
+    p.bird.y = 685 + Logic.R + 2; p.bird.vy = -680;   // rising into the top pillar's lip (gap top = 685)
+    p = Logic.step(p, Logic.STEP, false, rng);
+    assert(p.dead && p.bird.vy >= 0, 'pillar death kept vy ' + p.bird.vy);
+    const y0 = p.bird.y; p = Logic.step(p, 0.3, false, rng); assert(p.bird.y >= y0, 'bird rose after pillar death');
+  }],
+  ['fixed step: sub-step frames keep pending flap', () => {
+    const rng = Logic.mulberry32(15); let s = started(rng); s.bird.vy = 300;
+    s = Logic.step(s, Logic.STEP / 3, true, rng);
+    assertEq(s.bird.vy, 300, 'advanced without a whole step'); assert(s.pendingFlap);
+    s = Logic.step(s, Logic.STEP, false, rng);
+    assert(near(s.bird.vy, -680 + 2200 / 120), 'pending flap lost');
+  }],
+  ['frame-rate independent (30 vs 144 fps, and 60)', () => {
+    // Record a 30 fps autopilot run as input timestamps (flap at simulated time m/30 = fixed step 4m), then replay
+    // the SAME inputs at 144 and 60 fps: each flap is delivered with the frame that runs fixed step 4m
+    // (frame k = ceil((4m+1)*fps/120) - 1). With a fixed step the results must match; with a dt-scaled
+    // integrator they would drift.
+    const seed = 21, secs = 40;
+    const rec = (() => {
+      const rng = Logic.mulberry32(seed); let s = Logic.newWorld(rng); const flaps = [];
+      for (let m = 0; m < 30 * secs; m++) { const f = m === 0 || Logic.autopilot(s); if (f) flaps.push(m); s = Logic.step(s, 1 / 30, f, rng); }
+      return { s, flaps };
+    })();
+    const replay = (fps) => {
+      const rng = Logic.mulberry32(seed); let s = Logic.newWorld(rng); let fi = 0;
+      for (let k = 0; k < fps * secs; k++) {
+        let f = false;
+        while (fi < rec.flaps.length && Math.ceil((4 * rec.flaps[fi] + 1) * fps / 120) - 1 === k) { f = true; fi++; }
+        s = Logic.step(s, 1 / fps, f, rng);
+      }
+      assertEq(fi, rec.flaps.length, 'not all flaps delivered');
+      return s;
+    };
+    const a = rec.s;
+    assert(a.score >= 10, '30 fps bot scored only ' + a.score);
+    for (const fps of [144, 60]) {
+      const o = replay(fps);
+      assertEq([o.score, o.dead, o.started], [a.score, a.dead, a.started], fps + ' fps result differs');
+      assert(Math.abs(o.bird.y - a.bird.y) <= 1 && Math.abs(o.dist - a.dist) <= 1, fps + ' fps position differs');
+    }
+    // pure free fall at different frame rates
+    const ff = (dts) => { let s = started(); s.nextSpawnX = 1e9; s.bird.y = 300; s.bird.vy = 0; for (const d of dts) s = Logic.step(s, d, false); return s.bird.y; };
+    assert(Math.abs(ff(Array(15).fill(1 / 30)) - ff(Array(72).fill(1 / 144))) <= 1, 'free fall differs');
+  }],
+  ['pillars removed off-screen (bounded over 5 min)', () => {
+    const { s, maxPillars } = simRun(31, 300);
+    assert(!s.dead, 'bot died at score ' + s.score);
+    assert(maxPillars <= 4, 'pillar array grew to ' + maxPillars);
+    assert(s.spawned > 150 && s.pillars.every((p) => p.x + 120 >= 0));
+  }],
+  ['autopilot survives 200 pillars on 3 seeds', () => {
+    for (const seed of [101, 202, 303]) {
+      const { s } = simRun(seed, 400, 60, Logic.autopilot, 200);
+      assert(!s.dead && s.score >= 200, `seed ${seed}: died at ${s.score}`);
+    }
+  }],
+  ['deterministic with seeded rng; step does not mutate input', () => {
+    const a = simRun(41, 30).s, b = simRun(41, 30).s, c = simRun(42, 30).s;
+    assertEq(a, b, 'same seed differs');
+    assert(JSON.stringify(a.pillars) !== JSON.stringify(c.pillars), 'seed ignored');
+    const s = simRun(43, 5).s, before = JSON.stringify(s);
+    Logic.step(s, 0.2, true, Logic.mulberry32(1)); assertEq(JSON.stringify(s), before, 'input mutated');
+  }],
+  ['medals', () => {
+    assertEq([0, 9, 10, 19, 20, 29, 30, 39, 40, 99].map(Logic.medal),
+      [null, null, 'Bronze', 'Bronze', 'Silver', 'Silver', 'Gold', 'Gold', 'Platinum', 'Platinum']);
+  }],
+];
+
+/* ##### GAME-SPECIFIC: the game scene ##### */
+const COL = {
+  wall: 0x1c2433, wallLine: 0x243044, brick: 0x5a3a36, brickDark: 0x3d2826, mortar: 0x2a1c1b,
+  rail: 0x8a93a6, pillar: 0xc0582b, pillarDark: 0x8a3c1c, pillarLight: 0xd9733f,
+  bird: 0xffd23f, birdDark: 0xe0a800, beak: 0xff8a3d,
+};
+class GameScene extends GameSceneBase {
+  initGame() {
+    this.logic = Logic;                         // for checks.js
+    this.rng = Math.random;
+    this.sim = Logic.newWorld(this.rng);
+    this.flapQueued = false;
+    this.finishedCalled = false;
+
+    const L = Logic;
+    // tunnel background (static)
+    const bg = new Graphics();
+    bg.rect(0, L.CEIL_TOP, W, L.FLOOR_Y - L.CEIL_TOP).fill(COL.wall);
+    for (let y = L.CEIL_Y + 60; y < L.FLOOR_Y; y += 120) bg.rect(0, y, W, 4).fill(COL.wallLine);
+    this.board.addChild(bg);
+    // scrolling wall lamps (parallax, slower)
+    this.lamps = new Graphics();
+    for (let x = 0; x < W + 360; x += 360) {
+      this.lamps.roundRect(x + 60, 330, 90, 22, 8).fill({ color: 0xfff1b8, alpha: 0.18 });
+      this.lamps.roundRect(x + 240, 1010, 90, 22, 8).fill({ color: 0xfff1b8, alpha: 0.12 });
+    }
+    this.board.addChild(this.lamps);
+
+    this.pillarG = new Graphics();
+    this.board.addChild(this.pillarG);
+
+    // brick bands (ceiling + floor), scroll with the world
+    this.bands = new Container();
+    const bricks = new Graphics();
+    const brickRow = (y0, h, rowH) => {
+      for (let r = 0, y = y0; y < y0 + h; r++, y += rowH) {
+        const off = (r % 2) * 30;
+        for (let x = -60 + off; x < W + 120; x += 60) bricks.rect(x + 2, y + 2, 56, Math.min(rowH, y0 + h - y) - 4).fill(r % 2 ? COL.brick : COL.brickDark);
+      }
+    };
+    bricks.rect(-60, L.CEIL_TOP, W + 180, L.CEIL_Y - L.CEIL_TOP).fill(COL.mortar);
+    brickRow(L.CEIL_TOP, L.CEIL_Y - L.CEIL_TOP, 20);
+    bricks.rect(-60, L.FLOOR_Y, W + 180, H - L.FLOOR_Y).fill(COL.mortar);
+    brickRow(L.FLOOR_Y + 14, H - L.FLOOR_Y - 14, 32);
+    bricks.rect(-60, L.FLOOR_Y, W + 180, 10).fill(COL.rail);
+    this.bands.addChild(bricks);
+    this.board.addChild(this.bands);
+
+    // bird (drawn around 0,0, 64 px)
+    this.bird = new Container();
+    const g = new Graphics();
+    g.circle(0, 0, 32).fill(COL.bird).stroke({ width: 3, color: COL.birdDark });
+    g.ellipse(-10, 6, 16, 10).fill(0xfff3b0).stroke({ width: 2, color: COL.birdDark });
+    g.circle(12, -10, 10).fill(0xffffff); g.circle(15, -10, 5).fill(0x1b1b1b);
+    g.poly([26, -2, 44, 5, 26, 12]).fill(COL.beak);
+    this.bird.addChild(g);
+    this.bird.position.set(L.BIRD_X, this.sim.bird.y);
+    this.board.addChild(this.bird);
+
+    // big score in the play area + tap hint
+    this.bigScore = makeText('0', 110, 0xffffff, '900', { stroke: { color: 0x10141d, width: 10 } });
+    this.bigScore.position.set(W / 2, 290);
+    this.board.addChild(this.bigScore);
+    this.hint = new Container();
+    const h1 = makeText('Tap to fly', 56, THEME.accent, '800', { stroke: { color: 0x10141d, width: 8 } });
+    const h2 = makeText('Tap · Click · Space · ↑', 28, THEME.text, '600');
+    h1.position.set(W / 2, 820); h2.position.set(W / 2, 885);
+    this.hint.addChild(h1, h2);
+    this.board.addChild(this.hint);
+    this.shownScore = 0;
+    this.render();
+  }
+  handleInput(a, source) {
+    if (source === 'swipe') return;                              // swipes/taps are pointer-UP gestures: never flap
+    // Flap on pointer-DOWN (press) like the original; tap/swipe (pointer-up gestures) are ignored so long presses
+    // and small drifts still flap exactly once. Keys: Space (action) and Up.
+    if (a === 'action' || a === 'up' || a === 'press') this.flapQueued = true;
+  }
+  onAction(a, source, pos) {
+    if (a === 'restart' && this.sim && this.sim.dead) return;   // R during the death fall must not throw the score away
+    super.onAction(a, source, pos);
+  }
+  /** Leaving mid-death-fall via Pause -> Restart / Main Menu: the run is over, so record its score. */
+  cleanup() {
+    if (this.sim && this.sim.dead && this.state !== 'over' && !this.scoreRecorded) { this.scoreRecorded = true; HighScores.add(this.score); }
+  }
+  tick(dtMs) {
+    const prev = this.sim;
+    const flap = this.flapQueued && !prev.dead; this.flapQueued = false;
+    this.sim = Logic.step(prev, dtMs / 1000, flap, this.rng);
+    const s = this.sim;
+    if (flap) Sfx.play('move');
+    if (s.score !== prev.score) { this.setScore(s.score); Sfx.play('score'); }
+    if (s.dead && !prev.dead) { Sfx.play('hit'); this.shake(); }
+    this.render();
+    if (Logic.finished(s) && !this.finishedCalled) { this.finishedCalled = true; this.endGame(); }
+  }
+  shake() {
+    const b = this.board, to = (x, ms) => (b.destroyed ? null : Tween.to(b, { x }, ms));   // scene may be left mid-shake
+    to(10, 50).then(() => to(-8, 60)).then(() => to(0, 60));
+  }
+  render() {
+    const s = this.sim, L = Logic;
+    this.bird.y = s.bird.y;
+    this.bird.rotation = !s.started ? 0 : (s.dead && s.bird.vy === 0 ? Math.PI / 2 : L.birdAngleDeg(s.bird.vy) * Math.PI / 180);   // visual only; nose-down once landed
+    this.bands.x = -(s.dist % 60);
+    this.lamps.x = -((s.dist * 0.5) % 360);
+    this.hint.visible = !s.started;
+    this.bigScore.visible = s.started;
+    if (this.shownScore !== s.score) { this.shownScore = s.score; this.bigScore.text = String(s.score); Tween.pop(this.bigScore, 1.15, 140); }
+    const g = this.pillarG; g.clear();
+    for (const p of s.pillars) {
+      if (p.x > W || p.x + L.PILLAR_W < 0) continue;
+      const [top, bot] = L.pillarRects(p);
+      for (const [rc, capY] of [[top, top.y + top.h - 34], [bot, bot.y]]) {
+        g.rect(rc.x, rc.y, rc.w, rc.h).fill(COL.pillar);
+        g.rect(rc.x + 14, rc.y, 14, rc.h).fill(COL.pillarLight);
+        g.rect(rc.x + rc.w - 22, rc.y, 22, rc.h).fill(COL.pillarDark);
+        g.rect(rc.x, capY, rc.w, 34).fill(COL.pillarDark);
+        g.rect(rc.x, capY + (capY === rc.y ? 30 : 0), rc.w, 4).fill(0x5e2812);
+      }
+    }
+  }
+  gameOverData() { return { medal: Logic.medal(this.score) }; }
+  debugState() {
+    const s = this.sim;
+    return {
+      ...super.debugState(), started: s.started, dead: s.dead, simScore: s.score,
+      bird: { x: Logic.BIRD_X, y: Math.round(s.bird.y * 10) / 10, vy: Math.round(s.bird.vy) },
+      pillars: s.pillars.map((p) => ({ x: Math.round(p.x), gapY: Math.round(p.gapY), gapH: p.gapH, scored: p.scored })),
+      nextSpawnX: Math.round(s.nextSpawnX), medal: Logic.medal(s.score),
+    };
+  }
+}
+/* ##### END GAME-SPECIFIC ##### */
+
+/* ---------- test helpers ---------- */
+function assert(cond, msg = 'assertion failed') { if (!cond) throw new Error(msg); }
+function assertEq(a, b, msg = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg} expected ${B} got ${A}`); }
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const app = new Application();
+  await app.init({
+    resizeTo: window,
+    background: THEME.outerBg,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preference: 'webgl',
+  });
+  document.getElementById('app').appendChild(app.canvas);
+
+  const root = new Container(); root.label = 'root';
+  root.addChild(makeBackground());
+  const sceneLayer = new Container(); sceneLayer.label = 'scenes';
+  root.addChild(sceneLayer);
+  app.stage.addChild(root);
+
+  const mask = new Graphics(); mask.rect(0, 0, W, H).fill(0xffffff);
+  root.addChild(mask); root.mask = mask;       // nothing draws outside the play area
+
+  function layout() {
+    const sw = app.screen.width, sh = app.screen.height;
+    const s = Math.min(sw / W, sh / H);
+    root.scale.set(s);
+    root.position.set(Math.round((sw - W * s) / 2), Math.round((sh - H * s) / 2));
+    app.stage.hitArea = app.screen;
+  }
+  layout();
+  window.addEventListener('resize', () => requestAnimationFrame(() => { app.resize(); layout(); }));
+
+  Scenes.app = app; Scenes.root = sceneLayer;
+  Scenes.register('menu', MenuScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+
+  Input.init();
+  initSwipe(app, root);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden(); });
+
+  app.ticker.add((ticker) => {
+    const dt = Math.min(ticker.deltaMS, 50);  // clamp: no huge jumps after tab switch
+    Tween.update(dt);
+    Scenes.current?.update(dt);
+  });
+
+  await Scenes.go('menu');
+
+  /* test hook used by scripts/verify.py (harmless in production) */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },          // for checks.js: direct access to the live scene (set up boards, read fields)
+    inputStats() { return { ...Scenes.inputStats }; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    boardObjects() { const b = Scenes.current?.board; let n = 0; const walk = (c) => { if (!c.visible) return; n++; c.children.forEach(walk); }; if (b) walk(b); return n - (b ? 1 : 0); },
+    buttons() {
+      const out = [];
+      const walk = (c) => {
+        if (!c.visible || c.destroyed) return;
+        if (c.isButton) { const p = c.getGlobalPosition(); out.push({ label: c.btnText, x: p.x, y: p.y }); }
+        for (const ch of c.children) walk(ch);
+      };
+      walk(app.stage);
+      return out;
+    },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endGame) { s.endGame({ delay: 0 }); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+  };
+})().catch((e) => showFatal(e.message || String(e)));
+</script>
+</body>
+</html>

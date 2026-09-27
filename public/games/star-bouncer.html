@@ -1,0 +1,1360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Star Bouncer</title><!-- GAME-SPECIFIC: set to CONFIG.title (galleries read this tag) -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14121f; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #fatal { position: fixed; inset: auto 12px 12px 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fatal"></div>
+<script type="module">
+/* =====================================================================
+   PIXIJS GAME SHELL (PixiJS v8, single file, no build step)
+   Sections marked  ##### GAME-SPECIFIC #####  are the only parts that
+   change per game. Everything else is the tested framework:
+   scenes, menu, pause, game over, play again, high scores, sound,
+   input (keys + swipe + tap), tweens, responsive scaling, test hook.
+   ===================================================================== */
+import { Application, Container, Graphics, Text, Rectangle } from '/vendor/pixi.min.mjs';
+
+/* ---------- fatal error overlay (never a silent blank screen) ---------- */
+const fatalBox = document.getElementById('fatal');
+function showFatal(msg) { fatalBox.style.display = 'block'; fatalBox.textContent = 'Error: ' + msg; }
+window.addEventListener('error', (e) => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ##### GAME-SPECIFIC: CONFIG ##### */
+const CONFIG = {
+  id: 'star-bouncer',               // unique per game: namespaces saved scores
+  title: 'Star Bouncer',
+  subtitle: 'Tap to drop the ball. Grab the stars!',
+  width: 1280, height: 720,    // design resolution (landscape, like the original 800x480). Landscape games: 1280 x 720
+  maxHighScores: 10,
+  keyRepeat: false,            // true for continuous-movement games (e.g. paddle), false for turn/grid games
+  scoreLabel: 'Score',
+  lowerIsBetter: false,        // true for time-based games (fastest time wins)
+};
+const THEME = {
+  outerBg: 0x14121f,           // letterbox color outside the play area
+  bg: 0x1f1b2e,                // play-area background
+  panel: 0x2b2640,
+  primary: 0x7c5cff,
+  primaryHover: 0x9479ff,
+  secondary: 0x3a3452,
+  secondaryHover: 0x4a4366,
+  danger: 0xff5c7a,
+  text: 0xf4f1ff,
+  textDim: 0xa9a3c4,
+  accent: 0xffd166,
+  font: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+};
+/* Optional hooks, filled in the GAME-SPECIFIC scene section AFTER your classes are defined:
+     GAME_HOOKS.menuButtons.push(['Levels', () => Scenes.go('levels')]);   // extra menu buttons (between Play and High Scores)
+     GAME_HOOKS.scenes.levels = LevelSelectScene;                          // extra scenes, registered at boot
+   GameScene may define gameOverData() { return { extraLine: 'Gold medal' }; } to add a line to the Game Over screen. */
+const GAME_HOOKS = { menuButtons: [], scenes: {} };
+/* ##### END CONFIG ##### */
+
+const W = CONFIG.width, H = CONFIG.height;
+const LAND = W > H;   // landscape layout for the shared screens
+
+/* ---------- safe storage (localStorage may throw: private mode, sandboxed iframes) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fallback = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fallback : JSON.parse(raw); }
+      catch { return fallback; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+/* ---------- high scores ---------- */
+const HighScores = {
+  list() {
+    const l = Store.get('highscores', []);
+    return Array.isArray(l) ? l.filter((e) => e && Number.isFinite(e.score)) : [];
+  },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  better(a, b) { return CONFIG.lowerIsBetter ? a < b : a > b; },
+  /** Adds a score. Returns { rank (1-based or 0 if not ranked), isBest }. */
+  add(score) {
+    if (!Number.isFinite(score) || (!CONFIG.lowerIsBetter && score <= 0)) return { rank: 0, isBest: false };
+    const prevBest = this.list()[0];
+    const entry = { score, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list();
+    l.push(entry);
+    l.sort((a, b) => (CONFIG.lowerIsBetter ? a.score - b.score : b.score - a.score) || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    const isBest = rank === 1 && (!prevBest || this.better(score, prevBest.score));
+    return { rank, isBest };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* ---------- sound (WebAudio synth: no asset files needed) ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'move': this.tone(300, 0.04, 'sine', 0.06); break;
+      case 'score': this.tone(880, 0.07, 'triangle', 0.12, 1320); break;
+      case 'merge': this.tone(520, 0.09, 'sine', 0.12, 780); break;
+      case 'hit': this.tone(180, 0.08, 'square', 0.08); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.14, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- tweens (driven by app.ticker; promise-based; safe on destroyed targets) ---------- */
+const Ease = {
+  linear: (t) => t,
+  outQuad: (t) => 1 - (1 - t) * (1 - t),
+  outCubic: (t) => 1 - Math.pow(1 - t, 3),
+  inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  outBack: (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const Tween = {
+  active: new Set(),
+  /** props: numeric fields of target; 'scale' sets scale.x and scale.y together. */
+  to(target, props, ms = 200, ease = Ease.outCubic) {
+    return new Promise((resolve) => {
+      const from = {};
+      for (const k of Object.keys(props)) from[k] = k === 'scale' ? target.scale.x : target[k];
+      const tw = { target, props, from, ms: Math.max(1, ms), t: 0, ease, resolve };
+      this.active.add(tw);
+    });
+  },
+  apply(tw, p) {
+    const e = tw.ease(p);
+    for (const k of Object.keys(tw.props)) {
+      const v = tw.from[k] + (tw.props[k] - tw.from[k]) * e;
+      if (k === 'scale') tw.target.scale.set(v); else tw.target[k] = v;
+    }
+  },
+  update(dtMs) {
+    for (const tw of [...this.active]) {
+      if (tw.target.destroyed) { this.active.delete(tw); tw.resolve(); continue; }
+      tw.t += dtMs;
+      const p = Math.min(1, tw.t / tw.ms);
+      this.apply(tw, p);
+      if (p >= 1) { this.active.delete(tw); tw.resolve(); }
+    }
+  },
+  /** Jump every running tween (optionally only one target's) to its end state. */
+  finish(target = null) {
+    for (const tw of [...this.active]) {
+      if (target && tw.target !== target) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  /** Scale up to `peak` and back (merge/score pop). */
+  pop(target, peak = 1.15, ms = 140) {
+    const base = target.scale.x;
+    return this.to(target, { scale: base * peak }, ms, (t) => Math.sin(Math.PI * t));   // up and back in one tween; finishing lands on base
+  },
+  /** Finish only tweens whose target is `container` or inside it (e.g. this.board). Prefer this over finish(). */
+  finishWithin(container) {
+    for (const tw of [...this.active]) {
+      let n = tw.target, inside = false;
+      while (n) { if (n === container) { inside = true; break; } n = n.parent; }
+      if (!inside && !tw.target.destroyed) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  kill(target) { for (const tw of [...this.active]) if (tw.target === target) { this.active.delete(tw); tw.resolve(); } },
+  get busy() { return this.active.size > 0; },
+};
+
+/* ---------- UI helpers ---------- */
+function makeText(text, size = 32, color = THEME.text, weight = '600', extra = {}) {
+  const t = new Text({ text: String(text), style: { fontFamily: THEME.font, fontSize: size, fill: color, fontWeight: weight, align: 'center', ...extra } });
+  t.anchor.set(0.5);
+  return t;
+}
+/** Shrink a Text uniformly so it fits maxW (and optional maxH). Call after setting .text. */
+function fitText(t, maxW, maxH = Infinity) {
+  t.scale.set(1);
+  const s = Math.min(1, maxW / Math.max(1, t.width), maxH / Math.max(1, t.height));
+  t.scale.set(s);
+  return t;
+}
+function makePanel(w, h, color = THEME.panel, radius = 24, alpha = 1) {
+  const g = new Graphics();
+  g.roundRect(-w / 2, -h / 2, w, h, radius).fill({ color, alpha });
+  return g;
+}
+function makeButton(label, onTap, opts = {}) {
+  const { w = 360, h = 88, size = 34, variant = 'primary' } = opts;
+  const base = variant === 'primary' ? THEME.primary : variant === 'danger' ? THEME.danger : THEME.secondary;
+  const hover = variant === 'primary' ? THEME.primaryHover : variant === 'danger' ? 0xff7a93 : THEME.secondaryHover;
+  const c = new Container();
+  c.isButton = true;
+  c.label = 'button:' + label;
+  const bg = new Graphics();
+  const draw = (col) => { bg.clear(); bg.roundRect(-w / 2, -h / 2, w, h, Math.min(28, h / 2)).fill(col); };
+  draw(base);
+  const t = makeText(label, size, THEME.text, '700');
+  c.addChild(bg, t);
+  c.eventMode = 'static';
+  c.cursor = 'pointer';
+  c.hitArea = new Rectangle(-w / 2, -h / 2, w, h);
+  c.on('pointerover', () => { draw(hover); c.scale.set(1.03); });
+  c.on('pointerout', () => { draw(base); c.scale.set(1); });
+  c.on('pointerdown', () => c.scale.set(0.96));
+  c.on('pointerup', () => c.scale.set(1.03));
+  c.on('pointerupoutside', () => { draw(base); c.scale.set(1); });
+  c.on('pointertap', (e) => {
+    e.stopPropagation();
+    if (Scenes.busy || c.disabled) return;
+    Sfx.unlock(); Sfx.play('click');
+    onTap(e);
+  });
+  c.setText = (s) => { t.text = String(s); c.btnText = String(s); };
+  c.btnText = label;
+  return c;
+}
+/** Vertical stack of buttons centered at (x, y). */
+function buttonColumn(defs, x, y, gap = 24, opts = {}) {
+  const col = new Container();
+  const h = opts.h || 88;
+  defs.forEach(([label, fn, o], i) => {
+    const b = makeButton(label, fn, { ...opts, ...(o || {}) });
+    b.position.set(0, i * (h + gap));
+    col.addChild(b);
+  });
+  col.position.set(x, y);
+  return col;
+}
+
+/* ---------- input: keyboard + swipe + actions ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'action', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();                       // stop arrows/space scrolling the page
+      Sfx.unlock();
+      const wasHeld = this.held.has(a);
+      this.held.add(a);
+      if (e.repeat && !CONFIG.keyRepeat) return;
+      if (wasHeld && !e.repeat) return;
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+  },
+  isDown(a) { return this.held.has(a); },
+};
+/** Swipe detection on the whole screen (stage hitArea = app.screen). */
+function initSwipe(app, root) {
+  let start = null;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointerdown', (e) => {
+    Sfx.unlock(); start = { x: e.global.x, y: e.global.y, t: performance.now() };
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+    const p = root.toLocal(e.global);
+    Scenes.dispatch('press', 'pointer', { x: p.x, y: p.y });   // instant: use for flap/jump/shoot games
+  });
+  const end = (e) => {
+    if (!start) return;
+    const dx = (e.global.x - start.x) / root.scale.x, dy = (e.global.y - start.y) / root.scale.y;
+    const dt = performance.now() - start.t;
+    start = null;
+    const dist = Math.hypot(dx, dy);
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }   // presses on buttons are not game input
+    if (dist < 25 && dt < 500) {               // a tap anywhere: 'tap' action with design-space position
+      const p = root.toLocal(e.global);
+      Scenes.dispatch('tap', 'pointer', { x: p.x, y: p.y });
+      return;
+    }
+    if (dist < 40 || dt > 1000) return;         // design-space pixels; ignore slow drags
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    Scenes.dispatch(dir, 'swipe');
+  };
+  app.stage.on('pointerup', end);
+  app.stage.on('pointerupoutside', end);
+}
+
+/* ---------- scenes ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.view = new Container(); this.view.label = 'scene:' + name; }
+  enter(_data) {}
+  exit() {}
+  update(_dtMs) {}
+  onAction(_action, _source, _pos) {}
+  onHidden() {}
+}
+const Scenes = {
+  app: null, root: null, current: null, busy: false, registry: {},
+  register(name, cls) { this.registry[name] = cls; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const old = this.current;
+      if (old) {
+        await Tween.to(old.view, { alpha: 0 }, 140);
+        old.exit();
+        Tween.kill(old.view);
+        this.root.removeChild(old.view);
+        old.view.destroy({ children: true });
+      }
+      const Cls = this.registry[name];
+      const scene = new Cls(name);
+      this.current = scene;
+      scene.view.alpha = 0;
+      this.root.addChild(scene.view);
+      scene.enter(data);
+      await Tween.to(scene.view, { alpha: 1 }, 160);
+    } finally {
+      this.busy = false;
+    }
+  },
+  inputStats: {},
+  dispatch(action, source, pos = null) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, pos);
+  },
+};
+
+/* ---------- shared background ---------- */
+function makeBackground() {
+  const g = new Graphics();
+  g.rect(0, 0, W, H).fill(THEME.bg);
+  return g;
+}
+function soundLabel() { return Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+
+/* ---------- Menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    // Portrait: one centered column. Landscape (W > H): text on the left, buttons on the right.
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const ty = LAND ? H * 0.34 : H * 0.24;
+    const title = makeText(CONFIG.title, 96, THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, ty);
+    const sub = makeText(CONFIG.subtitle, 30, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: textW - 40 });
+    fitText(sub, textW - 40, 80);
+    sub.position.set(cx, ty + 90);
+    const best = HighScores.best();
+    const bestT = makeText(best ? `Best: ${formatScore(best)}` : 'No high score yet', 32, THEME.accent, '700');
+    bestT.position.set(cx, ty + 160);
+    const defs = [
+      ['Play', () => Scenes.go('game')],
+      ...GAME_HOOKS.menuButtons.map(([label, fn]) => [label, fn, { variant: 'secondary' }]),
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      [soundLabel(), () => { Sfx.setMuted(!Sfx.muted); this.onMuteChanged(); }, { variant: 'secondary' }],
+    ];
+    const bh = defs.length > 4 ? 76 : 88, gap = defs.length > 4 ? 18 : 24;
+    const colH = defs.length * bh + (defs.length - 1) * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.min(H * 0.55, H - 150 - colH + bh / 2);
+    const col = buttonColumn(defs, LAND ? W * 0.72 : W / 2, colTop, gap, { h: bh });
+    this.soundBtn = col.children[col.children.length - 1];
+    const hint = makeText('Enter to play  ·  M to mute', 24, THEME.textDim, '500');
+    hint.position.set(cx, H - 60);
+    this.view.addChild(title, sub, bestT, col, hint);
+  }
+  onMuteChanged() { this.soundBtn?.setText(soundLabel()); }
+  onAction(a) { if (a === 'confirm' || a === 'action') Scenes.go('game'); }
+}
+
+/* ---------- High scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const top = LAND ? 70 : 150;
+    const title = makeText('High Scores', LAND ? 60 : 72, THEME.text, '800');
+    title.position.set(W / 2, top);
+    const rowH = LAND ? 52 : 64;
+    const panelTop = top + (LAND ? 60 : 100);
+    const room = Math.floor((H - panelTop - 200) / rowH);             // rows that fit above the Back button
+    const rows = Math.max(3, Math.min(CONFIG.maxHighScores, room));
+    const panelW = LAND ? Math.min(W - 120, 760) : W - 120;
+    const panelH = 60 + rows * rowH;
+    const panel = makePanel(panelW, panelH);
+    panel.position.set(W / 2, panelTop + panelH / 2);
+    this.view.addChild(title, panel);
+    const list = HighScores.list().slice(0, rows);
+    if (!list.length) {
+      const none = makeText('No scores yet. Go play!', 34, THEME.textDim, '500');
+      none.position.set(W / 2, panelTop + panelH / 2);
+      this.view.addChild(none);
+    }
+    const left = W / 2 - panelW / 2 + 50, right = W / 2 + panelW / 2 - 50;
+    list.forEach((e, i) => {
+      const y = panelTop + 30 + rowH / 2 + i * rowH;
+      const color = i === 0 ? THEME.accent : THEME.text;
+      const r = makeText(`${i + 1}.`, 32, color, '700'); r.anchor.set(0, 0.5); r.position.set(left, y);
+      const sc = makeText(formatScore(e.score), 32, color, '700'); sc.position.set(W / 2, y);
+      const d = makeText(e.date || '', 22, THEME.textDim, '500'); d.anchor.set(1, 0.5); d.position.set(right, y);
+      this.view.addChild(r, sc, d);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, Math.min(H - 70, panelTop + panelH + 90));
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- Game over ---------- */
+class GameOverScene extends Scene {
+  /** data: { score, rank, isBest, won, extraLine? } — extraLine comes from GameScene.gameOverData() (e.g. "Gold medal"). */
+  enter({ score = 0, rank = 0, isBest = false, won = false, extraLine = '' } = {}) {
+    this.score = score;
+    this.enteredAt = performance.now();
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const y0 = LAND ? H * 0.2 : H * 0.2;
+    const title = makeText(won ? 'You Win!' : 'Game Over', 92, won ? THEME.accent : THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, y0);
+    const label = makeText(CONFIG.scoreLabel, 30, THEME.textDim, '600');
+    label.position.set(cx, y0 + 100);
+    const sc = makeText(formatScore(score), 110, THEME.text, '800');
+    fitText(sc, textW);
+    sc.position.set(cx, y0 + 185);
+    const bestLine = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${formatScore(HighScores.best())}`;
+    const b = makeText(bestLine, 36, isBest ? THEME.accent : THEME.textDim, '700');
+    b.position.set(cx, y0 + 275);
+    this.view.addChild(title, label, sc, b);
+    if (extraLine) {
+      const ex = makeText(extraLine, 30, THEME.text, '600', { wordWrap: true, wordWrapWidth: textW });
+      fitText(ex, textW, 80);
+      ex.position.set(cx, y0 + 330);
+      this.view.addChild(ex);
+    }
+    const bh = 88, gap = 24, colH = 3 * bh + 2 * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.max(y0 + (extraLine ? 420 : 370), H - 140 - colH + bh / 2);
+    const col = buttonColumn([
+      ['Play Again', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], LAND ? W * 0.72 : W / 2, colTop, gap);
+    this.view.addChild(col);
+    if (isBest) { b.scale.set(0.2); Tween.to(b, { scale: 1 }, 450, Ease.outBack); }
+  }
+  onAction(a) {
+    if (performance.now() - this.enteredAt < 800) return;   // grace period: a late Space/tap from the game must not skip this screen
+    if (a === 'confirm' || a === 'restart') Scenes.go('game'); else if (a === 'pause') Scenes.go('menu');
+  }
+}
+
+/* ---------- Game scene: framework part (HUD, pause, end) ---------- */
+class GameSceneBase extends Scene {
+  enter() {
+    this.score = 0;
+    this.state = 'playing';              // 'playing' | 'paused' | 'over'
+    this.board = new Container();        // put all game visuals in here
+    this.board.label = 'board';
+    this.hud = new Container();
+    this.overlay = null;
+    this.view.addChild(this.board, this.hud);
+    this.buildHud();
+    this.initGame();
+    this.renderScore();
+  }
+  buildHud() {
+    const scoreBox = makePanel(220, 96, THEME.panel, 18); scoreBox.position.set(150, 80);
+    const bestBox = makePanel(220, 96, THEME.panel, 18); bestBox.position.set(390, 80);
+    const sl = makeText(CONFIG.scoreLabel.toUpperCase(), 20, THEME.textDim, '700'); sl.position.set(150, 56);
+    const bl = makeText('BEST', 20, THEME.textDim, '700'); bl.position.set(390, 56);
+    this.scoreText = makeText('0', 40, THEME.text, '800'); this.scoreText.position.set(150, 96);
+    this.bestText = makeText(formatScore(HighScores.best()), 40, THEME.text, '800'); this.bestText.position.set(390, 96);
+    const pause = makeButton('II', () => this.togglePause(), { w: 96, h: 96, size: 34, variant: 'secondary' });
+    pause.label = 'button:Pause';
+    pause.position.set(W - 90, 80);
+    this.hud.addChild(scoreBox, bestBox, sl, bl, this.scoreText, this.bestText, pause);
+  }
+  addScore(n) {
+    if (this.state === 'over') return;
+    this.score += n;
+    this.renderScore();
+  }
+  setScore(n) { this.score = n; this.renderScore(); }
+  renderScore() {
+    this.scoreText.text = formatScore(this.score);
+    const best = HighScores.best();
+    const shown = CONFIG.lowerIsBetter ? best : Math.max(best, this.score);
+    this.bestText.text = formatScore(shown);
+  }
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedOverlay = this.overlay;               // keep e.g. a win overlay underneath; restored on resume
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => this.restart(), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ]);
+  }
+  resume() {
+    this.hideOverlay();
+    if (this.savedOverlay && !this.savedOverlay.destroyed) { this.savedOverlay.visible = true; this.overlay = this.savedOverlay; }
+    this.savedOverlay = null;
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  showOverlay(title, buttons, subtitle = '') {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.6 });
+    dim.eventMode = 'static';                         // swallow clicks to the game underneath
+    dim.on('pointertap', (e) => e.stopPropagation());
+    const panelH = 218 + buttons.length * 112 + (subtitle ? 40 : 0);
+    const panel = makePanel(W - 140, panelH); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 64, THEME.text, '800'); fitText(t, W - 220); t.position.set(W / 2, H / 2 - panelH / 2 + 90);
+    o.addChild(dim, panel, t);
+    if (subtitle) { const s = makeText(subtitle, 28, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 220 }); s.position.set(W / 2, t.y + 70); o.addChild(s); }
+    const col = buttonColumn(buttons, W / 2, t.y + (subtitle ? 180 : 140));
+    o.addChild(col);
+    this.overlay = o;
+    this.view.addChild(o);
+  }
+  hideOverlay() { if (this.overlay) { this.overlay.destroy({ children: true }); this.overlay = null; } }
+  hideAllOverlays() { this.hideOverlay(); if (this.savedOverlay) { this.savedOverlay.destroy({ children: true }); this.savedOverlay = null; } }
+  /** Call exactly when the game ends. Idempotent. */
+  endGame({ won = false, delay = 500 } = {}) {
+    if (this.state === 'over') return;
+    this.state = 'over';
+    this.hideAllOverlays();
+    Sfx.play(won ? 'win' : 'lose');
+    const { rank, isBest } = HighScores.add(this.score);
+    const score = this.score;
+    const extra = this.gameOverData?.() || {};      // optional: return { extraLine: 'Gold medal' }
+    wait(delay).then(() => { if (Scenes.current === this) Scenes.go('gameover', { score, rank, isBest, won, ...extra }); });
+  }
+  onAction(a, source, pos) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.overlay) return;                       // game-specific overlay (e.g. win) is showing: only its buttons act
+    if (a === 'restart' && this.state === 'playing') return this.restart();
+    if (this.state !== 'playing') return;
+    this.handleInput(a, source, pos);
+  }
+  update(dtMs) {
+    if (this.state !== 'paused' && this.timers?.length) {          // this.later() timers: frozen while paused, dropped with the scene
+      for (const t of [...this.timers]) { t.left -= dtMs; if (t.left <= 0) { this.timers.splice(this.timers.indexOf(t), 1); t.fn(); } }
+    }
+    if (this.state === 'playing') this.tick(dtMs);
+  }
+  /** Run fn after ms of game time. Paused time doesn't count; cancelled if the scene is left. Use for result panels, delayed spawns, AI turns. */
+  later(ms, fn) { (this.timers ||= []).push({ left: ms, fn }); }
+  /** R key and Pause→Restart. Default: fresh game. Level-based games override to replay the CURRENT level (keep run score as it was at level start). */
+  restart() { Scenes.go('game'); }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+  exit() { this.cleanup?.(); }
+  /** Override in GameScene to also expose game data, e.g. { ...super.debugState(), grid: this.grid } (verify.py and play-tests read it). */
+  debugState() { return { state: this.state, score: this.score }; }
+}
+
+/* ---------- timing helper: resolves after ms of ticker time ---------- */
+function wait(ms) {
+  return new Promise((resolve) => {
+    let t = 0;
+    const fn = (ticker) => { t += ticker.deltaMS; if (t >= ms) { Scenes.app.ticker.remove(fn); resolve(); } };
+    Scenes.app.ticker.add(fn);
+  });
+}
+
+/* ##### GAME-SPECIFIC: formatting ##### */
+function formatScore(n) { return String(Math.round(n)); }
+
+/* ##### GAME-SPECIFIC: pure game logic (NO Pixi here; unit-tested below) ##### */
+/* =====================================================================
+   RULES — replicated from the original "Bounce Ball" (htmlgames.com,
+   js/game.js, decoded). Logic runs in the ORIGINAL units: an 800x480
+   playfield, pixels "u", and fixed 20 ms ticks (setInterval 20 there).
+   The renderer only scales u -> design px (S = 550/480) under the HUD.
+   - Ball 31x31 at x = 111 (~14%), starts at y = 266 moving UP.
+   - Ball speed: up = -4 u/tick (200 u/s), down = +8 u/tick (400 u/s).
+     No gravity. A tap / Space / Down sets "down"; it keeps falling until
+     it touches a floor tile, which sets "up" again. It rises at constant
+     speed until the next tap. Tapping while falling changes nothing.
+   - If the ball's top goes above the playfield (y < 0) the game is lost.
+   - The world scrolls 4 u/tick (200 u/s), constant — no speed ramp.
+   - Floor = contiguous tiles 400 u (70%) or 150 u (30%) wide at heights
+     y 373 / 383 / 393 (steps of 10). Transition table from the source:
+       prev 383 -> 373 40%, 383 30%, 393 30%;  prev 373 -> 383 80%, 373 20%;
+       prev 393 -> 383 80%, 393 20%.
+     A higher tile arriving from the right just bounces the ball up
+     (floor test: tile.y < ball bottom and x-overlap -> up).
+   - Each new tile gets a spike ("mountain") with 90%; wide tiles get a
+     second one with 90%. Spike type 50/50: tall 42x48 or short 42x29,
+     standing on the tile at a random x inside it.
+   - Each spike spawns a star with 80%, 50 u to the right of the screen
+     edge, at y 170..300 (upper-middle band). Star 28x27, +50 points.
+   - Tick order (as original): scroll; floor test (bounce); spike test
+     (death ends the tick); star test; then ball moves; ceiling test.
+   - Spike hit box (original, inset): ball.bottom > spike.y + 10 and
+     spike.x < ball.x + 21 and spike.x + spike.w - 10 > ball.x.
+   - Star box: ball.y > star.y - 31 and ball.y < star.y + 27 and full
+     x-overlap.
+   - Score = 50 per star only (no time points, no lives, no levels).
+   RULE DECISIONS (where the source is silent or we deviate on purpose)
+   - Our screen is wider (1280x720 landscape, ball at 14% of the width),
+     so more lookahead is visible than in the original: spawning happens
+     relative to OUR right edge (tile when the last tile ends within
+     10 u of it, star 50 u beyond it) so nothing pops in on screen.
+   - The first tile is extended to the left (the original leaves a bare
+     patch behind the ball that the ball never reaches).
+   - Passability: the original can, rarely, build an impossible run.
+     The generator here is constructive (no search): a spike is skipped
+     when it would leave less than MIN_GAP u of safe floor between it and
+     the previous spike's danger zone while a long run of spikes is
+     already building up. Tests check the result with an independent
+     exact reachability search over ticks (humans: >= 6 ticks between a
+     bounce and the next dive).
+   - Dive triggers on touch-down ('press'), Space or ArrowDown key (the
+     original listens to Space/Down). Swipes are ignored. Taps while paused
+     or after game over are dropped (the original would buffer them).
+   - The ball is drawn snapped to the floor surface during the (up to
+     8 u) floor penetration the original tick allows.
+   - A small distance counter (1 m = 50 u) sits under the HUD.
+   ===================================================================== */
+const Logic = (() => {
+  const TICK = 0.02, SCROLL = 4, UP = -4, DOWN = 8, BALL = 31, BALL_X = 111, BALL_Y0 = 266;
+  const FLOOR_Y = 383, FLOOR_H = 10, STAR_W = 28, STAR_H = 27, STAR_SCORE = 50;
+  const FLOOR_W = { 1: 400, 2: 150 }, MOUNT = { 1: { w: 42, h: 48 }, 2: { w: 42, h: 29 } };
+  const S = 550 / 480;                               // u -> design px
+  const VIEW_BALL_PX = 179;                          // ball's design x (14% of 1280)
+  const VIEW_LEFT = BALL_X - VIEW_BALL_PX / S;       // screen-u range visible (screen u = world u - scroll)
+  const VIEW_RIGHT = BALL_X + (1280 - VIEW_BALL_PX) / S;
+  const FLOOR_SPAWN = VIEW_RIGHT + 10, STAR_SPAWN = VIEW_RIGHT + 50;   // original: 810 / 850 for an 800 u screen
+  const MIN_TAP = 6, MIN_GAP = 64, MAX_RUN = 300, CULL = 60;
+  const PX_PER_M = 50;
+
+  function mulberry32(a) {
+    return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  }
+
+  /* ---------- one tick of ball physics (shared by step, checker and bot) ----------
+     s = scroll AFTER this tick's scroll; floors/mounts in world u. Returns next ball or null if dead. */
+  function ballTick(y, vy, s, floors, mounts, out) {
+    const bx = BALL_X + s;
+    let bounced = false;
+    for (const f of floors) {
+      if (f.y < y + BALL && f.x < bx + BALL && f.x + f.w > bx) { vy = UP; bounced = true; }
+    }
+    for (const m of mounts) {
+      if (y + BALL > m.y + 10 && m.x < bx + 21 && m.x + m.w - 10 > bx) { out.dead = 'spike'; out.y = y; out.vy = vy; out.bounced = bounced; return out; }
+    }
+    out.starY = y;                                    // stars are tested before the ball moves
+    y += vy;
+    out.dead = y < 0 ? 'ceiling' : null; out.y = y; out.vy = vy; out.bounced = bounced;
+    return out;
+  }
+  function starHit(by, bx, st) { return by > st.y - BALL && by < st.y + STAR_H && st.x < bx + BALL && st.x + STAR_W > bx; }
+
+  /* ---------- generation (constructive; faithful distribution) ---------- */
+  function nextFloorY(prevY, rng) {
+    if (prevY < FLOOR_Y) return rng() < 0.8 ? FLOOR_Y : FLOOR_Y - 10;
+    if (prevY === FLOOR_Y) return ((Math.floor(rng() * 10) % 3) - 1) * 10 + FLOOR_Y;
+    return rng() < 0.8 ? FLOOR_Y : FLOOR_Y + 10;
+  }
+  // danger zone of a spike in ball-x terms: ball x in (m.x - 21, m.x + m.w - 10)
+  function addMountain(s, f, rng) {
+    const type = rng() < 0.5 ? 2 : 1, d = MOUNT[type];
+    const x = Math.floor(f.x + rng() * (f.w - d.w));
+    const g = s.gen;
+    const z0 = x - 21, z1 = x + d.w - 10;
+    // constructive passability guard: never let spikes chain into a danger run longer than MAX_RUN
+    // with less than MIN_GAP of clear floor between zones (the ball could not land in between).
+    let runStart = z0;
+    if (g.lastZ1 != null && z0 - g.lastZ1 < MIN_GAP) runStart = g.runStart;
+    const skip = runStart !== z0 && Math.max(z1, g.lastZ1) - runStart > MAX_RUN;
+    // the random draw for the star happens either way (keeps the stream aligned with the original)
+    const starRoll = rng(), starY = 170 + 130 * rng();
+    if (skip) return;
+    if (g.lastZ1 == null || z0 - g.lastZ1 >= MIN_GAP) g.runStart = z0;
+    g.lastZ1 = Math.max(z1, g.lastZ1 == null ? z1 : g.lastZ1);
+    s.mounts.push({ id: s.nextId++, x, y: f.y - d.h, w: d.w, h: d.h, type });
+    if (starRoll < 0.8) s.starsList.push({ id: s.nextId++, x: s.scroll + STAR_SPAWN, y: starY });
+  }
+  function addFloor(s, rng) {
+    const last = s.floors[s.floors.length - 1];
+    const type = rng() < 0.3 ? 2 : 1;
+    const f = { id: s.nextId++, x: last.x + last.w, y: nextFloorY(last.y, rng), w: FLOOR_W[type], type };
+    s.floors.push(f);
+    s.gen.tiles++;
+    if (rng() < 0.9) addMountain(s, f, rng);
+    if (type === 1 && rng() < 0.9) addMountain(s, f, rng);
+  }
+  function spawn(s, rng) {
+    let last = s.floors[s.floors.length - 1];
+    while (last.x + last.w - s.scroll <= FLOOR_SPAWN) { addFloor(s, rng); last = s.floors[s.floors.length - 1]; }
+  }
+
+  /* ---------- state ---------- */
+  function newState(rng = Math.random) {
+    const s = {
+      tick: 0, scroll: 0, acc: 0,
+      ball: { y: BALL_Y0, vy: UP, sinceBounce: 99 },
+      floors: [], mounts: [], starsList: [],
+      stars: 0, score: 0, dead: false, cause: null, events: [], nextId: 1,
+      gen: { lastZ1: null, runStart: null, tiles: 0 },
+    };
+    // opening layout of the original
+    s.starsList.push({ id: s.nextId++, x: 272, y: 257 }, { id: s.nextId++, x: 570, y: 347 });
+    s.mounts.push({ id: s.nextId++, x: 279, y: 343, w: 42, h: 48, type: 1 }, { id: s.nextId++, x: 455, y: 355, w: 42, h: 29, type: 2 });
+    s.floors.push({ id: s.nextId++, x: 104 - 400, y: 383, w: 800, type: 1 }, { id: s.nextId++, x: 504, y: 393, w: 400, type: 1 });
+    s.gen.lastZ1 = 455 + 42 - 10; s.gen.runStart = 455 - 21;
+    spawn(s, rng);
+    return s;
+  }
+  function clone(st) {
+    return { ...st, ball: { ...st.ball }, floors: st.floors.slice(), mounts: st.mounts.slice(),
+      starsList: st.starsList.slice(), gen: { ...st.gen }, events: [] };
+  }
+  const tmp = {};
+  function tickOnce(s, rng) {
+    s.tick++; s.scroll += SCROLL;
+    spawn(s, rng);
+    const bx = BALL_X + s.scroll;
+    const r = ballTick(s.ball.y, s.ball.vy, s.scroll, s.floors, s.mounts, tmp);
+    if (r.bounced) { s.events.push({ type: 'bounce' }); s.ball.sinceBounce = 0; }
+    if (r.dead === 'spike') { s.ball.vy = r.vy; s.dead = true; s.cause = 'spike'; s.events.push({ type: 'dead', cause: 'spike' }); return; }
+    for (let i = s.starsList.length - 1; i >= 0; i--) {
+      const st = s.starsList[i];
+      if (starHit(r.starY, bx, st)) {
+        s.starsList.splice(i, 1); s.stars++; s.score += STAR_SCORE;
+        s.events.push({ type: 'star', id: st.id, x: st.x, y: st.y });
+      }
+    }
+    s.ball.y = r.y; s.ball.vy = r.vy; s.ball.sinceBounce = Math.min(99, s.ball.sinceBounce + 1);
+    if (r.dead === 'ceiling') { s.dead = true; s.cause = 'ceiling'; s.events.push({ type: 'dead', cause: 'ceiling' }); return; }
+    const left = s.scroll + VIEW_LEFT - CULL;
+    if (s.floors.length > 1 && s.floors[0].x + s.floors[0].w < left) s.floors = s.floors.filter((o) => o.x + o.w >= left);
+    s.mounts = s.mounts.filter((o) => o.x + o.w >= left);
+    s.starsList = s.starsList.filter((o) => o.x + STAR_W >= left);
+  }
+  /** Advance by dt seconds with fixed 20 ms ticks (accumulator). Pure: returns a new state. */
+  function step(st, dt, rng = Math.random) {
+    const s = clone(st);
+    if (s.dead || !(dt > 0)) return s;
+    s.acc += Math.min(dt, 0.25);
+    while (s.acc >= TICK - 1e-9 && !s.dead) { s.acc -= TICK; tickOnce(s, rng); }
+    if (s.dead) s.acc = 0;
+    return s;
+  }
+  function runTicks(st, n, rng = Math.random) {
+    const s = clone(st);
+    for (let i = 0; i < n && !s.dead; i++) tickOnce(s, rng);
+    return s;
+  }
+  /** Tap: start falling. Ignored while already falling, or when dead. */
+  function dive(st) {
+    if (st.dead || st.ball.vy === DOWN) return st;
+    const s = clone(st);
+    s.ball.vy = DOWN;
+    s.events.push({ type: 'dive' });
+    return s;
+  }
+  const meters = (s) => Math.floor(s.scroll / PX_PER_M);
+
+  /* ---------- exact reachability over ticks (checker + bot) ----------
+     Node = (y, vy, sinceBounce capped at MIN_TAP). A tap is allowed while rising and
+     at least MIN_TAP ticks after the last bounce (human reaction). */
+  const key = (y, vy, c) => (y + 64) * 32 + (vy === DOWN ? 31 : Math.min(c, MIN_TAP));
+  function near(list, lo, hi) { return list.filter((o) => o.x < hi && o.x + o.w > lo); }
+  /** Forward search from a ball state over nTicks. Returns { ok, ticks reached, layers } */
+  function reach(floors, mounts, scroll0, ball, nTicks, keepLayers = false) {
+    let cur = new Map([[key(ball.y, ball.vy, ball.sinceBounce), { y: ball.y, vy: ball.vy, c: Math.min(ball.sinceBounce, MIN_TAP) }]]);
+    const layers = keepLayers ? [cur] : null;
+    const out = {};
+    for (let k = 1; k <= nTicks; k++) {
+      const s = scroll0 + k * SCROLL, bx = BALL_X + s;
+      const fl = near(floors, bx - 2, bx + BALL + 2), mt = near(mounts, bx - 60, bx + 60);
+      const next = new Map();
+      for (const n of cur.values()) {
+        const opts = n.vy === UP && n.c >= MIN_TAP ? [UP, DOWN] : [n.vy];
+        for (const vy of opts) {
+          ballTick(n.y, vy, s, fl, mt, out);
+          if (out.dead) continue;
+          const c = out.bounced ? 0 : Math.min(MIN_TAP, n.c + 1);
+          const kk = key(out.y, out.vy, c);
+          if (!next.has(kk)) next.set(kk, { y: out.y, vy: out.vy, c, from: n, tap: vy !== n.vy });
+        }
+      }
+      if (!next.size) return { ok: false, ticks: k, layers };
+      cur = next;
+      if (keepLayers) layers.push(cur);
+    }
+    return { ok: true, ticks: nTicks, layers, end: cur };
+  }
+  /** Is the whole current course (up to the last generated tile) passable from this state? */
+  function courseOK(st) {
+    const last = st.floors[st.floors.length - 1];
+    const nTicks = Math.floor((last.x + last.w - (BALL_X + BALL + 60) - st.scroll) / SCROLL);
+    return reach(st.floors, st.mounts, st.scroll, st.ball, nTicks).ok;
+  }
+  /** Bot: list of tick offsets (1-based) at which to tap, keeping the ball alive through the known course. */
+  function planTaps(st, horizon = null) {
+    const last = st.floors[st.floors.length - 1];
+    const n = horizon || Math.max(1, Math.floor((last.x + last.w - (BALL_X + BALL + 60) - st.scroll) / SCROLL));
+    const r = reach(st.floors, st.mounts, st.scroll, st.ball, n, true);
+    if (!r.ok) return null;
+    // prefer an end node low-ish and rising (flexible); walk back the chain
+    let best = null;
+    for (const node of r.end.values()) if (!best || (node.vy === UP) > (best.vy === UP) || ((node.vy === UP) === (best.vy === UP) && node.y > best.y)) best = node;
+    const taps = [];
+    let node = best, k = n;
+    while (node && node.from) { if (node.tap) taps.push(k); node = node.from; k--; }
+    return taps.reverse();
+  }
+
+  return {
+    TICK, SCROLL, UP, DOWN, BALL, BALL_X, BALL_Y0, FLOOR_Y, FLOOR_H, STAR_W, STAR_H, STAR_SCORE, FLOOR_W, MOUNT,
+    S, VIEW_BALL_PX, VIEW_LEFT, VIEW_RIGHT, FLOOR_SPAWN, STAR_SPAWN, MIN_TAP, MIN_GAP, MAX_RUN,
+    mulberry32, nextFloorY, newState, step, runTicks, dive, meters, ballTick, starHit, reach, courseOK, planTaps,
+  };
+})();
+
+/* ##### GAME-SPECIFIC: logic self-tests (run by verify.py via window.__game.selfTest()) ##### */
+const L_ = Logic;
+/** Bot that plays through Logic.step at a given frame rate. Taps only happen between frames
+    (like a real player); if a planned tap falls inside a multi-tick frame it taps at the frame start. */
+function botRun(seed, seconds, fps = 60) {
+  const rng = L_.mulberry32(seed);
+  let s = L_.newState(rng), taps = null, planTick = -1, maxEnt = 0;
+  const fdt = 1 / fps;
+  while (s.tick * L_.TICK < seconds && !s.dead) {
+    if (!taps || s.tick - planTick >= 40) {
+      const p = L_.planTaps(s);
+      if (!p) return { s, stuck: true, maxEnt };
+      taps = p.map((k) => s.tick + k); planTick = s.tick;
+    }
+    const ticksThisFrame = Math.max(1, Math.floor((s.acc + fdt) / L_.TICK + 1e-9));
+    if (taps.some((t) => t > s.tick && t <= s.tick + ticksThisFrame) && s.ball.vy === L_.UP) {
+      s = L_.dive(s);
+      if (fps < 50) taps = null;                       // tapped early: replan from the real state
+      else taps = taps.filter((t) => t > s.tick + 1);
+    }
+    s = L_.step(s, fdt, rng);
+    if (taps) taps = taps.filter((t) => t > s.tick);
+    maxEnt = Math.max(maxEnt, s.floors.length + s.mounts.length + s.starsList.length);
+  }
+  return { s, stuck: false, maxEnt };
+}
+const TESTS = [
+  ['original constants: 20 ms tick, up -4, down +8, scroll 4, ball 31 at x 111', () => {
+    assertEq([L_.TICK, L_.UP, L_.DOWN, L_.SCROLL, L_.BALL, L_.BALL_X, L_.STAR_SCORE], [0.02, -4, 8, 4, 31, 111, 50]);
+    assert(Math.abs(L_.VIEW_BALL_PX / 1280 - 0.14) < 0.001, 'ball at 14% of the width');
+  }],
+  ['opening layout matches the original', () => {
+    const s = L_.newState(L_.mulberry32(1));
+    assertEq([s.ball.y, s.ball.vy], [266, -4]);
+    assertEq(s.starsList.slice(0, 2).map((o) => [o.x, o.y]), [[272, 257], [570, 347]]);
+    assertEq(s.mounts.slice(0, 2).map((o) => [o.x, o.y, o.w, o.h]), [[279, 343, 42, 48], [455, 355, 42, 29]]);
+    assertEq(s.floors.slice(0, 2).map((o) => [o.x + o.w, o.y]), [[504, 383], [904, 393]]);
+  }],
+  ['ball rises at a constant 200 u/s with no gravity; no score for time', () => {
+    let s = L_.newState(L_.mulberry32(2));
+    s = L_.step(L_.step(s, 0.25), 0.25);
+    assertEq(s.tick, 25, 'ticks in 0.5 s'); assertEq(s.ball.y, 266 - 100, 'rose 100 u in 0.5 s');
+    s = L_.step(L_.step(s, 0.25), 0.25); assertEq(s.ball.y, 266 - 200, 'rose 200 u in 1 s');
+    assertEq(s.score, 0, 'no time points');
+  }],
+  ['frame-rate independent: 1/30, 1/60, 1/144, 1/20 s frames give the same world', () => {
+    const run = (dt) => { const rng = L_.mulberry32(3); let s = L_.newState(rng); const n = Math.round(1.2 / dt);
+      for (let i = 0; i < n; i++) { if (i === Math.round(0.6 / dt)) s = L_.dive(s); s = L_.step(s, dt, rng); }
+      return s; };
+    const ref = run(1 / 60);
+    for (const dt of [1 / 30, 1 / 144, 1 / 20]) {
+      const s = run(dt);
+      // same tick count => identical ball and world
+      const a = L_.runTicks(s, Math.max(0, ref.tick - s.tick)), b = L_.runTicks(ref, Math.max(0, s.tick - ref.tick));
+      assertEq([a.tick, a.scroll, a.ball.y, a.floors.length], [b.tick, b.scroll, b.ball.y, b.floors.length], 'dt ' + dt);
+    }
+  }],
+  ['ceiling: with no taps the ball leaves the top and the game is lost (tick 67)', () => {
+    let s = L_.newState(L_.mulberry32(4));
+    s = L_.runTicks(s, 66); assert(!s.dead, 'alive at 66'); assertEq(s.ball.y, 2);
+    s = L_.runTicks(s, 1); assert(s.dead && s.cause === 'ceiling', 'dead at 67 ' + s.cause);
+  }],
+  ['dive: falls 8 u/tick until the floor, bounces, then rises 4 u/tick', () => {
+    let s = L_.newState(L_.mulberry32(5));
+    s = L_.runTicks(s, 10); const y0 = s.ball.y;
+    s = L_.dive(s); s = L_.runTicks(s, 1); assertEq(s.ball.y, y0 + 8, 'falls 8');
+    let bounced = false, maxBottom = 0, t = 0;
+    while (!bounced && t++ < 100) { s = L_.runTicks(s, 1); maxBottom = Math.max(maxBottom, s.ball.y + 31); bounced = s.events.some((e) => e.type === 'bounce'); }
+    assert(bounced, 'bounced'); assertEq(s.ball.vy, -4, 'rising after bounce');
+    assert(maxBottom <= 383 + 8, 'penetration at most one down-step ' + maxBottom);
+    const y1 = s.ball.y; s = L_.runTicks(s, 3); assertEq(s.ball.y, y1 - 12, 'rises 4/tick');
+  }],
+  ['tap while falling does nothing; taps after game over are ignored', () => {
+    let s = L_.dive(L_.newState(L_.mulberry32(6)));
+    const s2 = L_.dive(s); assert(s2 === s, 'second dive changed state');
+    let d = L_.runTicks(L_.newState(L_.mulberry32(6)), 80); assert(d.dead, 'dead');
+    const strip = (o) => JSON.stringify({ ...o, events: [] });
+    const snap = strip(d); const d2 = L_.step(L_.dive(d), 0.25);
+    assertEq(strip(d2), snap, 'dead state changed (tap buffered?)');
+  }],
+  ['spike hit box is the original inset box', () => {
+    const m = { x: 500, y: 335, w: 42, h: 48 };
+    const hit = (y, bx) => { const o = {}; L_.ballTick(y, -4, bx - L_.BALL_X, [], [m], o); return o.dead === 'spike'; };
+    assert(!hit(335 + 10 - 31, 510), 'bottom exactly 10 into spike: safe');
+    assert(hit(335 + 10 - 31 + 1, 510), '11 into spike: dead');
+    assert(!hit(340, 500 - 21) && hit(340, 500 - 20), 'left edge: m.x < ball.x + 21');
+    assert(!hit(340, 500 + 32) && hit(340, 500 + 31), 'right edge: m.x + w - 10 > ball.x');
+  }],
+  ['star: +50, collected once, original box', () => {
+    let s = L_.newState(L_.mulberry32(7));
+    s.starsList = [{ id: 99, x: L_.BALL_X + s.scroll + 4 + 10, y: s.ball.y }];
+    let n = 0; for (let i = 0; i < 30; i++) { s = L_.runTicks(s, 1); n += s.events.filter((e) => e.type === 'star').length; }
+    assertEq([n, s.stars, s.score], [1, 1, 50]);
+    const st = { x: 200, y: 100 };
+    assert(L_.starHit(100 - 30, 180, st) && !L_.starHit(100 - 31, 180, st) && !L_.starHit(127, 180, st), 'vertical box');
+    assert(L_.starHit(100, 200 - 30, st) && !L_.starHit(100, 200 - 31, st) && !L_.starHit(100, 228, st), 'horizontal box');
+  }],
+  ['points from a frame that also kills are kept (star then spike in one step)', () => {
+    let s = L_.newState(L_.mulberry32(8));
+    s = L_.runTicks(s, 5);
+    const bx = L_.BALL_X + s.scroll;
+    s.starsList.push({ id: 900, x: bx + 4, y: s.ball.y });               // collected on tick 1
+    s.mounts.push({ id: 901, x: bx + 8 + 20, y: s.ball.y - 20, w: 42, h: 48 }); // hits on tick 3
+    const s2 = L_.step(s, 0.06);
+    assert(s2.dead && s2.cause === 'spike', 'died ' + s2.cause);
+    assertEq(s2.score, 50, 'star kept in the fatal step');
+  }],
+  ['floor generator follows the original tables (types, heights, spikes, stars)', () => {
+    const rng = L_.mulberry32(9);
+    const tr = { 373: {}, 383: {}, 393: {} };
+    for (let i = 0; i < 30000; i++) for (const p of [373, 383, 393]) { const y = L_.nextFloorY(p, rng); tr[p][y] = (tr[p][y] || 0) + 1; }
+    const f = (p, y) => (tr[p][y] || 0) / 30000;
+    assert(Math.abs(f(383, 373) - 0.4) < 0.02 && Math.abs(f(383, 383) - 0.3) < 0.02 && Math.abs(f(383, 393) - 0.3) < 0.02, '383 row ' + JSON.stringify(tr[383]));
+    assert(Math.abs(f(373, 383) - 0.8) < 0.02 && !tr[373][393], '373 row'); assert(Math.abs(f(393, 383) - 0.8) < 0.02 && !tr[393][373], '393 row');
+    let s = L_.newState(rng); let wide = 0, tiles = 0, seen = new Set();
+    for (let k = 0; k < 40; k++) {
+      s = L_.runTicks(s, 200, rng);
+      if (s.dead) { s = { ...s, dead: false, cause: null, ball: { y: 200, vy: -4, sinceBounce: 99 } }; }
+      for (let i = 1; i < s.floors.length; i++) {
+        const a = s.floors[i - 1], b = s.floors[i];
+        assertEq(b.x, a.x + a.w, 'floors contiguous'); assert([373, 383, 393].includes(b.y) && Math.abs(b.y - a.y) <= 10, 'heights');
+        if (!seen.has(b.id)) { seen.add(b.id); tiles++; if (b.w === 400) wide++; }
+      }
+      for (const m of s.mounts) {
+        const fl = s.floors.find((o) => m.x >= o.x && m.x + m.w <= o.x + o.w);
+        if (m.id > 10 && fl) assertEq(m.y + m.h, fl.y, 'spike stands on its tile');
+      }
+      for (const st of s.starsList) if (st.id > 10) assert(st.y >= 170 && st.y <= 300, 'star band');
+    }
+    assert(Math.abs(wide / tiles - 0.7) < 0.08, 'wide share ' + wide / tiles);
+  }],
+  ['spikes per tile: wide tiles 0-2, narrow 0-1, ~90% have one', () => {
+    const rng = L_.mulberry32(10);
+    let s = L_.newState(rng); const cnt = new Map();
+    for (let k = 0; k < 100; k++) { s = L_.runTicks({ ...s, ball: { y: 150, vy: 0, sinceBounce: 99 } }, 50, rng);
+      for (const m of s.mounts) { if (m.id <= 10) continue; const f = s.floors.find((o) => m.x >= o.x && m.x < o.x + o.w); if (f) { const e = cnt.get(f.id) || { w: f.w, ids: new Set() }; e.ids.add(m.id); cnt.set(f.id, e); } } }
+    for (const e of cnt.values()) assert(e.ids.size <= (e.w === 400 ? 2 : 1), 'too many spikes');
+    assert(cnt.size > 60, 'tiles with spikes ' + cnt.size);
+  }],
+  ['checker sanity: hand-made courses', () => {
+    const base = [{ x: -500, y: 383, w: 5000 }];
+    const ball = { y: 300, vy: -4, sinceBounce: 99 };
+    assert(L_.reach(base, [], 0, ball, 400).ok, 'flat floor passable');
+    assert(L_.reach(base, [{ x: 600, y: 335, w: 42, h: 48 }], 0, ball, 400).ok, 'one spike passable');
+    const wall = []; for (let x = 400; x < 1400; x += 30) wall.push({ x, y: 335, w: 42, h: 48 });
+    assert(!L_.reach(base, wall, 0, ball, 400).ok, '1000 u of packed spikes is impossible (ceiling)');
+    const pair = [{ x: 600, y: 335, w: 42, h: 48 }, { x: 600 + 32 + 21 + 30, y: 335, w: 42, h: 48 }];
+    assert(L_.reach(base, pair, 0, ball, 400).ok, 'two close spikes: jump both');
+  }],
+  ['generated courses are passable (independent exact reachability search, 4 seeds x 70 tiles)', () => {
+    for (const seed of [11, 12, 13, 14]) {
+      const rng = L_.mulberry32(seed);
+      const start = L_.newState(rng);
+      const floors = [...start.floors], mounts = [...start.mounts];
+      const seenF = new Set(floors.map((o) => o.id)), seenM = new Set(mounts.map((o) => o.id));
+      // grow the course with the real generator: scroll a copy whose ball is parked mid-air (vy 0)
+      let p = start;
+      while (p.gen.tiles < 70) {
+        p = L_.runTicks({ ...p, ball: { y: 150, vy: 0, sinceBounce: 99 } }, 50, rng);
+        for (const o of p.floors) if (!seenF.has(o.id)) { seenF.add(o.id); floors.push(o); }
+        for (const o of p.mounts) if (!seenM.has(o.id)) { seenM.add(o.id); mounts.push(o); }
+      }
+      const last = floors[floors.length - 1];
+      const n = Math.floor((last.x - 400 - L_.BALL_X) / L_.SCROLL);
+      const r = L_.reach(floors, mounts, 0, start.ball, n);
+      assert(r.ok, 'seed ' + seed + ' impossible at tick ' + r.ticks + ' of ' + n);
+      assert(mounts.length > 60, 'spikes ' + mounts.length);
+    }
+  }],
+  ['checker: a dense spike run is impossible; the generator guard caps runs well below that', () => {
+    // pathological but legal-by-original-rules run: 3 wide tiles each with 2 tall spikes packed tightly
+    const floors = [{ x: -500, y: 383, w: 5000 }], mounts = [];
+    for (let i = 0; i < 12; i++) mounts.push({ x: 500 + i * 52, y: 335, w: 42, h: 48 });
+    assert(!L_.reach(floors, mounts, 0, { y: 300, vy: -4, sinceBounce: 99 }, 500).ok, 'dense run is impossible');
+    const run = (mounts.length - 1) * 52 + 42 - 10 + 21; assert(run > L_.MAX_RUN, 'guard would split it');
+  }],
+  ['planning bot survives the real simulation (3 seeds x 60 s at 60 fps)', () => {
+    for (const seed of [21, 22, 23]) {
+      const r = botRun(seed, 60, 60);
+      assert(!r.stuck, 'planner stuck seed ' + seed + ' t=' + (r.s.tick * 0.02).toFixed(2));
+      assert(!r.s.dead, 'died seed ' + seed + ' ' + r.s.cause + ' t=' + (r.s.tick * 0.02).toFixed(2));
+      assert(r.s.stars >= 10, 'stars ' + r.s.stars);
+      assert(r.maxEnt < 40, 'off-screen objects removed: ' + r.maxEnt);
+    }
+  }],
+  ['bot at 24 fps (several ticks per frame) survives 40 s', () => {
+    const r = botRun(31, 40, 24);
+    assert(!r.stuck && !r.s.dead, 'died ' + r.s.cause + ' at ' + (r.s.tick * 0.02).toFixed(2));
+  }],
+  ['random tapping: invariants (no NaN, score = 50 x stars, never drops)', () => {
+    for (const seed of [41, 42, 43]) {
+      const rng = L_.mulberry32(seed), tap = L_.mulberry32(seed + 100);
+      let s = L_.newState(rng), last = 0;
+      for (let i = 0; i < 60 * 30 && !s.dead; i++) {
+        if (tap() < 0.03) s = L_.dive(s);
+        s = L_.step(s, [1 / 60, 1 / 30, 0.05][i % 3], rng);
+        assert(Number.isFinite(s.ball.y) && Number.isFinite(s.scroll), 'NaN');
+        assert(s.score >= last && s.score === 50 * s.stars, 'score'); last = s.score;
+        assert(s.ball.vy === -4 || s.ball.vy === 8, 'vy');
+      }
+    }
+  }],
+  ['step and dive do not mutate their input', () => {
+    const rng = L_.mulberry32(50);
+    const s = L_.newState(rng); const snap = JSON.stringify(s);
+    L_.step(s, 0.5, rng); L_.dive(s); L_.step(L_.dive(s), 0.3, rng);
+    assertEq(JSON.stringify(s), snap, 'mutated');
+  }],
+];
+
+/* ##### GAME-SPECIFIC: the game scene ##### */
+const SKY_TOP = 0x3fa9f5, SKY_BOTTOM = 0xd4f1ff;
+function lerpColor(a, b, t) {
+  const ar = a >> 16, ag = (a >> 8) & 255, ab = a & 255, br = b >> 16, bg = (b >> 8) & 255, bb = b & 255;
+  return (Math.round(ar + (br - ar) * t) << 16) | (Math.round(ag + (bg - ag) * t) << 8) | Math.round(ab + (bb - ab) * t);
+}
+function starPoly(r1, r2) {
+  const pts = [];
+  for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + (i * Math.PI) / 5, r = i % 2 ? r2 : r1; pts.push(Math.cos(a) * r, Math.sin(a) * r); }
+  return pts;
+}
+const TOP_Y = 170;                                   // design y of the playfield top (original y = 0)
+class GameScene extends GameSceneBase {
+  initGame() {
+    const L = Logic;
+    this.L = L;                                      // exposed for checks.js
+    this.rng = L.mulberry32((Math.random() * 2 ** 31) | 0);
+    this.gs = L.newState(this.rng);
+    this.squashMs = 0; this.shownScore = 0; this.time = 0;
+    this.mountViews = new Map(); this.starViews = new Map();
+    const S = L.S;
+    // sky
+    const sky = new Graphics();
+    const bands = 24;
+    for (let i = 0; i < bands; i++) {                  // exact, non-overlapping bands (no seams while the scene fades)
+      const y0 = Math.round(150 + ((H - 150) * i) / bands), y1 = Math.round(150 + ((H - 150) * (i + 1)) / bands);
+      sky.rect(0, y0, W, y1 - y0).fill(lerpColor(SKY_TOP, SKY_BOTTOM, i / (bands - 1)));
+    }
+    this.board.addChild(sky);
+    // clouds (parallax, slower than the world)
+    this.clouds = new Container(); this.board.addChild(this.clouds);
+    this.cloudData = [];
+    for (let i = 0; i < 7; i++) {
+      const c = new Graphics(), k = 0.6 + (i % 3) * 0.2;
+      c.ellipse(0, 0, 70 * k, 28 * k).ellipse(-50 * k, 10 * k, 45 * k, 20 * k).ellipse(50 * k, 12 * k, 50 * k, 20 * k).ellipse(10 * k, -16 * k, 42 * k, 26 * k)
+        .fill({ color: 0xffffff, alpha: 0.85 });
+      this.clouds.addChild(c);
+      this.cloudData.push({ view: c, x: i * 220 + 60, y: 230 + ((i * 97) % 220), f: 0.12 + (i % 3) * 0.07 });
+    }
+    // danger line at the top of the playfield (leaving it = game over)
+    const top = new Graphics();
+    for (let x = 0; x < W; x += 28) top.rect(x, TOP_Y - 5, 16, 4).fill({ color: 0xd62828, alpha: 0.55 });
+    this.board.addChild(top);
+    this.ground = new Graphics(); this.mountLayer = new Container(); this.starLayer = new Container(); this.fxLayer = new Container();
+    this.board.addChild(this.ground, this.mountLayer, this.starLayer);
+    // ball: drawn around its centre
+    const r = (L.BALL / 2) * S;
+    this.ball = new Container();
+    const bg = new Graphics();
+    bg.circle(0, 0, r).fill(0xd62828);
+    bg.circle(2, 3, r - 3).fill(0xef3b36);
+    bg.ellipse(-6, -7, 6, 4.5).fill({ color: 0xffffff, alpha: 0.9 });
+    bg.circle(5, -10, 2).fill({ color: 0xffffff, alpha: 0.7 });
+    this.ball.addChild(bg); this.ballG = bg; this.ballR = r;
+    this.board.addChild(this.ball, this.fxLayer);
+    // distance + stars counter in the free part of the HUD row
+    this.distText = makeText('0 m', 34, THEME.text, '800');
+    this.distText.position.set(760, 80);
+    this.starText = makeText('★ 0', 34, THEME.accent, '800');
+    this.starText.position.set(960, 80);
+    this.hint = makeText('Tap / Space to dive  ·  don\'t fly off the top!', 40, 0xffffff, '800', { stroke: { color: 0x1a3550, width: 7 } });
+    this.hint.position.set(W / 2, 300);
+    this.board.addChild(this.distText, this.starText, this.hint);
+    this.lastDist = -1; this.lastStars = -1;
+    this.render(0);
+  }
+  handleInput(a, source) {
+    const isDive = a === 'press' || a === 'action' || (a === 'down' && source === 'key');
+    if (!isDive || this.state !== 'playing' || this.gs.dead) return;
+    this.gs = this.L.dive(this.gs);
+  }
+  syncScore() {
+    if (this.gs.score !== this.shownScore) {         // addScore keeps any external bonus (verifier) intact
+      this.addScore(this.gs.score - this.shownScore);
+      this.shownScore = this.gs.score;
+    }
+  }
+  tick(dtMs) {
+    if (this.gs.dead) return;
+    this.gs = this.L.step(this.gs, dtMs / 1000, this.rng);
+    this.syncScore();                                 // before any death handling: points from the fatal frame count
+    let dead = null;
+    for (const e of this.gs.events) {
+      if (e.type === 'star') { Sfx.play('score'); this.sparkle(e); }
+      else if (e.type === 'bounce') { this.squashMs = 80; Sfx.play('move'); }
+      else if (e.type === 'dead') dead = e.cause;
+    }
+    this.render(dtMs);
+    if (dead) this.die(dead);
+  }
+  die(cause) {
+    Sfx.play('hit');
+    if (cause === 'ceiling') Tween.to(this.ball, { y: TOP_Y - 120, alpha: 0 }, 400, Ease.linear);
+    else {
+      this.ballG.tint = 0x555555;
+      Tween.to(this.ball, { scale: 1.8, alpha: 0 }, 350);
+      Tween.to(this.board, { x: 10 }, 50).then(() => Tween.to(this.board, { x: -10 }, 60)).then(() => Tween.to(this.board, { x: 0 }, 50));
+    }
+    this.endGame({ delay: 600 });
+  }
+  sx(worldX, scroll) { return (worldX - scroll - this.L.BALL_X) * this.L.S + this.L.VIEW_BALL_PX; }
+  sy(y) { return TOP_Y + y * this.L.S; }
+  sparkle(e) {
+    const L = this.L;
+    const x = this.sx(e.x + L.STAR_W / 2, this.gs.scroll), y = this.sy(e.y + L.STAR_H / 2);
+    for (let i = 0; i < 6; i++) {
+      const p = new Graphics(); p.poly(starPoly(8, 3.5)).fill(0xfff3a0);
+      p.position.set(x, y); this.fxLayer.addChild(p);
+      const a = (i / 6) * Math.PI * 2;
+      Tween.to(p, { x: x + Math.cos(a) * 45, y: y + Math.sin(a) * 45, alpha: 0 }, 320).then(() => { if (!p.destroyed) p.destroy(); });
+    }
+    const t = makeText('+50', 28, 0xffe066, '800', { stroke: { color: 0x1a3550, width: 5 } });
+    t.position.set(x, y - 20); this.fxLayer.addChild(t);
+    Tween.to(t, { y: y - 80, alpha: 0 }, 600).then(() => { if (!t.destroyed) t.destroy(); });
+  }
+  makeMountView(m) {
+    const S = this.L.S, g = new Graphics(), w = m.w * S, h = m.h * S;
+    g.poly([0, h, w * 0.5, 0, w, h]).fill(0x5b616a);
+    g.poly([w * 0.5, 0, w, h, w * 0.62, h]).fill(0x444950);
+    g.poly([w * 0.5, 0, w * 0.4, h * 0.3, w * 0.6, h * 0.3]).fill(0xd9dde2);
+    return g;
+  }
+  makeStarView() {
+    const S = this.L.S, g = new Graphics();
+    g.poly(starPoly(15 * S, 6.5 * S)).fill(0xffc81e).stroke({ width: 2.5, color: 0xe09a00 });
+    g.poly(starPoly(6 * S, 2.6 * S)).fill({ color: 0xfff3a0, alpha: 0.9 });
+    return g;
+  }
+  syncViews(map, list, make, layer) {
+    const ids = new Set();
+    for (const o of list) {
+      ids.add(o.id);
+      if (!map.has(o.id)) { const v = make(o); layer.addChild(v); map.set(o.id, v); }
+    }
+    for (const [id, v] of map) if (!ids.has(id)) { Tween.kill(v); v.destroy(); map.delete(id); }
+  }
+  render(dtMs) {
+    const L = this.L, gs = this.gs, S = L.S;
+    this.time += dtMs;
+    const alpha = gs.dead ? 0 : Math.min(1, gs.acc / L.TICK);   // interpolate between 20 ms ticks
+    const scroll = gs.scroll + L.SCROLL * alpha;
+    for (const c of this.cloudData) {
+      const span = W + 300;
+      c.view.position.set((((c.x - scroll * S * c.f) % span) + span) % span - 150, c.y);
+    }
+    // ground tiles
+    const g = this.ground; g.clear();
+    for (const f of gs.floors) {
+      const x0 = Math.max(-10, this.sx(f.x, scroll)), x1 = Math.min(W + 10, this.sx(f.x + f.w, scroll));
+      if (x1 <= x0) continue;
+      const y = this.sy(f.y);
+      g.rect(x0, y, x1 - x0, H - y).fill(0x8a5a36);
+      g.rect(x0, y, x1 - x0, L.FLOOR_H * S).fill(0x4cbb4c);
+      g.rect(x0, y + L.FLOOR_H * S, x1 - x0, 4).fill(0x3a9a3a);
+    }
+    // spikes and stars
+    this.syncViews(this.mountViews, gs.mounts, (m) => this.makeMountView(m), this.mountLayer);
+    for (const m of gs.mounts) this.mountViews.get(m.id).position.set(this.sx(m.x, scroll), this.sy(m.y));
+    this.syncViews(this.starViews, gs.starsList, () => this.makeStarView(), this.starLayer);
+    for (const st of gs.starsList) {
+      const v = this.starViews.get(st.id);
+      v.position.set(this.sx(st.x + L.STAR_W / 2, scroll), this.sy(st.y + L.STAR_H / 2));
+      v.rotation += dtMs * 0.0015;
+    }
+    // ball (interpolated; drawn snapped onto the floor surface while it dips into it)
+    if (!gs.dead) {
+      let y = gs.ball.y + gs.ball.vy * alpha;
+      const bx = L.BALL_X + gs.scroll;
+      for (const f of gs.floors) if (f.x < bx + L.BALL && f.x + f.w > bx) y = Math.min(y, f.y - L.BALL);
+      this.ball.position.set(L.VIEW_BALL_PX + this.ballR, this.sy(y) + this.ballR);
+      if (this.squashMs > 0) { this.squashMs -= dtMs; this.ball.scale.set(1.15, 0.8); }
+      else if (gs.ball.vy === L.DOWN) this.ball.scale.set(0.92, 1.1);
+      else this.ball.scale.set(1, 1);
+    }
+    const m = L.meters(gs);
+    if (m !== this.lastDist) { this.lastDist = m; this.distText.text = `${m} m`; }
+    if (gs.stars !== this.lastStars) { this.lastStars = gs.stars; this.starText.text = `★ ${gs.stars}`; }
+    if (this.hint.visible) { const t = gs.tick * L.TICK; this.hint.alpha = Math.max(0, Math.min(1, (3.5 - t) / 0.8)); if (t > 3.5) this.hint.visible = false; }
+  }
+  debugState() {
+    const gs = this.gs;
+    return {
+      ...super.debugState(),
+      tick: gs.tick, t: gs.tick * this.L.TICK, scroll: gs.scroll, meters: this.L.meters(gs),
+      ball: { y: gs.ball.y, vy: gs.ball.vy }, stars: gs.stars, gameScore: gs.score,
+      floors: gs.floors.length, mounts: gs.mounts.length, starItems: gs.starsList.length,
+      dead: gs.dead, cause: gs.cause,
+    };
+  }
+}
+/* ##### END GAME-SPECIFIC ##### */
+
+/* ---------- test helpers ---------- */
+function assert(cond, msg = 'assertion failed') { if (!cond) throw new Error(msg); }
+function assertEq(a, b, msg = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg} expected ${B} got ${A}`); }
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const app = new Application();
+  await app.init({
+    resizeTo: window,
+    background: THEME.outerBg,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preference: 'webgl',
+  });
+  document.getElementById('app').appendChild(app.canvas);
+
+  const root = new Container(); root.label = 'root';
+  root.addChild(makeBackground());
+  const sceneLayer = new Container(); sceneLayer.label = 'scenes';
+  root.addChild(sceneLayer);
+  app.stage.addChild(root);
+
+  const mask = new Graphics(); mask.rect(0, 0, W, H).fill(0xffffff);
+  root.addChild(mask); root.mask = mask;       // nothing draws outside the play area
+
+  function layout() {
+    const sw = app.screen.width, sh = app.screen.height;
+    const s = Math.min(sw / W, sh / H);
+    root.scale.set(s);
+    root.position.set(Math.round((sw - W * s) / 2), Math.round((sh - H * s) / 2));
+    app.stage.hitArea = app.screen;
+  }
+  layout();
+  window.addEventListener('resize', () => requestAnimationFrame(() => { app.resize(); layout(); }));
+
+  Scenes.app = app; Scenes.root = sceneLayer;
+  Scenes.register('menu', MenuScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+  for (const [name, cls] of Object.entries(GAME_HOOKS.scenes)) Scenes.register(name, cls);
+
+  Input.init();
+  initSwipe(app, root);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden(); });
+
+  app.ticker.add((ticker) => {
+    const dt = Math.min(ticker.deltaMS, 50);  // clamp: no huge jumps after tab switch
+    Tween.update(dt);
+    Scenes.current?.update(dt);
+  });
+
+  await Scenes.go('menu');
+
+  /* test hook used by scripts/verify.py (harmless in production) */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },          // for checks.js: direct access to the live scene (set up boards, read fields)
+    inputStats() { return { ...Scenes.inputStats }; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    boardObjects() { const b = Scenes.current?.board; let n = 0; const walk = (c) => { if (!c.visible) return; n++; c.children.forEach(walk); }; if (b) walk(b); return n - (b ? 1 : 0); },
+    buttons() {
+      const out = [];
+      const walk = (c) => {
+        if (!c.visible || c.destroyed) return;
+        if (c.isButton) { const p = c.getGlobalPosition(); out.push({ label: c.btnText, x: p.x, y: p.y }); }
+        for (const ch of c.children) walk(ch);
+      };
+      walk(app.stage);
+      return out;
+    },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endGame) { s.endGame({ delay: 0 }); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+  };
+})().catch((e) => showFatal(e.message || String(e)));
+</script>
+</body>
+</html>

@@ -1,0 +1,1507 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Key Peaks Solitaire</title><!-- GAME-SPECIFIC: set to CONFIG.title (galleries read this tag) -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14121f; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #fatal { position: fixed; inset: auto 12px 12px 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fatal"></div>
+<script type="module">
+/* =====================================================================
+   PIXIJS GAME SHELL (PixiJS v8, single file, no build step)
+   Sections marked  ##### GAME-SPECIFIC #####  are the only parts that
+   change per game. Everything else is the tested framework:
+   scenes, menu, pause, game over, play again, high scores, sound,
+   input (keys + swipe + tap), tweens, responsive scaling, test hook.
+   ===================================================================== */
+import { Application, Container, Graphics, Text, Rectangle } from '/vendor/pixi.min.mjs';
+
+/* ---------- fatal error overlay (never a silent blank screen) ---------- */
+const fatalBox = document.getElementById('fatal');
+function showFatal(msg) { fatalBox.style.display = 'block'; fatalBox.textContent = 'Error: ' + msg; }
+window.addEventListener('error', (e) => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ##### GAME-SPECIFIC: CONFIG ##### */
+const CONFIG = {
+  id: 'key-peaks-solitaire',   // unique per game: namespaces saved scores
+  title: 'Key Peaks Solitaire',
+  subtitle: 'Clear 7 columns, unlock 3 piles',
+  width: 1280, height: 720,    // landscape
+  maxHighScores: 5,
+  keyRepeat: false,
+  scoreLabel: 'Score',
+  lowerIsBetter: false,
+};
+const THEME = {
+  outerBg: 0x07301b,
+  bg: 0x0f5a33,
+  panel: 0x0b3d23,
+  primary: 0x2a6fb0,
+  primaryHover: 0x3a84c9,
+  secondary: 0x16663d,
+  secondaryHover: 0x1d7a4a,
+  danger: 0xe0525f,
+  text: 0xf7f4ea,
+  textDim: 0xb9d3bf,
+  accent: 0xf2c94c,
+  font: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+};
+/* ##### END CONFIG ##### */
+
+const W = CONFIG.width, H = CONFIG.height;
+const LAND = W > H;   // landscape: framework screens use a compressed vertical layout
+
+/* ---------- safe storage (localStorage may throw: private mode, sandboxed iframes) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fallback = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fallback : JSON.parse(raw); }
+      catch { return fallback; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+/* ---------- high scores ---------- */
+const HighScores = {
+  list() {
+    const l = Store.get('highscores', []);
+    return Array.isArray(l) ? l.filter((e) => e && Number.isFinite(e.score)) : [];
+  },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  better(a, b) { return CONFIG.lowerIsBetter ? a < b : a > b; },
+  /** Adds a score. Returns { rank (1-based or 0 if not ranked), isBest }. */
+  add(score) {
+    if (!Number.isFinite(score) || (!CONFIG.lowerIsBetter && score <= 0)) return { rank: 0, isBest: false };
+    const prevBest = this.list()[0];
+    const entry = { score, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list();
+    l.push(entry);
+    l.sort((a, b) => (CONFIG.lowerIsBetter ? a.score - b.score : b.score - a.score) || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    const isBest = rank === 1 && (!prevBest || this.better(score, prevBest.score));
+    return { rank, isBest };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* ---------- sound (WebAudio synth: no asset files needed) ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'move': this.tone(300, 0.04, 'sine', 0.06); break;
+      case 'score': this.tone(880, 0.07, 'triangle', 0.12, 1320); break;
+      case 'merge': this.tone(520, 0.09, 'sine', 0.12, 780); break;
+      case 'hit': this.tone(180, 0.08, 'square', 0.08); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.14, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- tweens (driven by app.ticker; promise-based; safe on destroyed targets) ---------- */
+const Ease = {
+  linear: (t) => t,
+  outQuad: (t) => 1 - (1 - t) * (1 - t),
+  outCubic: (t) => 1 - Math.pow(1 - t, 3),
+  inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  outBack: (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const Tween = {
+  active: new Set(),
+  /** props: numeric fields of target; 'scale' sets scale.x and scale.y together. */
+  to(target, props, ms = 200, ease = Ease.outCubic) {
+    return new Promise((resolve) => {
+      const from = {};
+      for (const k of Object.keys(props)) from[k] = k === 'scale' ? target.scale.x : target[k];
+      const tw = { target, props, from, ms: Math.max(1, ms), t: 0, ease, resolve };
+      this.active.add(tw);
+    });
+  },
+  apply(tw, p) {
+    const e = tw.ease(p);
+    for (const k of Object.keys(tw.props)) {
+      const v = tw.from[k] + (tw.props[k] - tw.from[k]) * e;
+      if (k === 'scale') tw.target.scale.set(v); else tw.target[k] = v;
+    }
+  },
+  update(dtMs) {
+    for (const tw of [...this.active]) {
+      if (tw.target.destroyed) { this.active.delete(tw); tw.resolve(); continue; }
+      tw.t += dtMs;
+      const p = Math.min(1, tw.t / tw.ms);
+      this.apply(tw, p);
+      if (p >= 1) { this.active.delete(tw); tw.resolve(); }
+    }
+  },
+  /** Jump every running tween (optionally only one target's) to its end state. */
+  finish(target = null) {
+    for (const tw of [...this.active]) {
+      if (target && tw.target !== target) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  /** Scale up to `peak` and back (merge/score pop). */
+  pop(target, peak = 1.15, ms = 140) {
+    const base = target.scale.x;
+    return this.to(target, { scale: base * peak }, ms, (t) => Math.sin(Math.PI * t));   // up and back in one tween; finishing lands on base
+  },
+  /** Finish only tweens whose target is `container` or inside it (e.g. this.board). Prefer this over finish(). */
+  finishWithin(container) {
+    for (const tw of [...this.active]) {
+      let n = tw.target, inside = false;
+      while (n) { if (n === container) { inside = true; break; } n = n.parent; }
+      if (!inside && !tw.target.destroyed) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  kill(target) { for (const tw of [...this.active]) if (tw.target === target) { this.active.delete(tw); tw.resolve(); } },
+  get busy() { return this.active.size > 0; },
+};
+
+/* ---------- UI helpers ---------- */
+function makeText(text, size = 32, color = THEME.text, weight = '600', extra = {}) {
+  const t = new Text({ text: String(text), style: { fontFamily: THEME.font, fontSize: size, fill: color, fontWeight: weight, align: 'center', ...extra } });
+  t.anchor.set(0.5);
+  return t;
+}
+/** Shrink a Text uniformly so it fits maxW (and optional maxH). Call after setting .text. */
+function fitText(t, maxW, maxH = Infinity) {
+  t.scale.set(1);
+  const s = Math.min(1, maxW / Math.max(1, t.width), maxH / Math.max(1, t.height));
+  t.scale.set(s);
+  return t;
+}
+function makePanel(w, h, color = THEME.panel, radius = 24, alpha = 1) {
+  const g = new Graphics();
+  g.roundRect(-w / 2, -h / 2, w, h, radius).fill({ color, alpha });
+  return g;
+}
+function makeButton(label, onTap, opts = {}) {
+  const { w = 360, h = 88, size = 34, variant = 'primary' } = opts;
+  const base = variant === 'primary' ? THEME.primary : variant === 'danger' ? THEME.danger : THEME.secondary;
+  const hover = variant === 'primary' ? THEME.primaryHover : variant === 'danger' ? 0xff7a93 : THEME.secondaryHover;
+  const c = new Container();
+  c.isButton = true;
+  c.label = 'button:' + label;
+  const bg = new Graphics();
+  const draw = (col) => { bg.clear(); bg.roundRect(-w / 2, -h / 2, w, h, Math.min(28, h / 2)).fill(col); };
+  draw(base);
+  const t = makeText(label, size, THEME.text, '700');
+  c.addChild(bg, t);
+  c.eventMode = 'static';
+  c.cursor = 'pointer';
+  c.hitArea = new Rectangle(-w / 2, -h / 2, w, h);
+  c.on('pointerover', () => { draw(hover); c.scale.set(1.03); });
+  c.on('pointerout', () => { draw(base); c.scale.set(1); });
+  c.on('pointerdown', () => c.scale.set(0.96));
+  c.on('pointerup', () => c.scale.set(1.03));
+  c.on('pointerupoutside', () => { draw(base); c.scale.set(1); });
+  c.on('pointertap', (e) => {
+    e.stopPropagation();
+    if (Scenes.busy || c.disabled) return;
+    Sfx.unlock(); Sfx.play('click');
+    onTap(e);
+  });
+  c.setText = (s) => { t.text = String(s); c.btnText = String(s); };
+  c.btnText = label;
+  return c;
+}
+/** Vertical stack of buttons centered at (x, y). */
+function buttonColumn(defs, x, y, gap = 24, opts = {}) {
+  const col = new Container();
+  const h = opts.h || 88;
+  defs.forEach(([label, fn, o], i) => {
+    const b = makeButton(label, fn, { ...opts, ...(o || {}) });
+    b.position.set(0, i * (h + gap));
+    col.addChild(b);
+  });
+  col.position.set(x, y);
+  return col;
+}
+
+/* ---------- input: keyboard + swipe + actions ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'action', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+  KeyJ: 'joker', Digit1: 'pile1', Digit2: 'pile2', Digit3: 'pile3', Numpad1: 'pile1', Numpad2: 'pile2', Numpad3: 'pile3',   // Key Peaks Solitaire extras
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();                       // stop arrows/space scrolling the page
+      Sfx.unlock();
+      const wasHeld = this.held.has(a);
+      this.held.add(a);
+      if (e.repeat && !CONFIG.keyRepeat) return;
+      if (wasHeld && !e.repeat) return;
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+  },
+  isDown(a) { return this.held.has(a); },
+};
+/** Swipe detection on the whole screen (stage hitArea = app.screen). */
+function initSwipe(app, root) {
+  let start = null;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointerdown', (e) => { Sfx.unlock(); start = { x: e.global.x, y: e.global.y, t: performance.now() }; });
+  const end = (e) => {
+    if (!start) return;
+    const dx = (e.global.x - start.x) / root.scale.x, dy = (e.global.y - start.y) / root.scale.y;
+    const dt = performance.now() - start.t;
+    start = null;
+    const dist = Math.hypot(dx, dy);
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }   // presses on buttons are not game input
+    if (dist < 25 && dt < 500) {               // a tap anywhere: 'tap' action with design-space position
+      const p = root.toLocal(e.global);
+      Scenes.dispatch('tap', 'pointer', { x: p.x, y: p.y });
+      return;
+    }
+    if (dist < 40 || dt > 1000) return;         // design-space pixels; ignore slow drags
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    Scenes.dispatch(dir, 'swipe');
+  };
+  app.stage.on('pointerup', end);
+  app.stage.on('pointerupoutside', end);
+}
+
+/* ---------- scenes ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.view = new Container(); this.view.label = 'scene:' + name; }
+  enter(_data) {}
+  exit() {}
+  update(_dtMs) {}
+  onAction(_action, _source, _pos) {}
+  onHidden() {}
+}
+const Scenes = {
+  app: null, root: null, current: null, busy: false, registry: {},
+  register(name, cls) { this.registry[name] = cls; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const old = this.current;
+      if (old) {
+        await Tween.to(old.view, { alpha: 0 }, 140);
+        old.exit();
+        Tween.kill(old.view);
+        this.root.removeChild(old.view);
+        old.view.destroy({ children: true });
+      }
+      const Cls = this.registry[name];
+      const scene = new Cls(name);
+      this.current = scene;
+      scene.view.alpha = 0;
+      this.root.addChild(scene.view);
+      scene.enter(data);
+      await Tween.to(scene.view, { alpha: 1 }, 160);
+    } finally {
+      this.busy = false;
+    }
+  },
+  inputStats: {},
+  dispatch(action, source, pos = null) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, pos);
+  },
+};
+
+/* ---------- shared background ---------- */
+function makeBackground() {
+  const g = new Graphics();
+  g.rect(0, 0, W, H).fill(THEME.bg);
+  return g;
+}
+function soundLabel() { return Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+
+/* ---------- Menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    const title = makeText(CONFIG.title, 96, THEME.text, '800');
+    fitText(title, W - 80);
+    title.position.set(W / 2, H * 0.24);
+    const sub = makeText(CONFIG.subtitle, 30, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 120 });
+    fitText(sub, W - 120, 80);
+    sub.position.set(W / 2, H * 0.24 + 90);
+    const best = HighScores.best();
+    const bestT = makeText(best ? `Best: ${formatScore(best)}` : 'No high score yet', 32, THEME.accent, '700');
+    bestT.position.set(W / 2, H * 0.24 + 160);
+    this.soundBtn = null;
+    const col = buttonColumn([
+      ['Play', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      [soundLabel(), () => { Sfx.setMuted(!Sfx.muted); this.onMuteChanged(); }, { variant: 'secondary' }],
+    ], W / 2, H * 0.55);
+    this.soundBtn = col.children[2];
+    const hint = makeText('Enter to play  ·  M to mute', 24, THEME.textDim, '500');
+    hint.position.set(W / 2, LAND ? H - 28 : H - 80);
+    this.view.addChild(title, sub, bestT, col, hint);
+  }
+  onMuteChanged() { this.soundBtn?.setText(soundLabel()); }
+  onAction(a) { if (a === 'confirm' || a === 'action') Scenes.go('game'); }
+}
+
+/* ---------- High scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const title = makeText('High Scores', 72, THEME.text, '800');
+    title.position.set(W / 2, LAND ? 80 : 150);
+    const top = LAND ? 150 : 250;
+    const panelH = 80 + CONFIG.maxHighScores * 64;
+    const panel = makePanel(W - 120, panelH);
+    panel.position.set(W / 2, top + panelH / 2);
+    this.view.addChild(title, panel);
+    const list = HighScores.list();
+    if (!list.length) {
+      const none = makeText('No scores yet. Go play!', 34, THEME.textDim, '500');
+      none.position.set(W / 2, top + panelH / 2);
+      this.view.addChild(none);
+    }
+    list.forEach((e, i) => {
+      const y = top + 72 + i * 64;
+      const color = i === 0 ? THEME.accent : THEME.text;
+      const r = makeText(`${i + 1}.`, 34, color, '700'); r.anchor.set(0, 0.5); r.position.set(110, y);
+      const s = makeText(formatScore(e.score), 34, color, '700'); s.position.set(W / 2, y);
+      const d = makeText(e.date || '', 24, THEME.textDim, '500'); d.anchor.set(1, 0.5); d.position.set(W - 110, y);
+      this.view.addChild(r, s, d);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, Math.min(H - 110, top + panelH + (LAND ? 70 : 110)));
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- Game over ---------- */
+class GameOverScene extends Scene {
+  enter({ score = 0, rank = 0, isBest = false, won = false } = {}) {
+    this.score = score;
+    const title = makeText(won ? 'You Win!' : 'Game Over', 92, won ? THEME.accent : THEME.text, '800');
+    fitText(title, W - 80);
+    title.position.set(W / 2, LAND ? 95 : H * 0.22);
+    const label = makeText(CONFIG.scoreLabel, 30, THEME.textDim, '600');
+    label.position.set(W / 2, LAND ? 180 : H * 0.34);
+    const s = makeText(formatScore(score), 110, THEME.text, '800');
+    fitText(s, W - 80);
+    s.position.set(W / 2, LAND ? 255 : H * 0.34 + 90);
+    const bestLine = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${formatScore(HighScores.best())}`;
+    const b = makeText(bestLine, 36, isBest ? THEME.accent : THEME.textDim, '700');
+    b.position.set(W / 2, LAND ? 345 : H * 0.34 + 190);
+    const col = buttonColumn([
+      ['Play Again', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], W / 2, LAND ? 432 : H * 0.62);
+    this.view.addChild(title, label, s, b, col);
+    if (isBest) { b.scale.set(0.2); Tween.to(b, { scale: 1 }, 450, Ease.outBack); }
+  }
+  onAction(a) { if (a === 'confirm' || a === 'action' || a === 'restart') Scenes.go('game'); else if (a === 'pause') Scenes.go('menu'); }
+}
+
+/* ---------- Game scene: framework part (HUD, pause, end) ---------- */
+class GameSceneBase extends Scene {
+  enter() {
+    this.score = 0;
+    this.state = 'playing';              // 'playing' | 'paused' | 'over'
+    this.board = new Container();        // put all game visuals in here
+    this.board.label = 'board';
+    this.hud = new Container();
+    this.overlay = null;
+    this.view.addChild(this.board, this.hud);
+    this.buildHud();
+    this.initGame();
+    this.renderScore();
+  }
+  buildHud() {
+    const scoreBox = makePanel(220, 96, THEME.panel, 18); scoreBox.position.set(150, 80);
+    const bestBox = makePanel(220, 96, THEME.panel, 18); bestBox.position.set(390, 80);
+    const sl = makeText(CONFIG.scoreLabel.toUpperCase(), 20, THEME.textDim, '700'); sl.position.set(150, 56);
+    const bl = makeText('BEST', 20, THEME.textDim, '700'); bl.position.set(390, 56);
+    this.scoreText = makeText('0', 40, THEME.text, '800'); this.scoreText.position.set(150, 96);
+    this.bestText = makeText(formatScore(HighScores.best()), 40, THEME.text, '800'); this.bestText.position.set(390, 96);
+    const pause = makeButton('II', () => this.togglePause(), { w: 96, h: 96, size: 34, variant: 'secondary' });
+    pause.label = 'button:Pause';
+    pause.position.set(W - 90, 80);
+    this.hud.addChild(scoreBox, bestBox, sl, bl, this.scoreText, this.bestText, pause);
+  }
+  addScore(n) {
+    if (this.state === 'over') return;
+    this.score += n;
+    this.renderScore();
+  }
+  setScore(n) { this.score = n; this.renderScore(); }
+  renderScore() {
+    this.scoreText.text = formatScore(this.score);
+    const best = HighScores.best();
+    const shown = CONFIG.lowerIsBetter ? best : Math.max(best, this.score);
+    this.bestText.text = formatScore(shown);
+  }
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedOverlay = this.overlay;               // keep e.g. a win overlay underneath; restored on resume
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => Scenes.go('game'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ]);
+  }
+  resume() {
+    this.hideOverlay();
+    if (this.savedOverlay && !this.savedOverlay.destroyed) { this.savedOverlay.visible = true; this.overlay = this.savedOverlay; }
+    this.savedOverlay = null;
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  showOverlay(title, buttons, subtitle = '') {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.6 });
+    dim.eventMode = 'static';                         // swallow clicks to the game underneath
+    dim.on('pointertap', (e) => e.stopPropagation());
+    const panelH = 218 + buttons.length * 112 + (subtitle ? 40 : 0);
+    const panel = makePanel(W - 140, panelH); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 64, THEME.text, '800'); fitText(t, W - 220); t.position.set(W / 2, H / 2 - panelH / 2 + 90);
+    o.addChild(dim, panel, t);
+    if (subtitle) { const s = makeText(subtitle, 28, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 220 }); s.position.set(W / 2, t.y + 70); o.addChild(s); }
+    const col = buttonColumn(buttons, W / 2, t.y + (subtitle ? 180 : 140));
+    o.addChild(col);
+    this.overlay = o;
+    this.view.addChild(o);
+  }
+  hideOverlay() { if (this.overlay) { this.overlay.destroy({ children: true }); this.overlay = null; } }
+  hideAllOverlays() { this.hideOverlay(); if (this.savedOverlay) { this.savedOverlay.destroy({ children: true }); this.savedOverlay = null; } }
+  /** Call exactly when the game ends. Idempotent. */
+  endGame({ won = false, delay = 500 } = {}) {
+    if (this.state === 'over') return;
+    this.state = 'over';
+    this.hideAllOverlays();
+    Sfx.play(won ? 'win' : 'lose');
+    const { rank, isBest } = HighScores.add(this.score);
+    const score = this.score;
+    wait(delay).then(() => { if (Scenes.current === this) Scenes.go('gameover', { score, rank, isBest, won }); });
+  }
+  onAction(a, source, pos) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.overlay) return;                       // game-specific overlay (e.g. win) is showing: only its buttons act
+    if (a === 'restart' && this.state === 'playing') return Scenes.go('game');
+    if (this.state !== 'playing') return;
+    this.handleInput(a, source, pos);
+  }
+  update(dtMs) { if (this.state === 'playing') this.tick(dtMs); }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+  exit() { this.cleanup?.(); }
+  /** Override in GameScene to also expose game data, e.g. { ...super.debugState(), grid: this.grid } (verify.py and play-tests read it). */
+  debugState() { return { state: this.state, score: this.score }; }
+}
+
+/* ---------- timing helper: resolves after ms of ticker time ---------- */
+function wait(ms) {
+  return new Promise((resolve) => {
+    let t = 0;
+    const fn = (ticker) => { t += ticker.deltaMS; if (t >= ms) { Scenes.app.ticker.remove(fn); resolve(); } };
+    Scenes.app.ticker.add(fn);
+  });
+}
+
+/* ##### GAME-SPECIFIC: formatting ##### */
+function formatScore(n) { return String(Math.round(n)); }
+
+/* ##### GAME-SPECIFIC: pure game logic (NO Pixi here; unit-tested below) ##### */
+/* RULE DECISIONS (where the spec is silent; chosen to match 3 Keys Solitaire as closely as known)
+   1. Deck = 2 x 52 standard cards = 104. Jokers are NOT shuffled into the deck: they come only from the
+      Joker button (level 1: 4, one less every 2 levels, min 1). The 104 cards are split into
+      tableau 67 + reserve 36 + 1 starter card that is turned face up onto waste pile 1 at the deal
+      (67 + 36 + 1 = 104), so pile 1 always has a card to build on.
+   2. The two KEY cards are extra special cards (not part of the 104 and not counted in the column sizes).
+      Each goes into a different column that has >= 3 cards, with at least 2 cards in front of it and at
+      least 1 card behind it. Cards leave a column strictly from the front, so every key is always
+      reachable; keys are never in the reserve and never the deepest card of a column (the column goes on).
+   3. A key is played by tapping it when it is the front card (no rank needed). It unlocks the next locked
+      waste pile (max 3 piles; extra keys never open more). Keys score no card points (they are not cards),
+      but the level is only clear when keys are gone too (the tableau must be empty).
+   4. A freshly unlocked pile is empty. An empty open pile, like a joker, accepts ANY card.
+   5. Reserve tap deals one card to every open pile, left to right, until the reserve runs out.
+   6. A joker cannot be placed on an empty pile or on another joker (it would be wasted). If only one pile
+      can take it, it goes there directly; otherwise the player taps the pile.
+   7. When the front card fits several piles, the first tap selects it and highlights the target piles; tap a
+      pile to choose, or tap the card again to use the default (a real card match before a joker/empty pile).
+   8. Level time bonus uses whole seconds left (rounded up, the same number the timer shows).
+   9. Every level uses all 67 tableau cards (different column shapes, max 14 per column). Time and jokers
+      follow the spec. Runs always start at level 1; the total over the run is the high score. Clearing
+      level 10 wins the run. Time out or stuck (no tableau move, empty reserve, no jokers) = Game Over.
+   10. Card points (+50) are added as cards are played; level bonuses are added once on the level-complete
+      screen. The score shown is always carry + levelTotal(state), so a bonus can never be added twice.
+*/
+function mulberry32(a) {
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+const SUITS = ['♠', '♥', '♦', '♣'];          // spades hearts diamonds clubs
+const RANKS = ['', 'A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+const LEVEL_LAYOUTS = [
+  [10, 8, 6, 11, 14, 5, 13],
+  [9, 11, 9, 9, 9, 11, 9],
+  [5, 9, 13, 14, 13, 9, 4],
+  [14, 12, 10, 5, 10, 12, 4],
+  [4, 8, 12, 14, 12, 8, 9],
+  [13, 6, 13, 3, 13, 6, 13],
+  [7, 14, 7, 11, 7, 14, 7],
+  [12, 11, 10, 9, 9, 8, 8],
+  [3, 14, 6, 14, 6, 14, 10],
+  [14, 4, 14, 3, 14, 4, 14],
+];
+const Logic = {
+  NUM_COLS: 7, RESERVE_SIZE: 36, MAX_PILES: 3, NUM_KEYS: 2, MAX_LEVEL: 10,
+  PTS_CARD: 50, PTS_RESERVE: 200, PTS_JOKER: 200, PTS_SECOND: 2,
+  LEVELS: LEVEL_LAYOUTS,
+  rng: mulberry32,
+
+  levelConfig(level) {
+    const L = Math.max(1, Math.min(this.MAX_LEVEL, level | 0));
+    return { level: L, cols: LEVEL_LAYOUTS[L - 1].slice(), timeMs: (420 - 30 * (L - 1)) * 1000,
+      jokers: Math.max(1, 4 - Math.floor((L - 1) / 2)) };
+  },
+  makeDeck() {
+    const d = [];
+    for (let deck = 0; deck < 2; deck++) for (let s = 0; s < 4; s++) for (let r = 1; r <= 13; r++)
+      d.push({ id: deck * 52 + s * 13 + r - 1, kind: 'card', r, s });
+    return d;
+  },
+  shuffle(a, rng) {
+    a = a.slice();
+    for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+    return a;
+  },
+  /** New level state. Column arrays: index 0 = back (top of screen), last = front (playable). Reserve/piles: last = top. */
+  newLevel(level, rng) {
+    const cfg = this.levelConfig(level);
+    const deck = this.shuffle(this.makeDeck(), rng);
+    let k = 0;
+    const cols = cfg.cols.map((n) => deck.slice(k, k += n));
+    const eligible = cols.map((_, i) => i).filter((i) => cols[i].length >= 3);
+    const chosen = this.shuffle(eligible, rng).slice(0, this.NUM_KEYS);
+    chosen.forEach((ci, n) => {
+      const col = cols[ci], len = col.length;
+      const inFront = 2 + Math.floor(rng() * (len - 2));       // 2 .. len-1 cards in front, >= 1 behind
+      col.splice(len - inFront, 0, { id: 200 + n, kind: 'key' });
+    });
+    const starter = deck[k++];
+    const reserve = deck.slice(k);
+    return { level: cfg.level, cols, reserve, piles: [[starter], [], []], open: 1, jokers: cfg.jokers,
+      jokersUsed: 0, nextJokerId: 300, timeMs: cfg.timeMs, played: 0, keys: 0, score: 0,
+      status: 'play', reason: '', bonus: null };
+  },
+  clone(S) {
+    return { ...S, cols: S.cols.map((c) => c.slice()), piles: S.piles.map((p) => p.slice()),
+      reserve: S.reserve.slice(), bonus: S.bonus ? { ...S.bonus } : null };
+  },
+  top(pile) { return pile.length ? pile[pile.length - 1] : null; },
+  isWild(pile) { const t = this.top(pile); return !t || t.kind === 'joker'; },
+  adjacent(a, b) { const d = Math.abs(a - b); return d === 1 || d === 12; },   // K-A-2 wrap
+  fits(card, pile) {
+    if (!card || card.kind !== 'card') return false;
+    if (this.isWild(pile)) return true;
+    return this.adjacent(card.r, this.top(pile).r);
+  },
+  front(S, c) { const col = S.cols[c]; return col && col.length ? col[col.length - 1] : null; },
+  targets(S, c) {
+    const f = this.front(S, c), out = [];
+    if (!f || f.kind !== 'card') return out;
+    for (let p = 0; p < S.open; p++) if (this.fits(f, S.piles[p])) out.push(p);
+    return out;
+  },
+  defaultTarget(S, c) {
+    const t = this.targets(S, c);
+    const real = t.find((p) => !this.isWild(S.piles[p]));
+    return real != null ? real : t.length ? t[0] : null;
+  },
+  fail(S, why) { return { ok: false, state: S, why }; },
+  /** Play the front card of column c (onto pile p, or the default pile). Keys unlock a pile. */
+  play(S, c, p = null) {
+    if (S.status !== 'play') return this.fail(S, 'not playing');
+    const f = this.front(S, c);
+    if (!f) return this.fail(S, 'empty column');
+    if (f.kind === 'key') {
+      const N = this.clone(S);
+      N.cols[c].pop(); N.keys++;
+      const unlocked = N.open < this.MAX_PILES ? N.open : null;
+      N.open = Math.min(this.MAX_PILES, N.open + 1);
+      return { ok: true, state: this.settle(N), card: f, key: true, pile: unlocked };
+    }
+    if (p == null) p = this.defaultTarget(S, c);
+    if (p == null || p < 0 || p >= S.open || !this.fits(f, S.piles[p])) return this.fail(S, 'no fit');
+    const N = this.clone(S);
+    N.cols[c].pop(); N.piles[p].push(f); N.played++; N.score += this.PTS_CARD;
+    return { ok: true, state: this.settle(N), card: f, pile: p };
+  },
+  /** Play a card by id: only allowed if it is the front card of its column. */
+  playById(S, id, p = null) {
+    const c = S.cols.findIndex((col) => col.length && col[col.length - 1].id === id);
+    if (c < 0) return this.fail(S, 'not a front card');
+    return this.play(S, c, p);
+  },
+  dealReserve(S) {
+    if (S.status !== 'play') return this.fail(S, 'not playing');
+    if (!S.reserve.length) return this.fail(S, 'reserve empty');
+    const N = this.clone(S), dealt = [];
+    for (let p = 0; p < N.open && N.reserve.length; p++) { const card = N.reserve.pop(); N.piles[p].push(card); dealt.push({ card, pile: p }); }
+    return { ok: true, state: this.settle(N), dealt };
+  },
+  jokerPiles(S) { const out = []; for (let p = 0; p < S.open; p++) if (!this.isWild(S.piles[p])) out.push(p); return out; },
+  useJoker(S, p) {
+    if (S.status !== 'play') return this.fail(S, 'not playing');
+    if (S.jokers <= 0) return this.fail(S, 'no jokers');
+    if (p == null || p < 0 || p >= S.open || this.isWild(S.piles[p])) return this.fail(S, 'bad pile');
+    const N = this.clone(S);
+    const card = { id: N.nextJokerId++, kind: 'joker' };
+    N.piles[p].push(card); N.jokers--; N.jokersUsed++;
+    return { ok: true, state: this.settle(N), card, pile: p };
+  },
+  tick(S, ms) {
+    if (S.status !== 'play') return S;
+    const N = { ...S, timeMs: Math.max(0, S.timeMs - ms) };
+    if (N.timeMs <= 0) { N.status = 'lost'; N.reason = 'time'; }
+    return N;
+  },
+  cleared(S) { return S.cols.every((c) => c.length === 0); },
+  hasTableauMove(S) {
+    for (let c = 0; c < S.cols.length; c++) {
+      const f = this.front(S, c);
+      if (f && (f.kind === 'key' || this.targets(S, c).length)) return true;
+    }
+    return false;
+  },
+  isStuck(S) { return !this.cleared(S) && !this.hasTableauMove(S) && S.reserve.length === 0 && S.jokers === 0; },
+  settle(N) {
+    if (this.cleared(N)) { N.status = 'won'; N.reason = ''; }
+    else if (this.isStuck(N)) { N.status = 'lost'; N.reason = 'stuck'; }
+    return N;
+  },
+  levelBonus(S) {
+    const reserve = S.reserve.length, jokers = S.jokers, seconds = Math.ceil(S.timeMs / 1000);
+    const b = { cards: S.played * this.PTS_CARD, reserve, jokers, seconds,
+      reservePts: reserve * this.PTS_RESERVE, jokerPts: jokers * this.PTS_JOKER, timePts: seconds * this.PTS_SECOND };
+    b.total = b.reservePts + b.jokerPts + b.timePts;
+    return b;
+  },
+  /** Idempotent: attaches the end-of-level bonus once. */
+  finishLevel(S) {
+    if (S.status !== 'won' || S.bonus) return S;
+    return { ...S, bonus: this.levelBonus(S) };
+  },
+  levelTotal(S) { return S.score + (S.bonus ? S.bonus.total : 0); },
+  cardLabel(c) { return !c ? '-' : c.kind === 'key' ? 'KEY' : c.kind === 'joker' ? 'JOKER' : RANKS[c.r] + SUITS[c.s]; },
+  countCards(S) {
+    const all = [...S.cols.flat(), ...S.reserve, ...S.piles.flat()];
+    return { standard: all.filter((c) => c.kind === 'card').length, keys: all.filter((c) => c.kind === 'key').length,
+      jokers: all.filter((c) => c.kind === 'joker').length, all };
+  },
+
+  /* ---------- solver bot (used by tests and checks; also proves deals are winnable) ----------
+     Fast integer simulation. At each decision it runs a budgeted DFS over sequences of tableau plays
+     (keys are always taken at once) and executes the best sequence; if nothing is playable it deals
+     from the reserve, and when the reserve is empty it places a joker on the pile that enables the
+     longest run. Returns the move list, replayable through Logic.play/dealReserve/useJoker. */
+  bot(S0, { budget = 1500 } = {}) {
+    const cols = S0.cols.map((c) => c.map((x) => (x.kind === 'key' ? 0 : x.r)));
+    const tops = [0, 1, 2].map((p) => (p >= S0.open ? -1 : (() => { const t = this.top(S0.piles[p]); return !t || t.kind === 'joker' ? 0 : t.r; })()));
+    const reserve = S0.reserve.map((x) => x.r);
+    let jokers = S0.jokers, open = S0.open;
+    const moves = [];
+    const adj = (a, b) => { const d = Math.abs(a - b); return d === 1 || d === 12; };
+    const fitsV = (r, t) => t === 0 || (t > 0 && adj(r, t));
+    const search = () => {
+      let best = { score: -1, seq: [] }, nodes = 0;
+      const seq = [];
+      const dfs = (played, keys) => {
+        nodes++;
+        let wild = 0; for (let p = 0; p < open; p++) if (tops[p] === 0) wild++;
+        const sc = played * 10 + keys * 40 + wild * 3;
+        if (sc > best.score) best = { score: sc, seq: seq.slice() };
+        if (nodes >= budget) return;
+        for (let c = 0; c < 7; c++) {                    // a key at the front is always taken first
+          const col = cols[c];
+          if (col.length && col[col.length - 1] === 0) {
+            col.pop(); const prevOpen = open;
+            if (open < 3) { tops[open] = 0; open++; }
+            seq.push({ t: 'play', col: c }); dfs(played, keys + 1); seq.pop();
+            if (open !== prevOpen) { open = prevOpen; tops[open] = -1; }
+            col.push(0);
+            return;
+          }
+        }
+        for (let c = 0; c < 7; c++) {
+          const col = cols[c]; if (!col.length) continue;
+          const r = col[col.length - 1];
+          for (let p = 0; p < open; p++) {
+            if (!fitsV(r, tops[p])) continue;
+            let dup = false; for (let q = 0; q < p; q++) if (tops[q] === tops[p]) dup = true;
+            if (dup) continue;                          // same top value: symmetric, skip
+            const pt = tops[p];
+            col.pop(); tops[p] = r; seq.push({ t: 'play', col: c, pile: p });
+            dfs(played + 1, keys);
+            seq.pop(); tops[p] = pt; col.push(r);
+            if (nodes >= budget) return;
+          }
+        }
+      };
+      dfs(0, 0);
+      return best;
+    };
+    const apply = (m) => {
+      const col = cols[m.col], r = col.pop();
+      if (r === 0) { if (open < 3) { tops[open] = 0; open++; } } else tops[m.pile] = r;
+    };
+    for (let guard = 0; guard < 2000; guard++) {
+      if (cols.every((c) => !c.length)) break;
+      const best = search();
+      if (best.seq.length) { for (const m of best.seq) { apply(m); moves.push(m); } continue; }
+      if (reserve.length) { for (let p = 0; p < open && reserve.length; p++) tops[p] = reserve.pop(); moves.push({ t: 'deal' }); continue; }
+      if (jokers > 0) {
+        let bestP = -1, bestScore = -1;
+        for (let p = 0; p < open; p++) {
+          if (tops[p] === 0) continue;
+          const keep = tops[p]; tops[p] = 0;
+          const b = search(); tops[p] = keep;
+          if (b.score > bestScore) { bestScore = b.score; bestP = p; }
+        }
+        if (bestP < 0) break;
+        tops[bestP] = 0; jokers--; moves.push({ t: 'joker', pile: bestP });
+        continue;
+      }
+      break;
+    }
+    return { won: cols.every((c) => !c.length), moves, reserveLeft: reserve.length, jokersLeft: jokers };
+  },
+  /** Replay a bot move list through the real rules. Returns the final state (or throws on an illegal move). */
+  replay(S, moves) {
+    for (const m of moves) {
+      const r = m.t === 'deal' ? this.dealReserve(S) : m.t === 'joker' ? this.useJoker(S, m.pile) : this.play(S, m.col, m.pile == null ? null : m.pile);
+      if (!r.ok) throw new Error('illegal bot move ' + JSON.stringify(m) + ': ' + r.why);
+      S = r.state;
+    }
+    return S;
+  },
+};
+
+/* ##### GAME-SPECIFIC: logic self-tests (run by verify.py via window.__game.selfTest()) ##### */
+const C = (r, s = 0, id = null) => ({ id: id == null ? 1000 + r * 4 + s : id, kind: 'card', r, s });
+const KEYC = (n = 0) => ({ id: 200 + n, kind: 'key' });
+const JK = (n = 0) => ({ id: 300 + n, kind: 'joker' });
+/** Hand-made state helper. */
+function mkState({ cols = [[], [], [], [], [], [], []], reserve = [], piles = [[C(5, 1, 900)], [], []], open = 1, jokers = 0, timeMs = 60000 } = {}) {
+  while (cols.length < 7) cols.push([]);
+  return { level: 1, cols, reserve, piles, open, jokers, jokersUsed: 0, nextJokerId: 300, timeMs, played: 0, keys: 0, score: 0, status: 'play', reason: '', bonus: null };
+}
+const TESTS = [
+  ['deck composition: 104 standard (each card exactly twice) + 2 keys, no jokers in the deal', () => {
+    for (let seed = 1; seed <= 50; seed++) {
+      for (const level of [1, 5, 10]) {
+        const S = Logic.newLevel(level, mulberry32(seed));
+        const n = Logic.countCards(S);
+        assertEq(n.standard, 104, 'standard'); assertEq(n.keys, 2, 'keys'); assertEq(n.jokers, 0, 'jokers');
+        const ids = new Set(n.all.map((c) => c.id)); assertEq(ids.size, n.all.length, 'unique ids');
+        const counts = {};
+        n.all.filter((c) => c.kind === 'card').forEach((c) => { const k = c.r + ':' + c.s; counts[k] = (counts[k] || 0) + 1; });
+        assertEq(Object.keys(counts).length, 52, 'distinct cards');
+        assert(Object.values(counts).every((v) => v === 2), 'every card exactly twice');
+      }
+    }
+  }],
+  ['level 1 deal: column sizes 10,8,6,11,14,5,13 (67), reserve 36, starter on pile 1, 1 pile open', () => {
+    const S = Logic.newLevel(1, mulberry32(7));
+    assertEq(S.cols.map((c) => c.filter((x) => x.kind === 'card').length), [10, 8, 6, 11, 14, 5, 13]);
+    assertEq(S.reserve.length, 36); assertEq(S.open, 1);
+    assertEq(S.piles.map((p) => p.length), [1, 0, 0]);
+    assertEq(S.piles[0][0].kind, 'card'); assertEq(S.jokers, 4); assertEq(S.timeMs, 420000);
+  }],
+  ['10 levels: 7 columns of 67 cards (max 14), timer 7:00 -30s/level, jokers 4,4,3,3,2,2,1,1,1,1', () => {
+    assertEq(Logic.LEVELS.length, 10);
+    for (let L = 1; L <= 10; L++) {
+      const cfg = Logic.levelConfig(L);
+      assertEq(cfg.cols.length, 7, 'cols L' + L);
+      assertEq(cfg.cols.reduce((a, b) => a + b, 0), 67, 'sum L' + L);
+      assert(Math.max(...cfg.cols) <= 14 && Math.min(...cfg.cols) >= 1, 'size range L' + L);
+      assertEq(cfg.timeMs, (420 - 30 * (L - 1)) * 1000);
+    }
+    assertEq(Logic.levelConfig(10).timeMs, 150000, 'level 10 = 2:30');
+    assertEq([1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((L) => Logic.levelConfig(L).jokers), [4, 4, 3, 3, 2, 2, 1, 1, 1, 1]);
+  }],
+  ['keys: two different columns, never front, >=1 card behind, never in reserve/piles (300 deals, all levels)', () => {
+    for (let seed = 1; seed <= 300; seed++) {
+      const S = Logic.newLevel(1 + (seed % 10), mulberry32(seed));
+      const where = [];
+      S.cols.forEach((col, c) => col.forEach((x, i) => { if (x.kind === 'key') where.push({ c, i, len: col.length }); }));
+      assertEq(where.length, 2, 'two keys in columns seed ' + seed);
+      assert(where[0].c !== where[1].c, 'different columns');
+      for (const w of where) { assert(w.len - 1 - w.i >= 2, 'at least 2 cards in front'); assert(w.i >= 1, 'at least 1 card behind'); }
+      assert(!S.reserve.some((x) => x.kind === 'key') && !S.piles.flat().some((x) => x.kind === 'key'), 'no key outside columns');
+    }
+  }],
+  ['adjacency with K-A-2 wrap both directions; suits ignored; non-neighbours rejected', () => {
+    const pile = (r) => [C(r, 0, 900)];
+    assert(Logic.fits(C(13, 1), pile(1)), 'K on A'); assert(Logic.fits(C(1, 2), pile(13)), 'A on K');
+    assert(Logic.fits(C(2, 3), pile(1)), '2 on A'); assert(Logic.fits(C(1, 0), pile(2)), 'A on 2');
+    assert(Logic.fits(C(12, 1), pile(13)), 'Q on K'); assert(Logic.fits(C(6, 0), pile(5)) && Logic.fits(C(4, 3), pile(5)), '6/4 on 5');
+    assert(!Logic.fits(C(7, 0), pile(5)), '7 on 5'); assert(!Logic.fits(C(5, 1), pile(5)), 'same rank');
+    assert(!Logic.fits(C(12, 0), pile(1)), 'Q on A'); assert(!Logic.fits(C(2, 0), pile(13)), '2 on K');
+  }],
+  ['only the front (bottom) card of a column can be played', () => {
+    const S = mkState({ cols: [[C(6, 0, 1), C(9, 0, 2)], [C(4, 2, 3)]] });
+    const r1 = Logic.playById(S, 1);
+    assert(!r1.ok, 'buried 6 must not play even though it fits'); assert(r1.state === S, 'state unchanged');
+    assert(!Logic.play(S, 0).ok, 'front 9 does not fit 5');
+    const r2 = Logic.play(S, 1); assert(r2.ok, 'front 4 fits 5');
+    assertEq(Logic.top(r2.state.piles[0]).id, 3); assertEq(r2.state.cols[1].length, 0);
+    assertEq(r2.state.score, 50); assertEq(r2.state.played, 1);
+  }],
+  ['reserve deals one card onto every open pile; partial when fewer cards than piles', () => {
+    const S = mkState({ cols: [[C(9)]], reserve: [C(1, 0, 11), C(2, 0, 12), C(3, 0, 13), C(4, 0, 14)], piles: [[C(7, 0, 900)], [], []], open: 3 });
+    const r = Logic.dealReserve(S); assert(r.ok);
+    assertEq(r.state.reserve.length, 1); assertEq(r.state.piles.map((p) => Logic.top(p).id), [14, 13, 12]);
+    const r2 = Logic.dealReserve(r.state); assert(r2.ok); assertEq(r2.dealt.length, 1);
+    assertEq(r2.state.reserve.length, 0); assertEq(Logic.top(r2.state.piles[0]).id, 11); assertEq(Logic.top(r2.state.piles[1]).id, 13);
+    const S1 = mkState({ cols: [[C(9)]], reserve: [C(1, 0, 11), C(2, 0, 12)] });
+    const r3 = Logic.dealReserve(S1); assertEq(r3.state.piles[1].length, 0, 'locked piles get nothing'); assertEq(r3.state.reserve.length, 1);
+  }],
+  ['dealing from an empty reserve does nothing', () => {
+    const S = mkState({ cols: [[C(9)]], reserve: [], jokers: 1 });
+    const r = Logic.dealReserve(S); assert(!r.ok); assert(r.state === S);
+    assertEq(S.piles[0].length, 1);
+  }],
+  ['joker: any card plays on it, then the pile top is that card (chaining)', () => {
+    const S = mkState({ cols: [[C(3, 0, 1), C(12, 0, 2), C(10, 1, 3)]], jokers: 2 });
+    assert(!Logic.play(S, 0).ok, '10 does not fit 5');
+    const j = Logic.useJoker(S, 0); assert(j.ok); assertEq(j.state.jokers, 1); assertEq(Logic.top(j.state.piles[0]).kind, 'joker');
+    assert(!Logic.useJoker(j.state, 0).ok, 'no joker on a joker');
+    const a = Logic.play(j.state, 0); assert(a.ok, '10 on joker'); assertEq(Logic.top(a.state.piles[0]).r, 10);
+    assert(!Logic.play(a.state, 0).ok, 'Q does not fit 10 (joker no longer wild)');
+    const zero = { ...S, jokers: 0 }; assert(!Logic.useJoker(zero, 0).ok, 'no jokers left');
+    assert(!Logic.useJoker(S, 1).ok, 'locked pile');
+    const empty = mkState({ cols: [[C(9)]], piles: [[C(5, 0, 900)], [], []], open: 2, jokers: 1 });
+    assert(!Logic.useJoker(empty, 1).ok, 'no joker on an empty pile');
+  }],
+  ['keys unlock piles one at a time, never more than 3 piles', () => {
+    let S = mkState({ cols: [[C(9, 0, 1), KEYC(0)], [KEYC(1)], [KEYC(2)], [C(4, 0, 4)]] });
+    let r = Logic.play(S, 0); assert(r.ok && r.key); assertEq(r.state.open, 2); assertEq(r.pile, 1); S = r.state;
+    r = Logic.play(S, 1); assertEq(r.state.open, 3); S = r.state;
+    r = Logic.play(S, 2); assert(r.ok, 'extra key still clears'); assertEq(r.state.open, 3, 'capped at 3'); assertEq(r.pile, null);
+    assertEq(r.state.score, 0, 'keys score no card points'); assertEq(r.state.keys, 3);
+  }],
+  ['a newly unlocked (empty) pile accepts any card; default target prefers a real match', () => {
+    const S = mkState({ cols: [[C(9, 0, 1)], [C(6, 0, 2)]], piles: [[C(5, 0, 900)], [], []], open: 2 });
+    assertEq(Logic.targets(S, 0), [1]); assertEq(Logic.targets(S, 1), [0, 1]);
+    assertEq(Logic.defaultTarget(S, 1), 0, 'real match first');
+    const r = Logic.play(S, 0); assert(r.ok); assertEq(r.pile, 1);
+    const S2 = mkState({ cols: [[C(6, 0, 2)]], piles: [[JK()], [C(7, 0, 901)], []], open: 2 });
+    assertEq(Logic.defaultTarget(S2, 0), 1, 'real match before joker');
+  }],
+  ['stuck detection: no move + empty reserve + no jokers = lost; otherwise not', () => {
+    const base = { cols: [[C(9, 0, 1)], [C(12, 0, 2)]] };
+    assert(Logic.isStuck(mkState(base)), 'stuck');
+    assert(!Logic.isStuck(mkState({ ...base, jokers: 1 })), 'joker left');
+    assert(!Logic.isStuck(mkState({ ...base, reserve: [C(1)] })), 'reserve left');
+    assert(!Logic.isStuck(mkState({ cols: [[C(9, 0, 1), KEYC()]] })), 'key at front is a move');
+    assert(!Logic.isStuck(mkState({ cols: [[C(9, 0, 1)]], open: 2 })), 'empty pile takes any card');
+    const r = Logic.dealReserve(mkState({ cols: [[C(9, 0, 1)], [C(12, 0, 2)]], reserve: [C(1, 0, 5)] }));
+    assertEq(r.state.status, 'lost'); assertEq(r.state.reason, 'stuck');
+    assert(!Logic.play(r.state, 0).ok && !Logic.dealReserve(r.state).ok, 'no actions after loss');
+  }],
+  ['win detection and level bonus: counted once, exact amounts', () => {
+    const S = mkState({ cols: [[C(4, 0, 1)]], reserve: [C(1, 0, 2), C(2, 0, 3), C(3, 0, 4)], jokers: 2, timeMs: 100400 });
+    const r = Logic.play(S, 0); assertEq(r.state.status, 'won');
+    const F = Logic.finishLevel(r.state);
+    assertEq(F.bonus.reservePts, 600); assertEq(F.bonus.jokerPts, 400); assertEq(F.bonus.timePts, 202); assertEq(F.bonus.total, 1202);
+    const F2 = Logic.finishLevel(F); assert(F2 === F, 'second finish is a no-op');
+    assertEq(Logic.levelTotal(F2), 50 + 1202);
+    assertEq(Logic.finishLevel(S), S, 'no bonus while still playing');
+  }],
+  ['timer: counts down, time out loses, frozen after win/loss', () => {
+    let S = mkState({ cols: [[C(9)]], reserve: [C(1)], timeMs: 1000 });
+    S = Logic.tick(S, 400); assertEq(S.timeMs, 600); assertEq(S.status, 'play');
+    S = Logic.tick(S, 700); assertEq(S.timeMs, 0); assertEq(S.status, 'lost'); assertEq(S.reason, 'time');
+    const W2 = { ...mkState(), status: 'won', timeMs: 5000 };
+    assertEq(Logic.tick(W2, 1000).timeMs, 5000, 'no ticking after win');
+  }],
+  ['logic functions never mutate their input', () => {
+    const S = Logic.newLevel(3, mulberry32(3)); S.jokers = 3;
+    const before = JSON.stringify(S);
+    Logic.dealReserve(S); Logic.useJoker(S, 0); for (let c = 0; c < 7; c++) Logic.play(S, c); Logic.tick(S, 1000);
+    Logic.bot(S, { budget: 50 });
+    assertEq(JSON.stringify(S), before);
+  }],
+  ['seeded deals are deterministic and differ between seeds', () => {
+    const a = JSON.stringify(Logic.newLevel(1, mulberry32(42))), b = JSON.stringify(Logic.newLevel(1, mulberry32(42)));
+    assertEq(a, b); assert(a !== JSON.stringify(Logic.newLevel(1, mulberry32(43))), 'different seeds differ');
+  }],
+  ['random play simulation (60 seeded games): invariants hold', () => {
+    for (let seed = 1; seed <= 60; seed++) {
+      const rng = mulberry32(seed * 7919);
+      let S = Logic.newLevel(1 + (seed % 10), mulberry32(seed));
+      for (let step = 0; step < 400 && S.status === 'play'; step++) {
+        const x = rng();
+        let r;
+        if (x < 0.6) r = Logic.play(S, Math.floor(rng() * 7), rng() < 0.5 ? null : Math.floor(rng() * 3));
+        else if (x < 0.9) r = Logic.dealReserve(S);
+        else r = Logic.useJoker(S, Math.floor(rng() * 3));
+        const prev = S; S = r.state;
+        assert(S.score >= prev.score, 'score never decreases');
+        assertEq(S.score, S.played * 50, 'score = 50 per played card');
+        const n = Logic.countCards(S);
+        assertEq(n.standard, 104, 'standard conserved');
+        assertEq(n.keys + S.keys, 2, 'keys conserved');
+        assertEq(n.jokers, S.jokersUsed, 'jokers on piles = used');
+        assert(S.open >= 1 && S.open <= 3 && S.jokers >= 0, 'bounds');
+        assert(S.status !== 'play' || Logic.hasTableauMove(S) || S.reserve.length || S.jokers, 'playing implies a possible action');
+      }
+    }
+  }],
+  ['solver bot: level 1 winnable on a good share of seeds; its moves replay legally', () => {
+    let won = 0; const N = 40;
+    for (let seed = 1; seed <= N; seed++) {
+      const S = Logic.newLevel(1, mulberry32(seed));
+      const b = Logic.bot(S, { budget: 100 });
+      if (b.won) { won++; const F = Logic.replay(S, b.moves); assertEq(F.status, 'won', 'replay wins seed ' + seed); }
+    }
+    assert(won / N >= 0.6, `level 1 bot win share ${won}/${N} below 60%`);
+  }],
+  ['level score after a bot win: 67 cards x 50 plus bonus, total recomputed not accumulated', () => {
+    let seed = 1, S, b;
+    do { S = Logic.newLevel(1, mulberry32(seed++)); b = Logic.bot(S, { budget: 100 }); } while (!b.won && seed < 50);
+    assert(b.won, 'found a winnable seed');
+    const F = Logic.finishLevel(Logic.replay(S, b.moves));
+    assertEq(F.score, 67 * 50); assertEq(F.keys, 2); assertEq(F.open, 3);
+    assertEq(Logic.levelTotal(F), 3350 + F.bonus.total);
+    assertEq(Logic.levelTotal(Logic.finishLevel(F)), Logic.levelTotal(F));
+  }],
+];
+
+/* ##### GAME-SPECIFIC: the game scene ##### */
+const CW = 92, CH = 128;                       // card size (design px)
+const TAB = { x0: 80, dx: 118, top: 176, bottom: 712 };
+const PILE_X = [980, 1090, 1200], PILE_Y = 262;
+const RES = { x: 1000, y: 470 };
+const JOKER_BTN = { x: 1160, y: 470 };
+const COL = { felt: 0x0f5a33, feltDark: 0x0a4426, navy: 0x1b2a55, gold: 0xd9b14a, red: 0xc62828, black: 0x1b1b1b };
+
+function mmss(ms) { const s = Math.ceil(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+
+/** Diagonal navy/gold lattice card back, centered on (0,0). */
+function drawCardBack(g, w = CW, h = CH) {
+  g.roundRect(-w / 2, -h / 2, w, h, 10).fill(0xffffff);
+  const ix = -w / 2 + 5, iy = -h / 2 + 5, iw = w - 10, ih = h - 10;
+  g.roundRect(ix, iy, iw, ih, 7).fill(COL.navy);
+  const step = 14;
+  for (let c = -ih; c <= iw; c += step) {            // y = x - c  (slope +1), clipped to the inner rect
+    const xa = Math.max(0, c), xb = Math.min(iw, ih + c);
+    if (xb > xa) g.moveTo(ix + xa, iy + xa - c).lineTo(ix + xb, iy + xb - c);
+  }
+  for (let c = 0; c <= iw + ih; c += step) {         // y = -x + c (slope -1)
+    const xa = Math.max(0, c - ih), xb = Math.min(iw, c);
+    if (xb > xa) g.moveTo(ix + xa, iy + c - xa).lineTo(ix + xb, iy + c - xb);
+  }
+  g.stroke({ width: 1.5, color: COL.gold, alpha: 0.8 });
+  g.roundRect(ix + 1, iy + 1, iw - 2, ih - 2, 7).stroke({ width: 2, color: COL.gold });
+}
+function drawKeyIcon(g, x, y, s = 1, color = 0x5a4108) {
+  g.circle(x - 16 * s, y, 10 * s).stroke({ width: 5 * s, color });
+  g.rect(x - 7 * s, y - 3 * s, 30 * s, 6 * s).fill(color);
+  g.rect(x + 13 * s, y + 3 * s, 5 * s, 9 * s).fill(color);
+  g.rect(x + 20 * s, y + 3 * s, 4 * s, 6 * s).fill(color);
+}
+function drawPadlock(g, x, y, color = 0xd9d4c0) {
+  g.moveTo(x - 13, y - 6).arc(x, y - 6, 13, Math.PI, 0).stroke({ width: 5, color });
+  g.roundRect(x - 19, y - 6, 38, 30, 6).fill(color);
+  g.circle(x, y + 5, 4).fill(0x333333);
+  g.rect(x - 1.5, y + 6, 3, 9).fill(0x333333);
+}
+
+class GameScene extends GameSceneBase {
+  initGame() {
+    this.Logic = Logic;                             // exposed for checks.js / play tests
+    // Pixi's ticker.deltaMS is capped at 100 ms (minFPS 10), so measure wall-clock time between frames ourselves.
+    // Gaps over 5 s (sleep/suspend without a visibilitychange) are capped so the clock never jumps.
+    this.lastClock = performance.now();
+    this.clockFn = () => { const now = performance.now(), dt = Math.min(5000, now - this.lastClock); this.lastClock = now; this.advanceClock(dt); };
+    Scenes.app.ticker.add(this.clockFn);
+    this.pileCursor = -1;
+    this.carry = 0;
+    this.moveId = 0;
+    // background: felt + vignette
+    const bg = new Graphics();
+    // (felt colour comes from the shared root background = THEME.bg; no second full-screen fill)
+    for (let i = 0; i < 4; i++) { const m = 10 + i * 20; bg.rect(m, m, W - 2 * m, H - 2 * m).stroke({ width: 20, color: 0x000000, alpha: 0.11 - i * 0.025 }); }   // soft vignette
+    bg.roundRect(900, 172, 368, 540, 18).fill({ color: 0x000000, alpha: 0.14 });
+    this.board.addChild(bg);
+    // HUD extras: level + time
+    const lvBox = makePanel(170, 96, THEME.panel, 18); lvBox.position.set(610, 80);
+    const tmBox = makePanel(200, 96, THEME.panel, 18); tmBox.position.set(820, 80);
+    const lvL = makeText('LEVEL', 20, THEME.textDim, '700'); lvL.position.set(610, 56);
+    const tmL = makeText('TIME', 20, THEME.textDim, '700'); tmL.position.set(820, 56);
+    this.levelText = makeText('1/10', 40, THEME.text, '800'); this.levelText.position.set(610, 96);
+    this.timeText = makeText('7:00', 40, THEME.accent, '800'); this.timeText.position.set(820, 96);
+    this.board.addChild(lvBox, tmBox, lvL, tmL, this.levelText, this.timeText);
+    // slots
+    this.slots = new Graphics(); this.board.addChild(this.slots);
+    this.pileLabels = PILE_X.map((x, i) => { const t = makeText('', 18, THEME.textDim, '600'); t.position.set(x, PILE_Y - CH / 2 - 16); this.board.addChild(t); return t; });
+    // reserve
+    this.reserveView = new Container();
+    const back = new Graphics(); drawCardBack(back); this.reserveView.addChild(back);
+    this.reserveView.position.set(RES.x, RES.y);
+    this.reserveCount = makeText('36', 22, THEME.text, '700'); this.reserveCount.position.set(RES.x, RES.y + CH / 2 + 20);
+    this.board.addChild(this.reserveView, this.reserveCount);
+    // joker button
+    this.jokerBtn = makeButton('Joker x4', () => this.pressJoker(), { w: 170, h: 76, size: 26 });
+    this.jokerBtn.position.set(JOKER_BTN.x, JOKER_BTN.y);
+    this.board.addChild(this.jokerBtn);
+    const hint = makeText('Play a front card one rank up/down\n(K-A wraps). Tap the deck to deal.\nKeys: ←→ ↑ column · Space deal\nJ joker · 1-3 or ←→ pick pile', 17, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: 340 });
+    hint.position.set(1084, 650);
+    this.board.addChild(hint);
+    // cards
+    this.cardLayer = new Container(); this.cardLayer.sortableChildren = true; this.board.addChild(this.cardLayer);
+    this.cursorG = new Graphics(); this.board.addChild(this.cursorG);
+    this.toast = new Container(); this.toast.position.set(460, 420); this.toast.visible = false;
+    const tp = makePanel(600, 120, 0x061f12, 24, 0.9); this.toastText = makeText('', 56, THEME.accent, '800');
+    this.toast.addChild(tp, this.toastText);
+    this.board.addChild(this.toast);
+    this.startLevel(1);
+  }
+
+  /* ---------- level lifecycle ---------- */
+  startLevel(level, seed = null) {
+    Tween.finishWithin(this.board);
+    this.seed = seed == null ? (Math.floor(Math.random() * 4294967296) >>> 0) : seed >>> 0;
+    this.S = Logic.newLevel(level, mulberry32(this.seed));
+    this.phase = 'play';
+    this.selCol = null; this.jokerMode = false; this.cursor = -1;
+    this.cardLayer.removeChildren().forEach((v) => v.destroy({ children: true }));
+    this.views = new Map();
+    this.toast.visible = false;
+    this.levelText.text = `${this.S.level}/${Logic.MAX_LEVEL}`;
+    this.lastTime = '';
+    this.updateTime();
+    this.renderTotal();
+    this.sync();
+  }
+  renderTotal() { this.setScore(this.carry + Logic.levelTotal(this.S)); }
+  updateTime() {
+    const s = mmss(this.S.timeMs);
+    if (s !== this.lastTime) { this.lastTime = s; this.timeText.text = s; this.timeText.style.fill = this.S.timeMs <= 30000 ? THEME.danger : THEME.accent; }
+  }
+  tick(_dtMs) { /* the level clock runs on real time in advanceClock(), not on the clamped frame delta */ }
+  /** Real (unclamped) ticker time; paused / level-complete / ending time is excluded. */
+  advanceClock(ms) {
+    if (this.state !== 'playing' || this.phase !== 'play' || this.overlay || !(ms > 0)) return;
+    this.S = Logic.tick(this.S, ms);
+    this.updateTime();
+    if (this.S.status === 'lost') this.lose();
+  }
+  afterAction() {
+    this.renderTotal();
+    if (this.S.status === 'won') this.levelComplete();
+    else if (this.S.status === 'lost') this.lose();
+  }
+  levelComplete() {
+    if (this.phase !== 'play') return;
+    this.phase = 'levelDone';
+    this.S = Logic.finishLevel(this.S);
+    this.renderTotal();
+    Sfx.play('win');
+    const b = this.S.bonus, last = this.S.level >= Logic.MAX_LEVEL;
+    const sub = `Cards +${b.cards}  ·  Deck ${b.reserve} left +${b.reservePts}  ·  Jokers ${b.jokers} left +${b.jokerPts}  ·  Time ${b.seconds}s +${b.timePts}`;
+    this.showOverlay(last ? 'All 10 Levels Clear!' : `Level ${this.S.level} Clear!`, [
+      [last ? 'Finish' : 'Next Level', () => this.nextLevel()],
+    ], sub);
+  }
+  nextLevel() {
+    if (this.phase !== 'levelDone' || this.state !== 'playing') return;
+    this.carry = this.score;
+    if (this.S.level >= Logic.MAX_LEVEL) { this.hideOverlay(); this.phase = 'ending'; this.endGame({ won: true, delay: 0 }); return; }
+    this.hideOverlay();
+    this.startLevel(this.S.level + 1);
+  }
+  lose() {
+    if (this.phase !== 'play') return;
+    this.phase = 'ending';
+    this.selCol = null; this.jokerMode = false; this.sync();
+    this.toastText.text = this.S.reason === 'time' ? 'Time\'s up!' : 'No moves left!';
+    this.toast.visible = true; this.toast.scale.set(0.3);
+    Tween.to(this.toast, { scale: 1 }, 300, Ease.outBack);
+    this.endGame({ won: false, delay: 1400 });
+  }
+
+  /* ---------- geometry ---------- */
+  colOff(n) { return n <= 1 ? 0 : Math.min(30, (TAB.bottom - TAB.top - CH) / (n - 1)); }
+  cardPos(c, i, n) { return { x: TAB.x0 + c * TAB.dx, y: TAB.top + CH / 2 + i * this.colOff(n) }; }
+  frontPos(c) { const n = this.S.cols[c].length; return n ? this.cardPos(c, n - 1, n) : this.cardPos(c, 0, 1); }
+  inRect(pos, x, y, w = CW, h = CH) { return Math.abs(pos.x - x) <= w / 2 && Math.abs(pos.y - y) <= h / 2; }
+  hitTest(pos) {
+    for (let c = 0; c < 7; c++) { if (!this.S.cols[c].length) continue; const f = this.frontPos(c); if (this.inRect(pos, f.x, f.y)) return { t: 'col', c }; }
+    if (this.inRect(pos, RES.x, RES.y)) return { t: 'reserve' };
+    for (let p = 0; p < 3; p++) if (this.inRect(pos, PILE_X[p], PILE_Y)) return { t: 'pile', p };
+    return null;
+  }
+
+  /* ---------- views ---------- */
+  makeCardView(card) {
+    const v = new Container(); const g = new Graphics(); v.addChild(g);
+    if (card.kind === 'card') {
+      const color = card.s === 1 || card.s === 2 ? COL.red : COL.black;
+      g.roundRect(-CW / 2, -CH / 2, CW, CH, 10).fill(0xffffff).stroke({ width: 2, color: 0x8d969e });
+      const corner = makeText(RANKS[card.r] + SUITS[card.s], 23, color, '800'); corner.anchor.set(0, 0); corner.position.set(-CW / 2 + 7, -CH / 2 + 2);
+      const mid = makeText(SUITS[card.s], 56, color, '400'); mid.position.set(0, 16);
+      const br = makeText(RANKS[card.r], 20, color, '800'); br.anchor.set(1, 1); br.position.set(CW / 2 - 7, CH / 2 - 4);
+      v.addChild(corner, mid, br);
+      v.detail = [mid, br];                       // hidden while covered in a column (less overdraw)
+    } else if (card.kind === 'key') {
+      g.roundRect(-CW / 2, -CH / 2, CW, CH, 10).fill(0xf2c94c).stroke({ width: 3, color: 0x9c7a12 });
+      g.roundRect(-CW / 2 + 5, -CH / 2 + 5, CW - 10, CH - 10, 7).stroke({ width: 1.5, color: 0x9c7a12 });
+      drawKeyIcon(g, 0, 18, 1.1);
+      const t = makeText('KEY', 22, 0x5a4108, '800'); t.anchor.set(0, 0); t.position.set(-CW / 2 + 8, -CH / 2 + 3);
+      v.addChild(t);
+    } else {
+      g.roundRect(-CW / 2, -CH / 2, CW, CH, 10).fill(0xfff6dc).stroke({ width: 3, color: 0x7b3fb5 });
+      const star = makeText('★', 58, 0x7b3fb5, '400'); star.position.set(0, 10);
+      const t = makeText('JOKER', 20, 0x7b3fb5, '800'); t.anchor.set(0, 0); t.position.set(-CW / 2 + 7, -CH / 2 + 3);
+      v.addChild(star, t);
+    }
+    v.label = 'card:' + Logic.cardLabel(card);
+    this.cardLayer.addChild(v);
+    return v;
+  }
+  cardView(card) { let v = this.views.get(card.id); if (!v || v.destroyed) { v = this.makeCardView(card); this.views.set(card.id, v); } return v; }
+  /** Rebuild every card position from logic. anim: [{ id, from:{x,y}, flip, fade }] */
+  sync(anim = []) {
+    const S = this.S, seen = new Set();
+    S.cols.forEach((col, c) => col.forEach((card, i) => {
+      const v = this.cardView(card), p = this.cardPos(c, i, col.length);
+      v.visible = true; v.alpha = 1; v.scale.set(1); v.position.set(p.x, p.y); v.zIndex = 10 + i; seen.add(card.id);
+      if (v.detail) { const show = i === col.length - 1; v.detail[0].visible = show; v.detail[1].visible = show; }
+      if (this.selCol === c && i === col.length - 1) { v.y -= 14; v.zIndex = 60; }
+    }));
+    S.piles.forEach((pile, p) => pile.forEach((card, i) => {
+      if (i < pile.length - 2) return;
+      const v = this.cardView(card); v.visible = true; v.alpha = 1; v.scale.set(1); v.position.set(PILE_X[p], PILE_Y); v.zIndex = 100 + i; seen.add(card.id);
+      if (v.detail) { v.detail[0].visible = true; v.detail[1].visible = true; }
+    }));
+    for (const [id, v] of this.views) if (!seen.has(id) && !v.destroyed) v.visible = false;
+    for (const a of anim) {
+      const v = this.views.get(a.id); if (!v || v.destroyed) continue;
+      const to = { x: v.x, y: v.y };
+      v.visible = true; v.position.set(a.from.x, a.from.y); v.zIndex = 500;
+      if (a.fade) { Tween.to(v, { x: a.to.x, y: a.to.y, alpha: 0 }, 320, Ease.inOutQuad).then(() => { if (!v.destroyed && !seen.has(a.id)) v.visible = false; }); continue; }
+      Tween.to(v, { x: to.x, y: to.y }, 180, Ease.outCubic);
+      if (a.flip) {
+        v.scale.x = 0;
+        const proxy = { parent: v, get destroyed() { return v.destroyed; }, get sx() { return v.destroyed ? 1 : v.scale.x; }, set sx(val) { if (!v.destroyed) v.scale.x = val; } };
+        Tween.to(proxy, { sx: 1 }, 180, Ease.outQuad);
+      }
+    }
+    // slots
+    const g = this.slots; g.clear();
+    for (let c = 0; c < 7; c++) g.roundRect(TAB.x0 + c * TAB.dx - CW / 2, TAB.top, CW, CH, 10).stroke({ width: 2, color: 0xffffff, alpha: 0.12 });
+    const targets = this.selCol != null ? Logic.targets(S, this.selCol) : [];
+    const jp = this.jokerMode ? Logic.jokerPiles(S) : [];
+    for (let p = 0; p < 3; p++) {
+      const x = PILE_X[p] - CW / 2, y = PILE_Y - CH / 2;
+      if (p < S.open) {
+        g.roundRect(x, y, CW, CH, 10).fill({ color: 0x000000, alpha: 0.18 }).stroke({ width: 2, color: 0xffffff, alpha: 0.35 });
+        if (targets.includes(p) || jp.includes(p)) g.roundRect(x - 6, y - 6, CW + 12, CH + 12, 14).stroke({ width: 4, color: THEME.accent });
+        if (p === this.pileCursor && (targets.includes(p) || jp.includes(p))) g.roundRect(x - 12, y - 12, CW + 24, CH + 24, 18).stroke({ width: 3, color: 0xffffff });   // keyboard pile choice
+      } else {
+        g.roundRect(x, y, CW, CH, 10).fill({ color: 0x000000, alpha: 0.35 }).stroke({ width: 2, color: 0x000000, alpha: 0.4 });
+        drawPadlock(g, PILE_X[p], PILE_Y);
+      }
+      const lbl = p < S.open ? (S.piles[p].length ? '' : 'ANY CARD') : 'LOCKED';
+      if (this.pileLabels[p].text !== lbl) this.pileLabels[p].text = lbl;
+    }
+    if (!S.reserve.length) g.roundRect(RES.x - CW / 2, RES.y - CH / 2, CW, CH, 10).stroke({ width: 2, color: 0xffffff, alpha: 0.25 });
+    this.reserveView.visible = S.reserve.length > 0;
+    const rc = S.reserve.length ? `Deck: ${S.reserve.length}` : 'Deck empty';
+    if (this.reserveCount.text !== rc) this.reserveCount.text = rc;
+    const jl = this.jokerMode ? 'Pick a pile' : `Joker x${S.jokers}`;
+    if (this.jokerBtn.btnText !== jl) this.jokerBtn.setText(jl);
+    this.jokerBtn.alpha = S.jokers > 0 ? 1 : 0.45;
+    // keyboard cursor
+    this.cursorG.clear();
+    if (this.cursor >= 0) {
+      const x = TAB.x0 + this.cursor * TAB.dx;
+      this.cursorG.poly([x - 14, TAB.top - 14, x + 14, TAB.top - 14, x, TAB.top - 2]).fill(THEME.accent);
+    }
+  }
+  shake(v) { if (!v || v.destroyed) return; Tween.to(v, { x: v.x + 9 }, 220, (t) => Math.sin(Math.PI * 4 * t) * (1 - t)); Sfx.play('hit'); }
+
+  /* ---------- actions (also called directly by checks.js / play tests) ---------- */
+  cleanup() { if (this.clockFn) Scenes.app.ticker.remove(this.clockFn); this.clockFn = null; }
+  /** Piles the current selection (card or joker) can go to. */
+  pileTargets() { return this.jokerMode ? Logic.jokerPiles(this.S) : this.selCol != null ? Logic.targets(this.S, this.selCol) : []; }
+  canAct() { return this.state === 'playing' && this.phase === 'play' && !this.overlay; }
+  tapColumn(c, fromKey = false) {
+    if (!this.canAct()) return false;
+    Tween.finishWithin(this.board);
+    this.jokerMode = false;
+    const f = Logic.front(this.S, c);
+    if (!f) { this.selCol = null; this.sync(); return false; }
+    if (f.kind === 'key') return this.doPlay(c, null);
+    const t = Logic.targets(this.S, c);
+    if (!t.length) { this.selCol = null; this.sync(); this.shake(this.views.get(f.id)); return false; }
+    if (t.length >= 2 && this.selCol !== c) { this.selCol = c; this.pileCursor = Logic.defaultTarget(this.S, c); this.sync(); Sfx.play('click'); return 'select'; }
+    return this.doPlay(c, null);
+  }
+  tapPile(p) {
+    if (!this.canAct()) return false;
+    Tween.finishWithin(this.board);
+    if (this.jokerMode) return this.doJoker(p);
+    if (this.selCol != null && Logic.targets(this.S, this.selCol).includes(p)) return this.doPlay(this.selCol, p);
+    this.selCol = null; this.sync();
+    return false;
+  }
+  tapReserve() {
+    if (!this.canAct()) return false;
+    Tween.finishWithin(this.board);
+    this.selCol = null; this.jokerMode = false;
+    const r = Logic.dealReserve(this.S);
+    if (!r.ok) { this.sync(); this.shake(this.reserveView); return false; }
+    this.S = r.state;
+    this.sync(r.dealt.map((d) => ({ id: d.card.id, from: { x: RES.x, y: RES.y }, flip: true })));
+    Sfx.play('move');
+    this.afterAction();
+    return true;
+  }
+  pressJoker() {
+    if (!this.canAct()) return false;
+    Tween.finishWithin(this.board);
+    this.selCol = null;
+    const piles = Logic.jokerPiles(this.S);
+    if (this.S.jokers <= 0 || !piles.length) { this.jokerMode = false; this.sync(); this.shake(this.jokerBtn); return false; }
+    if (piles.length === 1) return this.doJoker(piles[0]);
+    this.jokerMode = !this.jokerMode;
+    this.pileCursor = piles[0];
+    this.sync();
+    return 'select';
+  }
+  doJoker(p) {
+    const r = Logic.useJoker(this.S, p);
+    this.jokerMode = false;
+    if (!r.ok) { this.sync(); return false; }
+    this.S = r.state;
+    this.sync([{ id: r.card.id, from: { x: JOKER_BTN.x, y: JOKER_BTN.y }, flip: true }]);
+    Sfx.play('move');
+    this.afterAction();
+    return true;
+  }
+  doPlay(c, p) {
+    const f = Logic.front(this.S, c);
+    const fromV = f && this.views.get(f.id);
+    const from = fromV ? { x: fromV.x, y: fromV.y } : this.frontPos(c);
+    const r = Logic.play(this.S, c, p);
+    this.selCol = null;
+    if (!r.ok) { this.sync(); return false; }
+    this.S = r.state;
+    if (r.key) {
+      const tp = r.pile != null ? { x: PILE_X[r.pile], y: PILE_Y } : { x: RES.x, y: RES.y };
+      this.sync([{ id: r.card.id, from, fade: true, to: tp }]);
+      Sfx.play('score');
+    } else {
+      this.sync([{ id: r.card.id, from }]);
+      Sfx.play('move');
+    }
+    this.afterAction();
+    return true;
+  }
+  handleInput(a, source, pos) {
+    if (!this.canAct()) return;
+    if (source === 'swipe') return;                    // swipes are ignored: a stray swipe must never deal a card
+    if (a === 'tap' && pos) {
+      const h = this.hitTest(pos);
+      if (!h) { if (this.selCol != null || this.jokerMode) { this.selCol = null; this.jokerMode = false; this.sync(); } return; }
+      if (h.t === 'col') this.tapColumn(h.c);
+      else if (h.t === 'reserve') this.tapReserve();
+      else this.tapPile(h.p);
+      return;
+    }
+    if (a === 'joker') { this.pressJoker(); return; }
+    if (a === 'pile1' || a === 'pile2' || a === 'pile3') {
+      const p = +a.slice(4) - 1;
+      if (this.jokerMode || this.selCol != null) { this.tapPile(p); return; }
+      if (this.cursor >= 0 && Logic.targets(this.S, this.cursor).includes(p)) { Tween.finishWithin(this.board); this.doPlay(this.cursor, p); }
+      return;
+    }
+    const pt = this.pileTargets();
+    if (pt.length && (a === 'left' || a === 'right')) {          // choose the target pile of the selected card / joker
+      const d = a === 'left' ? -1 : 1;
+      let i = pt.indexOf(this.pileCursor); i = i < 0 ? 0 : (i + d + pt.length) % pt.length;
+      this.pileCursor = pt[i]; this.sync(); return;
+    }
+    if (pt.length && (a === 'up' || a === 'confirm')) { this.tapPile(pt.includes(this.pileCursor) ? this.pileCursor : pt[0]); return; }
+    if (a === 'left' || a === 'right') {
+      const d = a === 'left' ? -1 : 1;
+      let c = this.cursor < 0 ? (d > 0 ? -1 : 7) : this.cursor;
+      for (let k = 0; k < 7; k++) { c = (c + d + 7) % 7; if (this.S.cols[c].length) break; }
+      this.cursor = c; this.sync();
+    } else if (a === 'up' || a === 'confirm') {
+      if (this.cursor < 0) { this.cursor = this.S.cols.findIndex((col) => col.length); this.sync(); return; }
+      this.tapColumn(this.cursor, true);
+    } else if (a === 'action' || a === 'down') this.tapReserve();
+  }
+  debugState() {
+    const S = this.S;
+    return { ...super.debugState(), level: S.level, phase: this.phase, status: S.status, reason: S.reason, seed: this.seed,
+      timeMs: S.timeMs, open: S.open, jokers: S.jokers, reserve: S.reserve.length, carry: this.carry,
+      levelScore: S.score, bonus: S.bonus, played: S.played, keys: S.keys, selCol: this.selCol, jokerMode: this.jokerMode,
+      cols: S.cols.map((c) => c.map((x) => Logic.cardLabel(x))),
+      piles: S.piles.map((p, i) => (i < S.open ? Logic.cardLabel(Logic.top(p)) : 'locked')) };
+  }
+}
+/* ##### END GAME-SPECIFIC ##### */
+
+/* ---------- test helpers ---------- */
+function assert(cond, msg = 'assertion failed') { if (!cond) throw new Error(msg); }
+function assertEq(a, b, msg = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg} expected ${B} got ${A}`); }
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const app = new Application();
+  await app.init({
+    resizeTo: window,
+    background: THEME.outerBg,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preference: 'webgl',
+  });
+  document.getElementById('app').appendChild(app.canvas);
+
+  const root = new Container(); root.label = 'root';
+  root.addChild(makeBackground());
+  const sceneLayer = new Container(); sceneLayer.label = 'scenes';
+  root.addChild(sceneLayer);
+  app.stage.addChild(root);
+
+  const mask = new Graphics(); mask.rect(0, 0, W, H).fill(0xffffff);
+  root.addChild(mask); root.mask = mask;       // nothing draws outside the play area
+
+  function layout() {
+    const sw = app.screen.width, sh = app.screen.height;
+    const s = Math.min(sw / W, sh / H);
+    root.scale.set(s);
+    root.position.set(Math.round((sw - W * s) / 2), Math.round((sh - H * s) / 2));
+    app.stage.hitArea = app.screen;
+  }
+  layout();
+  window.addEventListener('resize', () => requestAnimationFrame(() => { app.resize(); layout(); }));
+
+  Scenes.app = app; Scenes.root = sceneLayer;
+  Scenes.register('menu', MenuScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+
+  Input.init();
+  initSwipe(app, root);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden(); });
+
+  app.ticker.add((ticker) => {
+    const dt = Math.min(ticker.deltaMS, 50);  // clamp: no huge jumps after tab switch
+    Tween.update(dt);
+    Scenes.current?.update(dt);
+  });
+
+  await Scenes.go('menu');
+
+  /* test hook used by scripts/verify.py (harmless in production) */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },          // for checks.js: direct access to the live scene (set up boards, read fields)
+    inputStats() { return { ...Scenes.inputStats }; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    boardObjects() { const b = Scenes.current?.board; let n = 0; const walk = (c) => { if (!c.visible) return; n++; c.children.forEach(walk); }; if (b) walk(b); return n - (b ? 1 : 0); },
+    buttons() {
+      const out = [];
+      const walk = (c) => {
+        if (!c.visible || c.destroyed) return;
+        if (c.isButton) { const p = c.getGlobalPosition(); out.push({ label: c.btnText, x: p.x, y: p.y }); }
+        for (const ch of c.children) walk(ch);
+      };
+      walk(app.stage);
+      return out;
+    },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endGame) { s.endGame({ delay: 0 }); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+  };
+})().catch((e) => showFatal(e.message || String(e)));
+</script>
+</body>
+</html>

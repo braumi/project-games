@@ -1,0 +1,1627 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Marble Chain</title><!-- GAME-SPECIFIC: set to CONFIG.title (galleries read this tag) -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14121f; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #fatal { position: fixed; inset: auto 12px 12px 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fatal"></div>
+<script type="module">
+/* =====================================================================
+   PIXIJS GAME SHELL (PixiJS v8, single file, no build step)
+   Sections marked  ##### GAME-SPECIFIC #####  are the only parts that
+   change per game. Everything else is the tested framework:
+   scenes, menu, pause, game over, play again, high scores, sound,
+   input (keys + swipe + tap), tweens, responsive scaling, test hook.
+   ===================================================================== */
+import { Application, Container, Graphics, GraphicsContext, Text, Rectangle } from '/vendor/pixi.min.mjs';
+
+/* ---------- fatal error overlay (never a silent blank screen) ---------- */
+const fatalBox = document.getElementById('fatal');
+function showFatal(msg) { fatalBox.style.display = 'block'; fatalBox.textContent = 'Error: ' + msg; }
+window.addEventListener('error', (e) => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ##### GAME-SPECIFIC: CONFIG ##### */
+const CONFIG = {
+  id: 'marble-chain',          // unique per game: namespaces saved scores
+  title: 'Marble Chain',
+  subtitle: 'Pop the marbles before they roll in',
+  width: 1280, height: 720,    // design resolution (portrait). Landscape games: 1280 x 720
+  maxHighScores: 10,
+  keyRepeat: false,            // true for continuous-movement games (e.g. paddle), false for turn/grid games
+  scoreLabel: 'Score',
+  lowerIsBetter: false,        // true for time-based games (fastest time wins)
+};
+const THEME = {
+  outerBg: 0x1a130b,           // letterbox color outside the play area
+  bg: 0x3b2c1b,                // play-area background (dark temple stone)
+  panel: 0x4f3b24,
+  primary: 0xc8872e,
+  primaryHover: 0xdb9a3f,
+  secondary: 0x6a5134,
+  secondaryHover: 0x7d6143,
+  danger: 0xd9534f,
+  text: 0xfff6e6,
+  textDim: 0xd8c3a0,
+  accent: 0xffd166,
+  font: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+};
+/* Optional hooks, filled in the GAME-SPECIFIC scene section AFTER your classes are defined:
+     GAME_HOOKS.menuButtons.push(['Levels', () => Scenes.go('levels')]);   // extra menu buttons (between Play and High Scores)
+     GAME_HOOKS.scenes.levels = LevelSelectScene;                          // extra scenes, registered at boot
+   GameScene may define gameOverData() { return { extraLine: 'Gold medal' }; } to add a line to the Game Over screen. */
+const GAME_HOOKS = { menuButtons: [], scenes: {} };
+/* ##### END CONFIG ##### */
+
+const W = CONFIG.width, H = CONFIG.height;
+const LAND = W > H;   // landscape layout for the shared screens
+
+/* ---------- safe storage (localStorage may throw: private mode, sandboxed iframes) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fallback = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fallback : JSON.parse(raw); }
+      catch { return fallback; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+/* ---------- high scores ---------- */
+const HighScores = {
+  list() {
+    const l = Store.get('highscores', []);
+    return Array.isArray(l) ? l.filter((e) => e && Number.isFinite(e.score)) : [];
+  },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  better(a, b) { return CONFIG.lowerIsBetter ? a < b : a > b; },
+  /** Adds a score. Returns { rank (1-based or 0 if not ranked), isBest }. */
+  add(score) {
+    if (!Number.isFinite(score) || (!CONFIG.lowerIsBetter && score <= 0)) return { rank: 0, isBest: false };
+    const prevBest = this.list()[0];
+    const entry = { score, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list();
+    l.push(entry);
+    l.sort((a, b) => (CONFIG.lowerIsBetter ? a.score - b.score : b.score - a.score) || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    const isBest = rank === 1 && (!prevBest || this.better(score, prevBest.score));
+    return { rank, isBest };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* ---------- sound (WebAudio synth: no asset files needed) ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'move': this.tone(300, 0.04, 'sine', 0.06); break;
+      case 'score': this.tone(880, 0.07, 'triangle', 0.12, 1320); break;
+      case 'merge': this.tone(520, 0.09, 'sine', 0.12, 780); break;
+      case 'hit': this.tone(180, 0.08, 'square', 0.08); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.14, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- tweens (driven by app.ticker; promise-based; safe on destroyed targets) ---------- */
+const Ease = {
+  linear: (t) => t,
+  outQuad: (t) => 1 - (1 - t) * (1 - t),
+  outCubic: (t) => 1 - Math.pow(1 - t, 3),
+  inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  outBack: (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const Tween = {
+  active: new Set(),
+  /** props: numeric fields of target; 'scale' sets scale.x and scale.y together. */
+  to(target, props, ms = 200, ease = Ease.outCubic) {
+    return new Promise((resolve) => {
+      const from = {};
+      for (const k of Object.keys(props)) from[k] = k === 'scale' ? target.scale.x : target[k];
+      const tw = { target, props, from, ms: Math.max(1, ms), t: 0, ease, resolve };
+      this.active.add(tw);
+    });
+  },
+  apply(tw, p) {
+    const e = tw.ease(p);
+    for (const k of Object.keys(tw.props)) {
+      const v = tw.from[k] + (tw.props[k] - tw.from[k]) * e;
+      if (k === 'scale') tw.target.scale.set(v); else tw.target[k] = v;
+    }
+  },
+  update(dtMs) {
+    for (const tw of [...this.active]) {
+      if (tw.target.destroyed) { this.active.delete(tw); tw.resolve(); continue; }
+      tw.t += dtMs;
+      const p = Math.min(1, tw.t / tw.ms);
+      this.apply(tw, p);
+      if (p >= 1) { this.active.delete(tw); tw.resolve(); }
+    }
+  },
+  /** Jump every running tween (optionally only one target's) to its end state. */
+  finish(target = null) {
+    for (const tw of [...this.active]) {
+      if (target && tw.target !== target) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  /** Scale up to `peak` and back (merge/score pop). */
+  pop(target, peak = 1.15, ms = 140) {
+    const base = target.scale.x;
+    return this.to(target, { scale: base * peak }, ms, (t) => Math.sin(Math.PI * t));   // up and back in one tween; finishing lands on base
+  },
+  /** Finish only tweens whose target is `container` or inside it (e.g. this.board). Prefer this over finish(). */
+  finishWithin(container) {
+    for (const tw of [...this.active]) {
+      let n = tw.target, inside = false;
+      while (n) { if (n === container) { inside = true; break; } n = n.parent; }
+      if (!inside && !tw.target.destroyed) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  kill(target) { for (const tw of [...this.active]) if (tw.target === target) { this.active.delete(tw); tw.resolve(); } },
+  get busy() { return this.active.size > 0; },
+};
+
+/* ---------- UI helpers ---------- */
+function makeText(text, size = 32, color = THEME.text, weight = '600', extra = {}) {
+  const t = new Text({ text: String(text), style: { fontFamily: THEME.font, fontSize: size, fill: color, fontWeight: weight, align: 'center', ...extra } });
+  t.anchor.set(0.5);
+  return t;
+}
+/** Shrink a Text uniformly so it fits maxW (and optional maxH). Call after setting .text. */
+function fitText(t, maxW, maxH = Infinity) {
+  t.scale.set(1);
+  const s = Math.min(1, maxW / Math.max(1, t.width), maxH / Math.max(1, t.height));
+  t.scale.set(s);
+  return t;
+}
+function makePanel(w, h, color = THEME.panel, radius = 24, alpha = 1) {
+  const g = new Graphics();
+  g.roundRect(-w / 2, -h / 2, w, h, radius).fill({ color, alpha });
+  return g;
+}
+function makeButton(label, onTap, opts = {}) {
+  const { w = 360, h = 88, size = 34, variant = 'primary' } = opts;
+  const base = variant === 'primary' ? THEME.primary : variant === 'danger' ? THEME.danger : THEME.secondary;
+  const hover = variant === 'primary' ? THEME.primaryHover : variant === 'danger' ? 0xff7a93 : THEME.secondaryHover;
+  const c = new Container();
+  c.isButton = true;
+  c.label = 'button:' + label;
+  const bg = new Graphics();
+  const draw = (col) => { bg.clear(); bg.roundRect(-w / 2, -h / 2, w, h, Math.min(28, h / 2)).fill(col); };
+  draw(base);
+  const t = makeText(label, size, THEME.text, '700');
+  c.addChild(bg, t);
+  c.eventMode = 'static';
+  c.cursor = 'pointer';
+  c.hitArea = new Rectangle(-w / 2, -h / 2, w, h);
+  c.on('pointerover', () => { draw(hover); c.scale.set(1.03); });
+  c.on('pointerout', () => { draw(base); c.scale.set(1); });
+  c.on('pointerdown', () => c.scale.set(0.96));
+  c.on('pointerup', () => c.scale.set(1.03));
+  c.on('pointerupoutside', () => { draw(base); c.scale.set(1); });
+  c.on('pointertap', (e) => {
+    e.stopPropagation();
+    if (Scenes.busy || c.disabled) return;
+    Sfx.unlock(); Sfx.play('click');
+    onTap(e);
+  });
+  c.setText = (s) => { t.text = String(s); c.btnText = String(s); };
+  c.btnText = label;
+  return c;
+}
+/** Vertical stack of buttons centered at (x, y). */
+function buttonColumn(defs, x, y, gap = 24, opts = {}) {
+  const col = new Container();
+  const h = opts.h || 88;
+  defs.forEach(([label, fn, o], i) => {
+    const b = makeButton(label, fn, { ...opts, ...(o || {}) });
+    b.position.set(0, i * (h + gap));
+    col.addChild(b);
+  });
+  col.position.set(x, y);
+  return col;
+}
+
+/* ---------- input: keyboard + swipe + actions ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'action', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();                       // stop arrows/space scrolling the page
+      Sfx.unlock();
+      const wasHeld = this.held.has(a);
+      this.held.add(a);
+      if (e.repeat && !CONFIG.keyRepeat) return;
+      if (wasHeld && !e.repeat) return;
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+  },
+  isDown(a) { return this.held.has(a); },
+};
+/** Swipe detection on the whole screen (stage hitArea = app.screen). */
+function initSwipe(app, root) {
+  let start = null;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointerdown', (e) => {
+    Sfx.unlock(); start = { x: e.global.x, y: e.global.y, t: performance.now() };
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+    const p = root.toLocal(e.global);
+    Scenes.dispatch('press', 'pointer', { x: p.x, y: p.y });   // instant: use for flap/jump/shoot games
+  });
+  const end = (e) => {
+    if (!start) return;
+    const dx = (e.global.x - start.x) / root.scale.x, dy = (e.global.y - start.y) / root.scale.y;
+    const dt = performance.now() - start.t;
+    start = null;
+    const dist = Math.hypot(dx, dy);
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }   // presses on buttons are not game input
+    if (dist < 25 && dt < 500) {               // a tap anywhere: 'tap' action with design-space position
+      const p = root.toLocal(e.global);
+      Scenes.dispatch('tap', 'pointer', { x: p.x, y: p.y });
+      return;
+    }
+    if (dist < 40 || dt > 1000) return;         // design-space pixels; ignore slow drags
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    Scenes.dispatch(dir, 'swipe');
+  };
+  app.stage.on('pointerup', end);
+  app.stage.on('pointerupoutside', end);
+}
+
+/* ---------- scenes ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.view = new Container(); this.view.label = 'scene:' + name; }
+  enter(_data) {}
+  exit() {}
+  update(_dtMs) {}
+  onAction(_action, _source, _pos) {}
+  onHidden() {}
+}
+const Scenes = {
+  app: null, root: null, current: null, busy: false, registry: {},
+  register(name, cls) { this.registry[name] = cls; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const old = this.current;
+      if (old) {
+        await Tween.to(old.view, { alpha: 0 }, 140);
+        old.exit();
+        Tween.kill(old.view);
+        this.root.removeChild(old.view);
+        old.view.destroy({ children: true });
+      }
+      const Cls = this.registry[name];
+      const scene = new Cls(name);
+      this.current = scene;
+      scene.view.alpha = 0;
+      this.root.addChild(scene.view);
+      scene.enter(data);
+      await Tween.to(scene.view, { alpha: 1 }, 160);
+    } finally {
+      this.busy = false;
+    }
+  },
+  inputStats: {},
+  dispatch(action, source, pos = null) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, pos);
+  },
+};
+
+/* ---------- shared background ---------- */
+function makeBackground() {
+  const g = new Graphics();
+  g.rect(0, 0, W, H).fill(THEME.bg);
+  return g;
+}
+function soundLabel() { return Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+
+/* ---------- Menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    // Portrait: one centered column. Landscape (W > H): text on the left, buttons on the right.
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const ty = LAND ? H * 0.34 : H * 0.24;
+    const title = makeText(CONFIG.title, 96, THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, ty);
+    const sub = makeText(CONFIG.subtitle, 30, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: textW - 40 });
+    fitText(sub, textW - 40, 80);
+    sub.position.set(cx, ty + 90);
+    const best = HighScores.best();
+    const bestT = makeText(best ? `Best: ${formatScore(best)}` : 'No high score yet', 32, THEME.accent, '700');
+    bestT.position.set(cx, ty + 160);
+    const defs = [
+      ['Play', () => Scenes.go('game')],
+      ...GAME_HOOKS.menuButtons.map(([label, fn]) => [label, fn, { variant: 'secondary' }]),
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      [soundLabel(), () => { Sfx.setMuted(!Sfx.muted); this.onMuteChanged(); }, { variant: 'secondary' }],
+    ];
+    const bh = defs.length > 4 ? 76 : 88, gap = defs.length > 4 ? 18 : 24;
+    const colH = defs.length * bh + (defs.length - 1) * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.min(H * 0.55, H - 150 - colH + bh / 2);
+    const col = buttonColumn(defs, LAND ? W * 0.72 : W / 2, colTop, gap, { h: bh });
+    this.soundBtn = col.children[col.children.length - 1];
+    const hint = makeText('Enter to play  ·  M to mute', 24, THEME.textDim, '500');
+    hint.position.set(cx, H - 60);
+    this.view.addChild(title, sub, bestT, col, hint);
+  }
+  onMuteChanged() { this.soundBtn?.setText(soundLabel()); }
+  onAction(a) { if (a === 'confirm' || a === 'action') Scenes.go('game'); }
+}
+
+/* ---------- High scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const top = LAND ? 70 : 150;
+    const title = makeText('High Scores', LAND ? 60 : 72, THEME.text, '800');
+    title.position.set(W / 2, top);
+    const rowH = LAND ? 52 : 64;
+    const panelTop = top + (LAND ? 60 : 100);
+    const room = Math.floor((H - panelTop - 200) / rowH);             // rows that fit above the Back button
+    const rows = Math.max(3, Math.min(CONFIG.maxHighScores, room));
+    const panelW = LAND ? Math.min(W - 120, 760) : W - 120;
+    const panelH = 60 + rows * rowH;
+    const panel = makePanel(panelW, panelH);
+    panel.position.set(W / 2, panelTop + panelH / 2);
+    this.view.addChild(title, panel);
+    const list = HighScores.list().slice(0, rows);
+    if (!list.length) {
+      const none = makeText('No scores yet. Go play!', 34, THEME.textDim, '500');
+      none.position.set(W / 2, panelTop + panelH / 2);
+      this.view.addChild(none);
+    }
+    const left = W / 2 - panelW / 2 + 50, right = W / 2 + panelW / 2 - 50;
+    list.forEach((e, i) => {
+      const y = panelTop + 30 + rowH / 2 + i * rowH;
+      const color = i === 0 ? THEME.accent : THEME.text;
+      const r = makeText(`${i + 1}.`, 32, color, '700'); r.anchor.set(0, 0.5); r.position.set(left, y);
+      const sc = makeText(formatScore(e.score), 32, color, '700'); sc.position.set(W / 2, y);
+      const d = makeText(e.date || '', 22, THEME.textDim, '500'); d.anchor.set(1, 0.5); d.position.set(right, y);
+      this.view.addChild(r, sc, d);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, Math.min(H - 70, panelTop + panelH + 90));
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- Game over ---------- */
+class GameOverScene extends Scene {
+  /** data: { score, rank, isBest, won, extraLine? } — extraLine comes from GameScene.gameOverData() (e.g. "Gold medal"). */
+  enter({ score = 0, rank = 0, isBest = false, won = false, extraLine = '' } = {}) {
+    this.score = score;
+    this.enteredAt = performance.now();
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const y0 = LAND ? H * 0.2 : H * 0.2;
+    const title = makeText(won ? 'You Win!' : 'Game Over', 92, won ? THEME.accent : THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, y0);
+    const label = makeText(CONFIG.scoreLabel, 30, THEME.textDim, '600');
+    label.position.set(cx, y0 + 100);
+    const sc = makeText(formatScore(score), 110, THEME.text, '800');
+    fitText(sc, textW);
+    sc.position.set(cx, y0 + 185);
+    const bestLine = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${formatScore(HighScores.best())}`;
+    const b = makeText(bestLine, 36, isBest ? THEME.accent : THEME.textDim, '700');
+    b.position.set(cx, y0 + 275);
+    this.view.addChild(title, label, sc, b);
+    if (extraLine) {
+      const ex = makeText(extraLine, 30, THEME.text, '600', { wordWrap: true, wordWrapWidth: textW });
+      fitText(ex, textW, 80);
+      ex.position.set(cx, y0 + 330);
+      this.view.addChild(ex);
+    }
+    const bh = 88, gap = 24, colH = 3 * bh + 2 * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.max(y0 + (extraLine ? 420 : 370), H - 140 - colH + bh / 2);
+    const col = buttonColumn([
+      ['Play Again', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], LAND ? W * 0.72 : W / 2, colTop, gap);
+    this.view.addChild(col);
+    if (isBest) { b.scale.set(0.2); Tween.to(b, { scale: 1 }, 450, Ease.outBack); }
+  }
+  onAction(a) {
+    if (performance.now() - this.enteredAt < 800) return;   // grace period: a late Space/tap from the game must not skip this screen
+    if (a === 'confirm' || a === 'restart') Scenes.go('game'); else if (a === 'pause') Scenes.go('menu');
+  }
+}
+
+/* ---------- Game scene: framework part (HUD, pause, end) ---------- */
+class GameSceneBase extends Scene {
+  enter() {
+    this.score = 0;
+    this.state = 'playing';              // 'playing' | 'paused' | 'over'
+    this.board = new Container();        // put all game visuals in here
+    this.board.label = 'board';
+    this.hud = new Container();
+    this.overlay = null;
+    this.view.addChild(this.board, this.hud);
+    this.buildHud();
+    this.initGame();
+    this.renderScore();
+  }
+  buildHud() {
+    const scoreBox = makePanel(220, 96, THEME.panel, 18); scoreBox.position.set(150, 80);
+    const bestBox = makePanel(220, 96, THEME.panel, 18); bestBox.position.set(390, 80);
+    const sl = makeText(CONFIG.scoreLabel.toUpperCase(), 20, THEME.textDim, '700'); sl.position.set(150, 56);
+    const bl = makeText('BEST', 20, THEME.textDim, '700'); bl.position.set(390, 56);
+    this.scoreText = makeText('0', 40, THEME.text, '800'); this.scoreText.position.set(150, 96);
+    this.bestText = makeText(formatScore(HighScores.best()), 40, THEME.text, '800'); this.bestText.position.set(390, 96);
+    const pause = makeButton('II', () => this.togglePause(), { w: 96, h: 96, size: 34, variant: 'secondary' });
+    pause.label = 'button:Pause';
+    pause.position.set(W - 90, 80);
+    this.hud.addChild(scoreBox, bestBox, sl, bl, this.scoreText, this.bestText, pause);
+  }
+  addScore(n) {
+    if (this.state === 'over') return;
+    this.score += n;
+    this.renderScore();
+  }
+  setScore(n) { this.score = n; this.renderScore(); }
+  renderScore() {
+    this.scoreText.text = formatScore(this.score);
+    const best = HighScores.best();
+    const shown = CONFIG.lowerIsBetter ? best : Math.max(best, this.score);
+    this.bestText.text = formatScore(shown);
+  }
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedOverlay = this.overlay;               // keep e.g. a win overlay underneath; restored on resume
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => this.restart(), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ]);
+  }
+  resume() {
+    this.hideOverlay();
+    if (this.savedOverlay && !this.savedOverlay.destroyed) { this.savedOverlay.visible = true; this.overlay = this.savedOverlay; }
+    this.savedOverlay = null;
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  showOverlay(title, buttons, subtitle = '') {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.6 });
+    dim.eventMode = 'static';                         // swallow clicks to the game underneath
+    dim.on('pointertap', (e) => e.stopPropagation());
+    const panelH = 218 + buttons.length * 112 + (subtitle ? 40 : 0);
+    const panel = makePanel(W - 140, panelH); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 64, THEME.text, '800'); fitText(t, W - 220); t.position.set(W / 2, H / 2 - panelH / 2 + 90);
+    o.addChild(dim, panel, t);
+    if (subtitle) { const s = makeText(subtitle, 28, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 220 }); s.position.set(W / 2, t.y + 70); o.addChild(s); }
+    const col = buttonColumn(buttons, W / 2, t.y + (subtitle ? 180 : 140));
+    o.addChild(col);
+    this.overlay = o;
+    this.view.addChild(o);
+  }
+  hideOverlay() { if (this.overlay) { this.overlay.destroy({ children: true }); this.overlay = null; } }
+  hideAllOverlays() { this.hideOverlay(); if (this.savedOverlay) { this.savedOverlay.destroy({ children: true }); this.savedOverlay = null; } }
+  /** Call exactly when the game ends. Idempotent. */
+  endGame({ won = false, delay = 500 } = {}) {
+    if (this.state === 'over') return;
+    this.state = 'over';
+    this.hideAllOverlays();
+    Sfx.play(won ? 'win' : 'lose');
+    const { rank, isBest } = HighScores.add(this.score);
+    const score = this.score;
+    const extra = this.gameOverData?.() || {};      // optional: return { extraLine: 'Gold medal' }
+    wait(delay).then(() => { if (Scenes.current === this) Scenes.go('gameover', { score, rank, isBest, won, ...extra }); });
+  }
+  onAction(a, source, pos) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.overlay) return;                       // game-specific overlay (e.g. win) is showing: only its buttons act
+    if (a === 'restart' && this.state === 'playing') return this.restart();
+    if (this.state !== 'playing') return;
+    this.handleInput(a, source, pos);
+  }
+  update(dtMs) {
+    if (this.state !== 'paused' && this.timers?.length) {          // this.later() timers: frozen while paused, dropped with the scene
+      for (const t of [...this.timers]) { t.left -= dtMs; if (t.left <= 0) { this.timers.splice(this.timers.indexOf(t), 1); t.fn(); } }
+    }
+    if (this.state === 'playing') this.tick(dtMs);
+  }
+  /** Run fn after ms of game time. Paused time doesn't count; cancelled if the scene is left. Use for result panels, delayed spawns, AI turns. */
+  later(ms, fn) { (this.timers ||= []).push({ left: ms, fn }); }
+  /** R key and Pause→Restart. Default: fresh game. Level-based games override to replay the CURRENT level (keep run score as it was at level start). */
+  restart() { Scenes.go('game'); }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+  exit() { this.cleanup?.(); }
+  /** Override in GameScene to also expose game data, e.g. { ...super.debugState(), grid: this.grid } (verify.py and play-tests read it). */
+  debugState() { return { state: this.state, score: this.score }; }
+}
+
+/* ---------- timing helper: resolves after ms of ticker time ---------- */
+function wait(ms) {
+  return new Promise((resolve) => {
+    let t = 0;
+    const fn = (ticker) => { t += ticker.deltaMS; if (t >= ms) { Scenes.app.ticker.remove(fn); resolve(); } };
+    Scenes.app.ticker.add(fn);
+  });
+}
+
+/* ##### GAME-SPECIFIC: formatting ##### */
+function formatScore(n) { return String(Math.round(n)); }
+
+/* ##### GAME-SPECIFIC: pure game logic (NO Pixi here; unit-tested below) ##### */
+/*
+  RULE DECISIONS (where the spec is silent; chosen to match Zuma-style play):
+  - Chain = ordered array of { id, c (color index), s (arc length) } sorted by s ASCENDING
+    (index 0 = rear/tail near the start, last = head nearest the hole). Marbles "touch"
+    when their s-difference is <= D + 0.5. Only touching marbles ever match.
+  - Movement: the rearmost segment is pushed at the chain speed (fast intro speed for the
+    first 2 s of a level, then the level speed). Every other segment is stopped, EXCEPT a
+    segment whose rear marble has the same color as the marble just behind a gap that was
+    opened by a removal: then that FRONT part rolls BACKWARD (480 px/s, away from the hole)
+    to meet the back part, like classic Zuma. Moving segments push whatever they touch; a
+    non-matching gap closes only when the pushed back part arrives at normal speed.
+    Gaps opened by the spawner (tail cleared) close at normal speed and never combo.
+  - Insertion: the new marble goes in the slot ahead of (towards the hole) or behind the hit
+    marble, whichever slot point is nearer to the shot. Marbles AHEAD of the new marble
+    (toward the hole) are pushed forward; the rear never moves backward. If the slot behind
+    lies in a gap, the marble fills the gap without pushing.
+  - Scoring: 10 per marble x multiplier. Shot match = x1; each gap-closing combo in the same
+    chain reaction adds +1 (x2, x3, ...). A gap closing with different colors ends the reaction.
+    Bonus spot pass-through +100, once per spot per level (no farming). Bumper bounce -20,
+    total score never below 0.
+  - Shooter colors come from colors on the path; before any marble has spawned, from the
+    upcoming queue. When a color disappears, the loaded and next marbles are re-rolled.
+  - Chain generation: random colors with ~35% chance to repeat the previous color, never
+    3 in a row (so the chain never starts with ready-made matches).
+  - Shots: 1400 px/s, max ~6 per second (0.15 s reload), several may fly at once; they are
+    processed one at a time in firing order; they vanish when leaving the 1280x720 field.
+  - Hidden marbles (s < 0, still inside the start tunnel) cannot be hit by shots, never take
+    part in a match, and a shot hitting a marble less than D from the start inserts ahead of it.
+  - Input: a shot fires on pointer-DOWN ('press'); pressing the idol swaps; swipes are ignored.
+    Enter/Space on the level-clear screen = Next Level.
+  - Lose: head reaches the hole -> 'losing' (every marble rolls in at 900 px/s, no shooting)
+    -> 'lost' -> game over. Win a level: queue empty and chain empty -> 'cleared'.
+  - A run is 6 levels from level 1 with score carried over; clearing level 6 = You Win.
+    No level select (runs are scored as a whole, like the original's adventure mode).
+  - Simulation uses a fixed 1/120 s step (frame-rate independent).
+*/
+function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+const Logic = {
+  R: 22, D: 44, EPS: 0.5, STEP: 1 / 120,
+  SHOT_SPEED: 1400, CATCHUP_SPEED: 480, INTRO_SPEED: 260, INTRO_TIME: 2, LOSE_SPEED: 900,
+  SHOT_COOLDOWN: 0.15, SHOOTER_R: 56, MUZZLE: 60, BUMPER_R: 26, SPOT_R: 20,
+  HIT_DIST: 42,
+
+  /* ---------- path ---------- */
+  spiralPoints({ cx, cy, rx0, ry0, rx1, ry1, a0, turns, dir = 1 }) {
+    const n = Math.ceil(turns * 28);
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n, a = a0 + dir * t * turns * Math.PI * 2;
+      const rx = rx0 + (rx1 - rx0) * t, ry = ry0 + (ry1 - ry0) * t;
+      pts.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+    }
+    return pts;
+  },
+  /** Catmull-Rom spline through control points -> dense polyline. */
+  catmullRom(P, per = 14) {
+    const out = [];
+    const g = (i) => P[Math.max(0, Math.min(P.length - 1, i))];
+    for (let i = 0; i < P.length - 1; i++) {
+      const p0 = g(i - 1), p1 = g(i), p2 = g(i + 1), p3 = g(i + 2);
+      for (let k = 0; k < per; k++) {
+        const t = k / per, t2 = t * t, t3 = t2 * t;
+        const f = (a, b, c, d) => 0.5 * (2 * b + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+        out.push([f(p0[0], p1[0], p2[0], p3[0]), f(p0[1], p1[1], p2[1], p3[1])]);
+      }
+    }
+    out.push(P[P.length - 1].slice());
+    return out;
+  },
+  /** Arc-length table: points every ds px along the curve; cum[i] = distance of pts[i]. */
+  buildPath(ctrl, ds = 4) {
+    const dense = this.catmullRom(ctrl);
+    const pts = [dense[0].slice()], cum = [0];
+    let acc = 0, next = ds;
+    for (let i = 1; i < dense.length; i++) {
+      const [ax, ay] = dense[i - 1], [bx, by] = dense[i];
+      const len = Math.hypot(bx - ax, by - ay);
+      while (len > 0 && acc + len >= next) {
+        const t = (next - acc) / len;
+        pts.push([ax + (bx - ax) * t, ay + (by - ay) * t]); cum.push(next);
+        next += ds;
+      }
+      acc += len;
+    }
+    const last = dense[dense.length - 1];
+    if (acc - cum[cum.length - 1] > 1e-6) { pts.push(last.slice()); cum.push(acc); }
+    return { pts, cum, ds, length: acc };
+  },
+  pointAt(path, s) {
+    const { pts, cum, ds } = path;
+    if (s <= 0) return { x: pts[0][0], y: pts[0][1] };
+    if (s >= path.length) { const p = pts[pts.length - 1]; return { x: p[0], y: p[1] }; }
+    const i = Math.min(pts.length - 2, Math.floor(s / ds));
+    const t = (s - cum[i]) / (cum[i + 1] - cum[i]);
+    return { x: pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t, y: pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t };
+  },
+
+  /* ---------- levels ---------- */
+  LEVELS: [
+    { name: 'Sun Gate', colors: 4, count: 45, speed: 26,
+      path: { spiral: { cx: 640, cy: 434, rx0: 590, ry0: 240, rx1: 300, ry1: 138, a0: Math.PI, turns: 1.3, dir: 1 } },
+      bumpers: [], spots: [[480, 360], [420, 520]] },
+    { name: 'Serpent Court', colors: 4, count: 55, speed: 29,
+      path: { points: [[60, 200], [400, 215], [800, 196], [1150, 222], [1226, 430], [1150, 660], [800, 682], [420, 664], [165, 610], [100, 430], [230, 330], [410, 400]] },
+      bumpers: [[640, 300]], spots: [[930, 540]] },
+    { name: 'Moon Well', colors: 5, count: 62, speed: 32,
+      path: { spiral: { cx: 640, cy: 434, rx0: 590, ry0: 240, rx1: 285, ry1: 140, a0: 0, turns: 1.45, dir: -1 } },
+      bumpers: [[470, 440], [810, 440]], spots: [[700, 540]] },
+    { name: 'Stone Maze', colors: 5, count: 70, speed: 35,
+      path: { points: [[60, 690], [48, 430], [80, 196], [400, 186], [880, 186], [1200, 206], [1230, 440], [1186, 664], [880, 684], [420, 680], [215, 640], [172, 450], [262, 304], [640, 290], [1000, 302], [1075, 440], [990, 560], [770, 580]] },
+      bumpers: [[420, 480]], spots: [[860, 440]] },
+    { name: 'River Steps', colors: 6, count: 76, speed: 37,
+      path: { points: [[1226, 690], [1000, 660], [800, 688], [600, 658], [400, 688], [200, 660], [70, 600], [48, 420], [90, 205], [300, 200], [520, 225], [740, 198], [960, 222], [1150, 250], [1170, 420], [960, 470]] },
+      bumpers: [[400, 420], [650, 563]], spots: [[860, 350], [260, 470]] },
+    { name: 'Idol Heart', colors: 6, count: 84, speed: 39,
+      path: { spiral: { cx: 640, cy: 434, rx0: 590, ry0: 245, rx1: 255, ry1: 128, a0: -Math.PI / 2, turns: 1.75, dir: 1 } },
+      bumpers: [[518, 430], [770, 420]], spots: [[633, 323]] },
+  ],
+  levelCount() { return this.LEVELS.length; },
+  levelPathPoints(def) { return def.path.points ? def.path.points : this.spiralPoints(def.path.spiral); },
+
+  /** Color queue: ~35% repeat chance, never 3 in a row. */
+  makeQueue(count, nColors, rng) {
+    const q = [];
+    for (let i = 0; i < count; i++) {
+      const p = q[i - 1], pp = q[i - 2];
+      let c;
+      if (i > 0 && rng() < 0.35 && !(p === pp)) c = p;
+      else { do { c = Math.floor(rng() * nColors); } while (i > 0 && c === p && nColors > 1); }
+      q.push(c);
+    }
+    return q;
+  },
+
+  /** New level state. def overrides let tests build hand-made setups. */
+  newLevel(levelIdx, rng = Math.random, startScore = 0, override = null) {
+    const base = this.LEVELS[levelIdx] || this.LEVELS[0];
+    const def = { ...base, shooter: [640, 440], ...(override || {}) };
+    const path = def.pathObj || this.buildPath(this.levelPathPoints(def));
+    const queue = def.queue ? def.queue.slice() : this.makeQueue(def.count, def.colors, rng);
+    const st = {
+      level: levelIdx, def, path, rng, queue, qi: 0, nextId: 1,
+      chain: [], shots: [], cur: 0, next: 0, cooldown: 0, time: 0, acc: 0,
+      score: startScore, phase: 'playing', events: [],
+      shooter: { x: def.shooter[0], y: def.shooter[1] },
+      bumpers: def.bumpers.map(([x, y]) => ({ x, y })),
+      spots: def.spots.map(([x, y]) => ({ x, y, active: true })),
+      speed: def.speed, colorsN: def.colors,
+    };
+    st.cur = this.pickColor(st); st.next = this.pickColor(st);
+    return st;
+  },
+
+  /* ---------- chain helpers ---------- */
+  touching(ch, j) { return j > 0 && j < ch.length && ch[j].s - ch[j - 1].s <= this.D + this.EPS; },
+  segments(ch) {
+    const segs = [];
+    for (let j = 0; j < ch.length; j++) {
+      if (j === 0 || !this.touching(ch, j)) segs.push([j, j]); else segs[segs.length - 1][1] = j;
+    }
+    return segs;
+  },
+  /** Same-colored run of TOUCHING marbles containing index k -> [a, b]. */
+  findRun(ch, k) {
+    const c = ch[k].c;
+    let a = k, b = k;
+    while (a > 0 && ch[a - 1].s >= 0 && ch[a - 1].c === c && this.touching(ch, a)) a--;   // hidden (tunnel) marbles never match
+    while (b < ch.length - 1 && ch[b + 1].c === c && this.touching(ch, b + 1)) b++;
+    return [a, b];
+  },
+  availableColors(st) {
+    const set = new Set(st.chain.map((m) => m.c));
+    if (!set.size) for (let i = st.qi; i < st.queue.length; i++) set.add(st.queue[i]);
+    if (!set.size) for (let i = 0; i < st.colorsN; i++) set.add(i);
+    return [...set].sort((a, b) => a - b);
+  },
+  pickColor(st) { const a = this.availableColors(st); return a[Math.floor(st.rng() * a.length) % a.length]; },
+  refreshShooter(st) {
+    const a = this.availableColors(st);
+    if (!a.includes(st.cur)) st.cur = this.pickColor(st);
+    if (!a.includes(st.next)) st.next = this.pickColor(st);
+  },
+  remaining(st) { return st.queue.length - st.qi; },
+  chainSpeed(st) { return st.time < this.INTRO_TIME ? this.INTRO_SPEED : st.speed; },
+
+  /* ---------- removal / insertion ---------- */
+  removeRun(st, a, b, mult) {
+    const ch = st.chain;
+    const removed = ch.splice(a, b - a + 1);
+    const pts = 10 * removed.length * mult;
+    st.score += pts;
+    st.events.push({ type: 'pop', marbles: removed.map((m) => ({ id: m.id, c: m.c, s: m.s })), mult, pts });
+    if (a > 0 && a < ch.length) ch[a].gc = mult;     // gap opened by a removal: remember the multiplier
+    this.refreshShooter(st);
+    return removed.length;
+  },
+  /** Insert color c next to chain[i] on side 'ahead' | 'behind'. Returns the new marble's index. */
+  insertAt(st, i, side, c, from = null) {
+    const ch = st.chain, D = this.D;
+    let k, s;
+    if (side === 'ahead') { k = i + 1; s = ch[i].s + D; }
+    else { k = i; s = ch[i].s - D; if (k > 0) s = Math.max(s, ch[k - 1].s + D); }
+    const m = { id: st.nextId++, c, s };
+    ch.splice(k, 0, m);
+    for (let j = k + 1; j < ch.length; j++) {
+      if (ch[j].s < ch[j - 1].s + D) ch[j].s = ch[j - 1].s + D; else break;
+    }
+    st.events.push({ type: 'insert', id: m.id, x: from ? from.x : null, y: from ? from.y : null });
+    const [a, b] = this.findRun(ch, k);
+    if (b - a + 1 >= 3) this.removeRun(st, a, b, 1);
+    return k;
+  },
+  /** Which slot is closer to the shot position: ahead or behind the hit marble. */
+  sideFor(st, i, x, y) {
+    const s = st.chain[i].s;
+    if (s - this.D < 0) return 'ahead';                 // the slot behind would be inside the start tunnel
+    const pa = this.pointAt(st.path, s + this.D), pb = this.pointAt(st.path, s - this.D);
+    return Math.hypot(x - pa.x, y - pa.y) <= Math.hypot(x - pb.x, y - pb.y) ? 'ahead' : 'behind';
+  },
+  insertShot(st, i, x, y, c) { return this.insertAt(st, i, this.sideFor(st, i, x, y), c, { x, y }); },
+
+  /* ---------- shooter ---------- */
+  shoot(st, angle) {
+    if (st.phase !== 'playing' || st.cooldown > 0) return false;
+    const dx = Math.cos(angle), dy = Math.sin(angle);
+    st.shots.push({ id: st.nextId++, c: st.cur, x: st.shooter.x + dx * this.MUZZLE, y: st.shooter.y + dy * this.MUZZLE,
+      vx: dx * this.SHOT_SPEED, vy: dy * this.SHOT_SPEED });
+    st.cur = st.next; st.next = this.pickColor(st);
+    this.refreshShooter(st);
+    st.cooldown = this.SHOT_COOLDOWN;
+    st.events.push({ type: 'shoot' });
+    return true;
+  },
+  swap(st) { if (st.phase !== 'playing') return false; const t = st.cur; st.cur = st.next; st.next = t; return true; },
+
+  /* ---------- simulation ---------- */
+  marblePositions(st) {
+    const L = st.path.length;
+    return st.chain.map((m) => (m.s >= 0 && m.s <= L ? this.pointAt(st.path, m.s) : null));
+  },
+  stepShots(st, h) {
+    const R = this.R;
+    let pos = null;
+    for (const sh of st.shots) {
+      const n = Math.max(1, Math.ceil(Math.hypot(sh.vx, sh.vy) * h / 8));
+      for (let k = 0; k < n && !sh.dead; k++) {
+        sh.x += sh.vx * h / n; sh.y += sh.vy * h / n;
+        for (const b of st.bumpers) {
+          const dx = sh.x - b.x, dy = sh.y - b.y, d = Math.hypot(dx, dy);
+          if (d < R + this.BUMPER_R && d > 1e-6) {
+            const nx = dx / d, ny = dy / d, vn = sh.vx * nx + sh.vy * ny;
+            if (vn < 0) {
+              sh.vx -= 2 * vn * nx; sh.vy -= 2 * vn * ny;
+              st.score = Math.max(0, st.score - 20);
+              st.events.push({ type: 'bump', x: sh.x, y: sh.y });
+            }
+            sh.x = b.x + nx * (R + this.BUMPER_R); sh.y = b.y + ny * (R + this.BUMPER_R);
+          }
+        }
+        for (const sp of st.spots) {
+          if (sp.active && Math.hypot(sh.x - sp.x, sh.y - sp.y) < R + this.SPOT_R) {
+            sp.active = false; st.score += 100;             // one-time bonus per level (no farming)
+            st.events.push({ type: 'bonus', x: sp.x, y: sp.y });
+          }
+        }
+        if (!pos) pos = this.marblePositions(st);
+        let best = -1, bd = Infinity;
+        for (let j = 0; j < pos.length; j++) {
+          const p = pos[j]; if (!p) continue;
+          const d = Math.hypot(sh.x - p.x, sh.y - p.y);
+          if (d < this.HIT_DIST && d < bd) { bd = d; best = j; }
+        }
+        if (best >= 0) {
+          this.insertShot(st, best, sh.x, sh.y, sh.c);
+          sh.dead = true; pos = null;          // chain changed: recompute for the next shot
+          break;
+        }
+        if (sh.x < -R || sh.x > W + R || sh.y < -R || sh.y > H + R) { sh.dead = true; st.events.push({ type: 'miss' }); }
+      }
+    }
+    st.shots = st.shots.filter((s) => !s.dead);
+  },
+  stepChain(st, h) {
+    const ch = st.chain, D = this.D;
+    if (!ch.length) return;
+    const gapIds = [];
+    for (let j = 0; j < ch.length; j++) {
+      if (j > 0 && !this.touching(ch, j)) gapIds.push(ch[j].id);
+      else delete ch[j].gc;                        // no gap behind -> no pending combo
+    }
+    const segs = this.segments(ch);
+    // rear segment is pushed forward; a segment whose rear marble matches the color across a
+    // removal gap behind it rolls BACKWARD (away from the hole) to meet the back part (classic Zuma)
+    const vs = segs.map((seg, k) => {
+      if (k === 0) return this.chainSpeed(st);
+      const rear = ch[seg[0]], back = ch[seg[0] - 1];
+      return rear.gc !== undefined && back.c === rear.c ? -this.CATCHUP_SPEED : 0;
+    });
+    segs.forEach((seg, k) => { if (vs[k]) for (let j = seg[0]; j <= seg[1]; j++) ch[j].s += vs[k] * h; });
+    for (let j = 1; j < ch.length; j++) if (ch[j].s < ch[j - 1].s + D) ch[j].s = ch[j - 1].s + D;
+    // gaps that closed this step -> joins (combo check only for removal gaps)
+    for (const id of gapIds) {
+      const j = ch.findIndex((m) => m.id === id);
+      if (j <= 0 || !this.touching(ch, j)) continue;
+      const gc = ch[j].gc;
+      delete ch[j].gc;
+      st.events.push({ type: 'join' });
+      if (gc === undefined || ch[j].c !== ch[j - 1].c) continue;
+      const [a, b] = this.findRun(ch, j);
+      if (b - a + 1 >= 3) this.removeRun(st, a, b, gc + 1);
+    }
+  },
+  spawn(st) {
+    const ch = st.chain;
+    while (st.qi < st.queue.length && (ch.length === 0 || ch[0].s >= 0)) {
+      const s = ch.length ? Math.min(ch[0].s - this.D, 0) : 0;
+      ch.unshift({ id: st.nextId++, c: st.queue[st.qi++], s });
+    }
+  },
+  step(st, h) {
+    if (st.phase === 'losing') {
+      for (const m of st.chain) m.s += this.LOSE_SPEED * h;
+      const L = st.path.length;
+      const sunk = st.chain.filter((m) => m.s >= L);
+      if (sunk.length) { st.chain = st.chain.filter((m) => m.s < L); st.events.push({ type: 'sink', ids: sunk.map((m) => m.id) }); }
+      if (!st.chain.length) { st.phase = 'lost'; st.events.push({ type: 'lost' }); }
+      return;
+    }
+    if (st.phase !== 'playing') return;
+    st.cooldown = Math.max(0, st.cooldown - h);
+    this.stepShots(st, h);
+    this.stepChain(st, h);
+    this.spawn(st);
+    this.refreshShooter(st);
+    st.time += h;
+    if (!st.chain.length && st.qi >= st.queue.length) { st.phase = 'cleared'; st.shots = []; st.events.push({ type: 'cleared' }); return; }
+    if (st.chain.length && st.chain[st.chain.length - 1].s >= st.path.length) {
+      st.phase = 'losing'; st.shots = []; st.events.push({ type: 'losing' });
+    }
+  },
+  /** Advance by dt seconds using fixed steps (frame-rate independent). */
+  advance(st, dt) {
+    st.acc += dt;
+    while (st.acc >= this.STEP - 1e-9) { st.acc -= this.STEP; this.step(st, this.STEP); }
+    if (st.acc < 0) st.acc = 0;
+  },
+  /** Check chain invariants; returns error string or ''. */
+  checkChain(st) {
+    const ch = st.chain, ids = new Set();
+    for (let j = 0; j < ch.length; j++) {
+      const m = ch[j];
+      if (!Number.isFinite(m.s)) return 'NaN s at ' + j;
+      if (ids.has(m.id)) return 'duplicate id ' + m.id;
+      ids.add(m.id);
+      if (j > 0 && m.s - ch[j - 1].s < this.D - 1e-6) return `overlap at ${j}: ${ch[j - 1].s} -> ${m.s}`;
+    }
+    return '';
+  },
+};
+
+/* ##### GAME-SPECIFIC: logic self-tests (run by verify.py via window.__game.selfTest()) ##### */
+const T = {
+  straight: null,
+  path() { return this.straight || (this.straight = Logic.buildPath([[100, 400], [1200, 400]])); },
+  /** Hand-built level on a straight path (x = 100 + s, y = 400). No spawning unless queue given. */
+  mk(colors, ss, opts = {}) {
+    const st = Logic.newLevel(0, opts.rng || mulberry32(7), opts.score || 0, {
+      pathObj: this.path(), queue: opts.queue || [], colors: opts.nColors || 6, speed: opts.speed || 30,
+      bumpers: opts.bumpers || [], spots: opts.spots || [], shooter: opts.shooter || [640, 650],
+    });
+    st.chain = colors.map((c, i) => ({ id: st.nextId++, c, s: ss[i] }));
+    st.time = opts.time ?? 10;
+    st.cur = colors.length ? colors[0] : 0; st.next = st.cur;
+    return st;
+  },
+  run(D0, n) { return Array.from({ length: n }, (_, i) => D0 + i * Logic.D); },
+  cs(st) { return st.chain.map((m) => m.c); },
+};
+const TESTS = [
+  ['path arc-length table', () => {
+    const p = T.path();
+    assert(Math.abs(p.length - 1100) < 1e-6, 'length ' + p.length);
+    const a = Logic.pointAt(p, 0), b = Logic.pointAt(p, p.length), m = Logic.pointAt(p, 250);
+    assert(Math.abs(a.x - 100) < 1e-6 && Math.abs(b.x - 1200) < 1e-6 && Math.abs(m.x - 350) < 1e-6 && Math.abs(m.y - 400) < 1e-6, 'pointAt');
+    const sp = Logic.buildPath(Logic.levelPathPoints(Logic.LEVELS[0]));
+    for (let s = 0; s < sp.length - 10; s += 7) {
+      const p1 = Logic.pointAt(sp, s), p2 = Logic.pointAt(sp, s + 10);
+      const d = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      assert(d > 9.5 && d <= 10.0001, 'arc length not uniform at ' + s + ': ' + d);
+    }
+  }],
+  ['6 levels valid: bounds, HUD, no self-overlap, bumpers/spots clear of path', () => {
+    assertEq(Logic.LEVELS.length, 6);
+    const colors = Logic.LEVELS.map((l) => l.colors);
+    assertEq(colors[0], 4); assertEq(Math.max(...colors), 6);
+    Logic.LEVELS.forEach((def, li) => {
+      if (li) { assert(def.count > Logic.LEVELS[li - 1].count, 'chain length grows'); assert(def.speed > Logic.LEVELS[li - 1].speed, 'speed grows'); }
+      const p = Logic.buildPath(Logic.levelPathPoints(def));
+      assert(p.length > 2000, `L${li + 1} path too short ${p.length}`);
+      const S = []; for (let s = 0; s <= p.length; s += 8) S.push([s, Logic.pointAt(p, s)]);
+      for (const [, q] of S) {
+        assert(q.x >= 24 && q.x <= W - 24 && q.y >= 172 && q.y <= H - 24, `L${li + 1} path out of area at ${q.x|0},${q.y|0}`);
+        assert(Math.hypot(q.x - 640, q.y - 440) > Logic.SHOOTER_R + 60, `L${li + 1} path too near shooter`);
+      }
+      for (let i = 0; i < S.length; i++) for (let j = i + 1; j < S.length; j++) {
+        if (S[j][0] - S[i][0] < 3 * Logic.D) continue;
+        const d = Math.hypot(S[i][1].x - S[j][1].x, S[i][1].y - S[j][1].y);
+        assert(d >= 2 * Logic.R + 6, `L${li + 1} path overlaps itself (${d.toFixed(1)}) at s=${S[i][0]}/${S[j][0]}`);
+      }
+      const clear = (x, y, r, what) => {
+        for (const [, q] of S) assert(Math.hypot(q.x - x, q.y - y) >= Logic.R + r + 4, `L${li + 1} ${what} at ${x},${y} touches path`);
+        assert(Math.hypot(640 - x, 440 - y) >= Logic.SHOOTER_R + r + 30, `L${li + 1} ${what} too near shooter`);
+      };
+      def.bumpers.forEach(([x, y]) => clear(x, y, Logic.BUMPER_R, 'bumper'));
+      def.spots.forEach(([x, y]) => clear(x, y, Logic.SPOT_R, 'spot'));
+    });
+  }],
+  ['insert side: shot ahead of hit marble goes ahead, behind goes behind (classic bug)', () => {
+    const mkS = () => T.mk([0, 1, 2], [200, 244, 288]);        // x = 300, 344, 388
+    let st = mkS(); let k = Logic.insertShot(st, 1, 356, 372, 3);
+    assertEq(k, 2, 'ahead index'); assertEq(T.cs(st), [0, 1, 3, 2]);
+    st = mkS(); k = Logic.insertShot(st, 1, 332, 372, 3);
+    assertEq(k, 1, 'behind index'); assertEq(T.cs(st), [0, 3, 1, 2]);
+    // via real shot flight: falling at x=352 hits marble x=344 slightly on its hole side
+    st = mkS(); st.cur = 3; st.shooter = { x: 352, y: 150 }; Logic.shoot(st, Math.PI / 2);
+    for (let i = 0; i < 60 && st.shots.length; i++) Logic.stepShots(st, Logic.STEP);
+    assertEq(T.cs(st), [0, 1, 3, 2], 'flight insert');
+    st = mkS(); st.cur = 3; st.shooter = { x: 336, y: 150 }; Logic.shoot(st, Math.PI / 2);
+    for (let i = 0; i < 60 && st.shots.length; i++) Logic.stepShots(st, Logic.STEP);
+    assertEq(T.cs(st), [0, 3, 1, 2], 'flight insert behind');
+  }],
+  ['insert pushes marbles ahead forward, rear stays, spacing kept', () => {
+    const st = T.mk([0, 1, 2, 3, 4], T.run(200, 5));
+    Logic.insertAt(st, 1, 'ahead', 5);
+    assertEq(st.chain.map((m) => m.s), [200, 244, 288, 332, 376, 420]);
+    assertEq(T.cs(st), [0, 1, 5, 2, 3, 4]);
+    assertEq(Logic.checkChain(st), '');
+    // behind the rear marble of a front segment with a wide gap: fills the gap, no push
+    const g = T.mk([0, 1, 2, 3], [100, 144, 400, 444]);
+    Logic.insertAt(g, 2, 'behind', 5);
+    assertEq(g.chain.map((m) => m.s), [100, 144, 356, 400, 444]);
+    // narrow gap (60px): new marble touches the rear part and pushes the front part
+    const n = T.mk([0, 1, 2], [100, 144, 204]);
+    Logic.insertAt(n, 2, 'behind', 5);
+    assertEq(n.chain.map((m) => m.s), [100, 144, 188, 232]);
+  }],
+  ['3 touching same color are removed (x1), 2 are not', () => {
+    const st = T.mk([1, 0, 0, 2], T.run(200, 4));
+    Logic.insertAt(st, 2, 'ahead', 0);
+    assertEq(T.cs(st), [1, 2]); assertEq(st.score, 30);
+    assertEq(st.chain[1].gc, 1, 'gap remembers multiplier');
+    assert(st.chain[1].s - st.chain[0].s > Logic.D + 1, 'gap stays open: front part not moved back');
+    const s2 = T.mk([1, 0, 2], T.run(200, 3));
+    Logic.insertAt(s2, 1, 'ahead', 0);
+    assertEq(T.cs(s2), [1, 0, 0, 2]); assertEq(s2.score, 0);
+    const s5 = T.mk([1, 0, 0, 0, 0, 2], T.run(200, 6));
+    Logic.insertAt(s5, 2, 'behind', 0);
+    assertEq(T.cs(s5), [1, 2]); assertEq(s5.score, 50);
+  }],
+  ['no matching across an open gap (classic bug)', () => {
+    // [R A] ...gap... [A A B]: shooting A next to the rear A makes only 2 touching
+    const st = T.mk([1, 0, 0, 0, 2], [100, 144, 400, 444, 488]);
+    Logic.insertAt(st, 1, 'ahead', 0);
+    assertEq(T.cs(st), [1, 0, 0, 0, 0, 2], 'must not remove across the gap');
+    assertEq(st.score, 0);
+    const [a, b] = Logic.findRun(st.chain, 2); assertEq([a, b], [1, 2]);
+  }],
+  ['matching gap: front rolls BACK to the back part (join happens behind the old gap spot)', () => {
+    // middle back part [C A A] is stopped (not the tail); front [A B] with a segment ahead [D]
+    const st = T.mk([5, 3, 0, 0, 0, 1, 4], [100, 300, 344, 388, 600, 644, 900]);
+    st.chain[4].gc = 1;
+    let t = 0; while (st.chain.length === 7 && t++ < 400) Logic.step(st, Logic.STEP);
+    assertEq(T.cs(st), [5, 3, 1, 4], 'AAA removed at the join');
+    assertEq(st.score, 60);
+    assert(Math.abs(st.chain[1].s - 300) < 1e-6, 'stopped back part did not move');
+    assert(Math.abs(st.chain[3].s - 900) < 1e-6, 'segment further ahead stays');
+    assert(st.chain[2].s < 644 - 150, 'front part moved backward: ' + st.chain[2].s);
+    // non-matching gap: front stays, back part (tail) closes at normal speed
+    const n = T.mk([1, 0, 2, 2], [100, 144, 400, 444]); n.chain[2].gc = 1;
+    for (let i = 0; i < 60; i++) Logic.step(n, Logic.STEP);
+    assert(Math.abs(n.chain[2].s - 400) < 1e-9 && Math.abs(n.chain[0].s - 115) < 1e-6, 'non-matching: front stops, back normal');
+  }],
+  ['gap close with same colors -> combo x2 (classic bug: combo after close)', () => {
+    // rear [B A A] gap(front stopped) [A C]; gap made by a removal (gc=1)
+    const st = T.mk([1, 0, 0, 0, 2], [100, 144, 188, 400, 444]);
+    st.chain[3].gc = 1;
+    Logic.step(st, Logic.STEP);
+    assert(Math.abs(st.chain[3].s - (400 - Logic.CATCHUP_SPEED * Logic.STEP)) < 1e-6, 'front part rolls back fast ' + st.chain[3].s);
+    assert(Math.abs(st.chain[4].s - (444 - Logic.CATCHUP_SPEED * Logic.STEP)) < 1e-6, 'whole front part rolls back');
+    assert(Math.abs(st.chain[0].s - (100 + 30 * Logic.STEP)) < 1e-6, 'back part keeps normal push speed');
+    let t = 0; while (st.chain.length === 5 && t++ < 400) Logic.step(st, Logic.STEP);
+    assertEq(T.cs(st), [1, 2]); assertEq(st.score, 60, 'combo 3 x10 x2');
+    const pop = st.events.filter((e) => e.type === 'pop'); assertEq(pop[pop.length - 1].mult, 2);
+  }],
+  ['gap close with different colors: no match, combo chain ends, back part normal speed', () => {
+    const st = T.mk([1, 0, 2, 2], [100, 144, 400, 444]);
+    st.chain[2].gc = 1;
+    Logic.step(st, Logic.STEP);
+    assert(Math.abs(st.chain[0].s - (100 + 30 * Logic.STEP)) < 1e-6, 'normal push speed');
+    for (let i = 0; i < 120 * 12; i++) Logic.step(st, Logic.STEP);
+    assertEq(T.cs(st), [1, 0, 2, 2]); assertEq(st.score, 0);
+    assert(Logic.touching(st.chain, 2), 'joined'); assertEq(st.chain[2].gc, undefined);
+  }],
+  ['chain reaction: x1 then combo x2 then x3', () => {
+    // D C B B A A B C C E  + shot A at the A's
+    const st = T.mk([5, 3, 1, 1, 0, 0, 1, 3, 3, 4], T.run(100, 10));
+    Logic.insertAt(st, 4, 'behind', 0);
+    assertEq(st.score, 30);
+    for (let i = 0; i < 600; i++) Logic.step(st, Logic.STEP);
+    assertEq(T.cs(st), [5, 4]);
+    assertEq(st.score, 30 + 60 + 90);
+    assertEq(st.events.filter((e) => e.type === 'pop').map((e) => e.mult), [1, 2, 3]);
+  }],
+  ['chain speed is frame-rate independent; fast intro for 2 s then slow (classic bug)', () => {
+    const run = (dt, total) => { const st = Logic.newLevel(0, mulberry32(3)); let t = 0; while (t < total - 1e-9) { Logic.advance(st, dt); t += dt; } return st; };
+    const a = run(1 / 144, 5), b = run(1 / 60, 5), c = run(1 / 20, 5), d = run(0.05, 5);
+    const sa = a.chain.map((m) => m.s.toFixed(3)).join();
+    assertEq(b.chain.map((m) => m.s.toFixed(3)).join(), sa, '60fps');
+    assertEq(c.chain.map((m) => m.s.toFixed(3)).join(), sa, '20fps');
+    assertEq(d.chain.map((m) => m.s.toFixed(3)).join(), sa, '50ms');
+    const st = Logic.newLevel(0, mulberry32(3));
+    Logic.advance(st, 2);
+    const h2 = st.chain[st.chain.length - 1].s;
+    assert(Math.abs(h2 - Logic.INTRO_SPEED * 2) < 3, 'intro distance ' + h2);
+    Logic.advance(st, 1); const h2b = st.chain[st.chain.length - 1].s; Logic.advance(st, 1);
+    const h3 = st.chain[st.chain.length - 1].s;
+    assert(Math.abs(h3 - h2b - Logic.LEVELS[0].speed) < 0.01, 'slow speed ' + (h3 - h2b));
+  }],
+  ['spawning: marbles enter from the start in queue order, touching, never more than count', () => {
+    const st = Logic.newLevel(0, mulberry32(11));
+    const q = st.queue.slice();
+    for (let i = 0; i < 120 * 60; i++) { Logic.step(st, Logic.STEP); if (st.phase !== 'playing') break; }
+    assertEq(st.qi, q.length, 'all spawned');
+    assertEq(st.chain.length, q.length);
+    assertEq(T.cs(st), q.slice().reverse(), 'queue order (head = first spawned)');
+    assertEq(Logic.segments(st.chain).length, 1, 'one touching chain');
+    assertEq(Logic.checkChain(st), '');
+    for (let i = 2; i < q.length; i++) assert(!(q[i] === q[i - 1] && q[i] === q[i - 2]), 'no ready-made triple');
+  }],
+  ['shooter only offers colors still in the chain; re-rolls when a color vanishes (classic bug)', () => {
+    const st = T.mk([1, 3, 3, 1], T.run(200, 4));
+    for (let i = 0; i < 200; i++) { const c = Logic.pickColor(st); assert(c === 1 || c === 3, 'bad color ' + c); }
+    st.cur = 3; st.next = 3;
+    Logic.insertAt(st, 2, 'ahead', 3);                 // removes all 3s
+    assertEq(T.cs(st), [1, 1]);
+    assertEq([st.cur, st.next], [1, 1], 'loaded/next re-rolled');
+    for (let i = 0; i < 20; i++) { st.cooldown = 0; Logic.shoot(st, -Math.PI / 2); assert(st.cur === 1 && st.next === 1); }
+    const fresh = Logic.newLevel(2, mulberry32(5));
+    assert(fresh.queue.includes(fresh.cur) && fresh.queue.includes(fresh.next), 'initial colors from queue');
+  }],
+  ['tunnel edge: near the start insert ahead; hidden marbles never match', () => {
+    const st = T.mk([0, 1, 2], [-30, 14, 58]);          // marble 0 hidden in the tunnel
+    assertEq(Logic.sideFor(st, 1, 100, 380), 'ahead', 'slot behind s=14 is in the tunnel');
+    const h = T.mk([0, 0, 1], [-30, 14, 58]);            // hidden A + visible A, insert A next to visible A
+    Logic.insertAt(h, 1, 'ahead', 0);
+    assertEq(T.cs(h), [0, 0, 0, 1], 'only 2 visible -> no match with the hidden marble');
+    assertEq(h.score, 0);
+    assertEq(Logic.findRun(h.chain, 2), [1, 2]);
+  }],
+  ['swap exchanges loaded and next marble', () => {
+    const st = T.mk([0, 1], [200, 244]); st.cur = 0; st.next = 1;
+    Logic.swap(st); assertEq([st.cur, st.next], [1, 0]);
+  }],
+  ['shots leaving the screen are removed (classic bug)', () => {
+    const st = T.mk([0], [200], { shooter: [640, 600] });
+    for (const a of [-Math.PI / 2, 0, Math.PI, Math.PI / 2 - 0.2]) { st.cooldown = 0; Logic.shoot(st, a); }
+    assertEq(st.shots.length, 4);
+    for (let i = 0; i < 240; i++) Logic.stepShots(st, Logic.STEP);
+    assertEq(st.shots.length, 0);
+  }],
+  ['two shots inserted in the same frame keep chain order (classic bug)', () => {
+    const st = T.mk([0, 1, 2, 3, 4, 5], T.run(300, 6));  // x 400..620
+    st.shots.push({ id: 900, c: 5, x: 468, y: 370, vx: 0, vy: 1400 }, { id: 901, c: 4, x: 470, y: 372, vx: 0, vy: 1400 });
+    Logic.stepShots(st, Logic.STEP);
+    assertEq(st.shots.length, 0);
+    assertEq(st.chain.length, 8);
+    assertEq(Logic.checkChain(st), '');
+    assertEq(T.cs(st), [0, 1, 4, 5, 2, 3, 4, 5]);
+  }],
+  ['bonus spot +100 once; bumper bounces shot and costs 20 (never below 0)', () => {
+    const st = T.mk([0], [50], { spots: [[640, 300]], bumpers: [[900, 300]], shooter: [640, 600], score: 10 });
+    st.cur = 2; Logic.shoot(st, -Math.PI / 2);
+    for (let i = 0; i < 60; i++) Logic.stepShots(st, Logic.STEP);
+    assertEq(st.score, 110); assert(!st.spots[0].active, 'spot consumed');
+    st.shots.push({ id: 5, c: 1, x: 700, y: 300, vx: 1400, vy: 0 });
+    for (let i = 0; i < 20; i++) Logic.stepShots(st, Logic.STEP);
+    assertEq(st.score, 90, 'bumper -20');
+    assertEq(st.events.filter((e) => e.type === 'bump').length, 1);
+    const sh = st.shots[0]; assert(!sh || sh.vx < 0, 'bounced back');
+    const z = T.mk([0], [50], { bumpers: [[900, 300]], score: 5 });
+    z.shots.push({ id: 5, c: 1, x: 700, y: 300, vx: 1400, vy: 0 });
+    for (let i = 0; i < 20; i++) Logic.stepShots(z, Logic.STEP);
+    assertEq(z.score, 0, 'clamped at 0');
+    // one-time: spot never comes back, later passes give nothing (no farming)
+    const r = T.mk([0], [50], { spots: [[640, 300]], shooter: [640, 600], speed: 1e-9 }); r.cur = 0;
+    for (let i = 0; i < 120 * 30; i++) { if (i % 120 === 0) { r.cooldown = 0; Logic.shoot(r, -Math.PI / 2); } Logic.step(r, Logic.STEP); }
+    assertEq(r.score, 100, 'bonus only once per level'); assert(!r.spots[0].active, 'spot stays gone');
+  }],
+  ['level cleared only when queue spawned and chain empty', () => {
+    const st = T.mk([0, 0], [300, 344], { queue: [] });
+    Logic.insertAt(st, 1, 'ahead', 0);
+    Logic.step(st, Logic.STEP);
+    assertEq(st.phase, 'cleared');
+    const q = T.mk([0, 0], [300, 344], { queue: [1, 2, 3] });
+    Logic.insertAt(q, 1, 'ahead', 0);
+    Logic.step(q, Logic.STEP);
+    assertEq(q.phase, 'playing', 'more marbles to come'); assert(q.chain.length > 0, 'spawned');
+  }],
+  ['lose: head reaches the hole -> all roll in -> lost; no shooting meanwhile', () => {
+    const L = T.path().length;
+    const st = T.mk([0, 1, 2], [L - 100, L - 56, L - 12]);
+    for (let i = 0; i < 200 && st.phase === 'playing'; i++) Logic.step(st, Logic.STEP);
+    assertEq(st.phase, 'losing');
+    assert(!Logic.shoot(st, 0), 'no shooting while losing');
+    let n = 0; while (st.phase === 'losing' && n++ < 600) Logic.step(st, Logic.STEP);
+    assertEq(st.phase, 'lost'); assertEq(st.chain.length, 0);
+    assert(n < 60, 'rolls in quickly');
+  }],
+  ['helpers do not mutate their inputs', () => {
+    const st = T.mk([0, 0, 1, 1, 1], [100, 144, 188, 400, 444]);
+    const before = JSON.stringify(st.chain);
+    Logic.findRun(st.chain, 1); Logic.segments(st.chain); Logic.availableColors(st); Logic.marblePositions(st);
+    assertEq(JSON.stringify(st.chain), before);
+  }],
+  ['seeded random bots on every level: invariants hold', () => {
+    for (let li = 0; li < 6; li++) {
+      const rng = mulberry32(100 + li);
+      const st = Logic.newLevel(li, rng);
+      let lastScore = 0, t = 0;
+      while (t < 15 && (st.phase === 'playing' || st.phase === 'losing')) {
+        if (rng() < 0.1) Logic.shoot(st, rng() * Math.PI * 2);
+        if (rng() < 0.02) Logic.swap(st);
+        Logic.advance(st, 1 / 30); t += 1 / 30;
+        const e = Logic.checkChain(st); assert(!e, `L${li + 1}: ${e}`);
+        assert(Number.isFinite(st.score) && st.score >= 0, 'score');
+        if (!st.bumpers.length) assert(st.score >= lastScore, 'score decreased without bumpers');
+        lastScore = st.score;
+        assert(st.shots.every((s) => Number.isFinite(s.x) && Number.isFinite(s.y)), 'shot NaN');
+        if (st.chain.length && st.phase === 'playing') assert(Logic.availableColors(st).includes(st.cur), 'cur color not in chain');
+      }
+    }
+  }],
+  ['smart bot clears level 1 (winnable) and score adds up', () => {
+    const rng = mulberry32(42);
+    const st = Logic.newLevel(0, rng);
+    let t = 0, removed = 0;
+    Logic.advance(st, 2.5);
+    while (st.phase === 'playing' && t < 400) {
+      // choose a visible marble whose color matches the loaded one, preferring pairs
+      const ch = st.chain; let best = -1, bestScore = -1;
+      for (let j = 0; j < ch.length; j++) {
+        if (ch[j].s < 0 || ch[j].c !== st.cur) continue;
+        const [a, b] = Logic.findRun(ch, j);
+        const sc = (b - a + 1) * 1000 + ch[j].s;
+        if (sc > bestScore) { bestScore = sc; best = j; }
+      }
+      if (best < 0) Logic.swap(st);
+      else if (st.cooldown <= 0) { const c = st.cur; Logic.insertAt(st, best, 'ahead', c); st.cur = st.next; st.next = Logic.pickColor(st); Logic.refreshShooter(st); st.cooldown = 0.6; }
+      Logic.advance(st, 0.05); t += 0.05;
+      assert(!Logic.checkChain(st), Logic.checkChain(st));
+    }
+    assertEq(st.phase, 'cleared', 'bot should clear level 1, phase ' + st.phase + ' t=' + t.toFixed(1));
+    const pops = st.events.filter((e) => e.type === 'pop');
+    removed = pops.reduce((n, e) => n + e.marbles.length, 0);
+    const inserted = st.events.filter((e) => e.type === 'insert').length;
+    assertEq(removed, st.queue.length + inserted, 'every marble accounted for');
+    assertEq(st.score, pops.reduce((n, e) => n + e.pts, 0));
+  }],
+];
+
+/* ##### GAME-SPECIFIC: the game scene ##### */
+const COLORS = [0xe53935, 0x1e88e5, 0x43a047, 0xfdd835, 0x8e24aa, 0xf2f2f2];
+const MarbleArt = {
+  ctx: null,
+  get(c) {
+    if (!this.ctx) {
+      this.ctx = COLORS.map((col) => {
+        const dark = ((((col >> 16) & 255) * 0.55) << 16) | ((((col >> 8) & 255) * 0.55) << 8) | ((col & 255) * 0.55);
+        return new GraphicsContext()
+          .circle(0, 0, Logic.R).fill(dark)
+          .circle(-2, -2, Logic.R - 3).fill(col)
+          .circle(-7, -8, 8).fill({ color: 0xffffff, alpha: 0.35 })
+          .circle(-8, -9, 4).fill({ color: 0xffffff, alpha: 0.85 });
+      });
+    }
+    return this.ctx[c % COLORS.length];
+  },
+};
+
+class GameScene extends GameSceneBase {
+  initGame() {
+    this.rng = Math.random;
+    this.aim = -Math.PI / 2;
+    this.onMove = (e) => {
+      if (this.state !== 'playing' || this.overlay || !this.lv) return;
+      const p = this.view.toLocal(e.global);
+      this.aim = Math.atan2(p.y - this.lv.shooter.y, p.x - this.lv.shooter.x);
+    };
+    Scenes.app.stage.on('globalpointermove', this.onMove);
+    this.startLevel(0);
+  }
+  cleanup() { Scenes.app.stage.off('globalpointermove', this.onMove); }
+  addScore(n) { super.addScore(n); if (this.lv) this.lv.score = this.score; }
+
+  startLevel(i) {
+    this.hideOverlay();
+    this.board.removeChildren().forEach((c) => c.destroy({ children: true }));
+    this.lv = Logic.newLevel(i, this.rng, this.score);
+    this.clearedShown = false; this.lostHandled = false; this.clearWait = 0;
+    this.views = new Map(); this.shotViews = new Map(); this.insertFrom = new Map();
+    this.drawStatic();
+    this.marbleLayer = new Container(); this.shotLayer = new Container(); this.fxLayer = new Container();
+    this.board.addChild(this.marbleLayer);
+    this.buildShooter();
+    this.board.addChild(this.shotLayer, this.fxLayer);
+    const lp = makePanel(260, 96, THEME.panel, 18); lp.position.set(820, 80);
+    this.levelText = makeText(`Level ${i + 1} / ${Logic.levelCount()}`, 30, THEME.text, '800');
+    this.levelText.position.set(820, 64);
+    this.nameText = makeText(this.lv.def.name, 22, THEME.textDim, '600');
+    this.nameText.position.set(820, 102);
+    this.board.addChild(lp, this.levelText, this.nameText);
+    this.syncViews(0);
+  }
+  nextLevel() {
+    if (this.state !== 'playing' || !this.lv || this.lv.phase !== 'cleared') return;
+    this.startLevel(this.lv.level + 1);
+  }
+  posAt(s) { return Logic.pointAt(this.lv.path, s); }
+
+  drawStatic() {
+    const lv = this.lv, g = new Graphics();
+    g.rect(0, 0, W, H).fill(0xd8bf8a);
+    for (let y = 0; y < H; y += 60) {                    // stone blocks
+      g.moveTo(0, y).lineTo(W, y).stroke({ width: 2, color: 0xb99f6c, alpha: 0.45 });
+      for (let x = (y / 60) % 2 ? 0 : 60; x < W; x += 120) g.moveTo(x, y).lineTo(x, y + 60).stroke({ width: 2, color: 0xb99f6c, alpha: 0.45 });
+    }
+    const pts = lv.path.pts;
+    const line = (w, color, alpha = 1) => {
+      g.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 3; i < pts.length; i += 3) g.lineTo(pts[i][0], pts[i][1]);
+      g.lineTo(pts[pts.length - 1][0], pts[pts.length - 1][1]);
+      g.stroke({ width: w, color, alpha, join: 'round', cap: 'round' });
+    };
+    line(Logic.D + 16, 0xa88a58);
+    line(Logic.D + 6, 0x8c6f42);
+    line(Logic.D - 8, 0x7a5f36);
+    const a = pts[0], e = pts[pts.length - 1];
+    g.circle(a[0], a[1], 34).fill(0x6b5230).circle(a[0], a[1], 26).fill(0x3a2a16);
+    g.circle(e[0], e[1], 40).fill(0x8c6f42).circle(e[0], e[1], 32).fill(0x1c130a).circle(e[0], e[1], 20).fill(0x000000);
+    for (const b of lv.bumpers) {
+      g.circle(b.x, b.y, Logic.BUMPER_R + 3).fill(0x5d4a33).circle(b.x, b.y, Logic.BUMPER_R).fill(0x9b8466)
+        .circle(b.x - 6, b.y - 6, 8).fill({ color: 0xffffff, alpha: 0.18 });
+    }
+    const layer = new Container(); layer.addChild(g);
+    this.board.addChild(layer);
+    layer.cacheAsTexture(true);                          // static art: one texture instead of thousands of triangles
+    this.spotViews = lv.spots.map((sp) => {
+      const s = new Graphics().circle(0, 0, Logic.SPOT_R).fill(0xf4c542).circle(0, 0, Logic.SPOT_R - 5).fill(0xffe082)
+        .star(0, 0, 5, 9, 4).fill(0xc99a1c);
+      s.position.set(sp.x, sp.y);
+      this.board.addChild(s);
+      return s;
+    });
+  }
+  buildShooter() {
+    const { x, y } = this.lv.shooter;
+    const base = new Graphics()
+      .circle(0, 0, Logic.SHOOTER_R + 6).fill(0x5d4a33)
+      .circle(0, 0, Logic.SHOOTER_R).fill(0x9b8466)
+      .circle(0, 0, Logic.SHOOTER_R - 12).stroke({ width: 3, color: 0x6e5a40 });
+    base.position.set(x, y);
+    this.shooterTurn = new Container(); this.shooterTurn.position.set(x, y);
+    const mouth = new Graphics().roundRect(10, -20, 48, 40, 10).fill(0x6e5a40).circle(0, 0, 22).fill(0x7d6849);
+    this.loaded = new Graphics(MarbleArt.get(this.lv.cur)); this.loaded.position.set(44, 0); this.loadedC = this.lv.cur;
+    this.shooterTurn.addChild(mouth, this.loaded);
+    this.core = new Graphics().circle(0, 0, 13).fill(0xffffff); this.core.position.set(x, y);
+    this.coreGlow = new Graphics().circle(0, 0, 19).fill({ color: 0xffffff, alpha: 0.35 }); this.coreGlow.position.set(x, y);
+    this.board.addChild(base, this.shooterTurn, this.coreGlow, this.core);
+  }
+
+  handleInput(a, source, pos) {
+    const lv = this.lv;
+    if (!lv || lv.phase !== 'playing') return;
+    if (source === 'swipe') return;                      // swipes are not used in this game
+    if (a === 'press' && pos) {                          // shoot on pointer-down (instant, like the original)
+      if (Math.hypot(pos.x - lv.shooter.x, pos.y - lv.shooter.y) < Logic.SHOOTER_R) return this.doSwap();
+      this.aim = Math.atan2(pos.y - lv.shooter.y, pos.x - lv.shooter.x);
+      return this.doShoot();
+    }
+    if (a === 'tap') return;                             // already handled on press
+    if (a === 'up' || a === 'confirm') return this.doShoot();
+    if (a === 'action' || a === 'down') return this.doSwap();
+  }
+  onAction(a, source, pos) {
+    // Enter / Space on the "Level N Clear!" overlay = Next Level
+    if (this.state === 'playing' && this.overlay && this.clearedShown && this.lv && this.lv.phase === 'cleared' && (a === 'confirm' || a === 'action')) return this.nextLevel();
+    return super.onAction(a, source, pos);
+  }
+  doShoot() { if (Logic.shoot(this.lv, this.aim)) Sfx.play('move'); }
+  doSwap() { if (Logic.swap(this.lv)) Sfx.play('click'); }
+
+  tick(dtMs) {
+    const lv = this.lv; if (!lv) return;
+    const dt = dtMs / 1000;
+    if (Input.isDown('left')) this.aim -= 2.6 * dt;
+    if (Input.isDown('right')) this.aim += 2.6 * dt;
+    if (!this.overlay) Logic.advance(lv, dt);
+    this.handleEvents();
+    if (lv.score !== this.score) this.setScore(lv.score);
+    this.syncViews(dt);
+    if (lv.phase === 'cleared' && !this.clearedShown) {
+      this.clearWait = (this.clearWait || 0) + dtMs;   // short pause so pops finish and rapid shooting clicks don't hit "Next Level"
+      if (this.clearWait >= 900) this.onCleared();
+    }
+    if (lv.phase === 'lost' && !this.lostHandled) { this.lostHandled = true; this.endGame({ won: false, delay: 300 }); }
+  }
+  onCleared() {
+    this.clearedShown = true;
+    if (this.lv.level + 1 >= Logic.levelCount()) { this.endGame({ won: true }); return; }
+    Sfx.play('win');
+    this.showOverlay(`Level ${this.lv.level + 1} Clear!`, [['Next Level', () => this.nextLevel()]], `Score: ${formatScore(this.score)}`);
+  }
+  handleEvents() {
+    const ev = this.lv.events; if (!ev.length) return;
+    this.lv.events = [];
+    for (const e of ev) {
+      if (e.type === 'insert' && e.x != null) { this.insertFrom.set(e.id, { x: e.x, y: e.y }); Sfx.play('hit'); }
+      else if (e.type === 'pop') this.popFx(e);
+      else if (e.type === 'bonus') { Sfx.play('score'); this.floatText('+100', e.x, e.y - 30, 0xfff3b0); }
+      else if (e.type === 'bump') { Sfx.play('hit'); this.floatText('-20', e.x, e.y - 30, 0xffb0a0); }
+      else if (e.type === 'sink') for (const id of e.ids) this.dropView(id);
+      else if (e.type === 'losing') Sfx.play('lose');
+    }
+  }
+  dropView(id) { const v = this.views.get(id); if (v) { v.g.destroy(); this.views.delete(id); } }
+  popFx(e) {
+    Sfx.play(e.mult > 1 ? 'merge' : 'score');
+    let cx = 0, cy = 0, n = 0;
+    for (const m of e.marbles) {
+      const v = this.views.get(m.id);
+      const p = v ? { x: v.g.x, y: v.g.y } : this.posAt(Math.max(0, m.s));
+      cx += p.x; cy += p.y; n++;
+      if (v) {
+        this.views.delete(m.id);
+        const g = v.g; this.marbleLayer.removeChild(g); this.fxLayer.addChild(g);
+        Tween.to(g, { scale: 1.5, alpha: 0 }, 220).then(() => { if (!g.destroyed) g.destroy(); });
+      }
+      for (let k = 0; k < 4; k++) {
+        const a = Math.random() * Math.PI * 2;
+        const d = new Graphics().circle(0, 0, 5).fill(COLORS[m.c]);
+        d.position.set(p.x, p.y); this.fxLayer.addChild(d);
+        Tween.to(d, { x: p.x + Math.cos(a) * 46, y: p.y + Math.sin(a) * 46, alpha: 0 }, 360).then(() => { if (!d.destroyed) d.destroy(); });
+      }
+    }
+    if (n) {
+      this.floatText(`+${e.pts}`, cx / n, cy / n - 20, 0xffffff);
+      if (e.mult > 1) this.floatText(`Combo x${e.mult}`, cx / n, cy / n - 60, 0xffd166, 36);
+    }
+  }
+  floatText(s, x, y, color, size = 28) {
+    const t = makeText(s, size, color, '800', { stroke: { color: 0x2a1c0c, width: 5 } });
+    t.position.set(Math.max(90, Math.min(W - 90, x)), Math.max(190, y));
+    this.fxLayer.addChild(t);
+    Tween.to(t, { y: t.y - 50, alpha: 0 }, 900, Ease.outQuad).then(() => { if (!t.destroyed) t.destroy(); });
+  }
+  syncViews(dt) {
+    const lv = this.lv, seen = new Set();
+    const k = Math.min(1, dt * 18), decay = Math.exp(-dt * 12);
+    for (const m of lv.chain) {
+      seen.add(m.id);
+      let v = this.views.get(m.id);
+      if (!v) {
+        const g = new Graphics(MarbleArt.get(m.c));
+        this.marbleLayer.addChild(g);
+        v = { g, d: m.s, ox: 0, oy: 0 };
+        const from = this.insertFrom.get(m.id);
+        if (from) { const p = this.posAt(m.s); v.ox = from.x - p.x; v.oy = from.y - p.y; this.insertFrom.delete(m.id); }
+        this.views.set(m.id, v);
+      }
+      v.d += (m.s - v.d) * k;
+      if (Math.abs(m.s - v.d) > 250 || lv.phase === 'losing') v.d = m.s;
+      v.ox *= decay; v.oy *= decay;
+      const p = this.posAt(v.d);
+      v.g.position.set(p.x + v.ox, p.y + v.oy);
+      v.g.visible = m.s >= 0 && v.d >= 0;
+    }
+    for (const [id, v] of this.views) if (!seen.has(id)) { v.g.destroy(); this.views.delete(id); }
+    const sseen = new Set();
+    for (const s of lv.shots) {
+      sseen.add(s.id);
+      let g = this.shotViews.get(s.id);
+      if (!g) { g = new Graphics(MarbleArt.get(s.c)); this.shotLayer.addChild(g); this.shotViews.set(s.id, g); }
+      g.position.set(s.x, s.y);
+    }
+    for (const [id, g] of this.shotViews) if (!sseen.has(id)) { g.destroy(); this.shotViews.delete(id); }
+    // shooter
+    this.shooterTurn.rotation = this.aim;
+    if (this.loadedC !== lv.cur) { this.loaded.context = MarbleArt.get(lv.cur); this.loadedC = lv.cur; }
+    this.loaded.visible = lv.cooldown <= 0.05 && lv.phase === 'playing';
+    if (this.core.tint !== COLORS[lv.next]) { this.core.tint = COLORS[lv.next]; this.coreGlow.tint = COLORS[lv.next]; }
+    lv.spots.forEach((sp, i) => { const v = this.spotViews[i]; v.visible = sp.active; if (sp.active) v.scale.set(1 + 0.08 * Math.sin(lv.time * 5 + i)); });
+  }
+  debugState() {
+    const lv = this.lv;
+    return {
+      ...super.debugState(),
+      level: lv ? lv.level + 1 : 0, phase: lv ? lv.phase : null,
+      remaining: lv ? Logic.remaining(lv) : 0,
+      chain: lv ? lv.chain.map((m) => [m.c, Math.round(m.s)]) : [],
+      pathLength: lv ? Math.round(lv.path.length) : 0,
+      cur: lv ? lv.cur : null, next: lv ? lv.next : null,
+      shots: lv ? lv.shots.length : 0, aim: this.aim, logicScore: lv ? lv.score : 0,
+    };
+  }
+}
+/* ##### END GAME-SPECIFIC ##### */
+
+/* ---------- test helpers ---------- */
+function assert(cond, msg = 'assertion failed') { if (!cond) throw new Error(msg); }
+function assertEq(a, b, msg = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg} expected ${B} got ${A}`); }
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const app = new Application();
+  await app.init({
+    resizeTo: window,
+    background: THEME.outerBg,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preference: 'webgl',
+  });
+  document.getElementById('app').appendChild(app.canvas);
+
+  const root = new Container(); root.label = 'root';
+  root.addChild(makeBackground());
+  const sceneLayer = new Container(); sceneLayer.label = 'scenes';
+  root.addChild(sceneLayer);
+  app.stage.addChild(root);
+
+  const mask = new Graphics(); mask.rect(0, 0, W, H).fill(0xffffff);
+  root.addChild(mask); root.mask = mask;       // nothing draws outside the play area
+
+  function layout() {
+    const sw = app.screen.width, sh = app.screen.height;
+    const s = Math.min(sw / W, sh / H);
+    root.scale.set(s);
+    root.position.set(Math.round((sw - W * s) / 2), Math.round((sh - H * s) / 2));
+    app.stage.hitArea = app.screen;
+  }
+  layout();
+  window.addEventListener('resize', () => requestAnimationFrame(() => { app.resize(); layout(); }));
+
+  Scenes.app = app; Scenes.root = sceneLayer;
+  Scenes.register('menu', MenuScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+  for (const [name, cls] of Object.entries(GAME_HOOKS.scenes)) Scenes.register(name, cls);
+
+  Input.init();
+  initSwipe(app, root);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden(); });
+
+  app.ticker.add((ticker) => {
+    const dt = Math.min(ticker.deltaMS, 50);  // clamp: no huge jumps after tab switch
+    Tween.update(dt);
+    Scenes.current?.update(dt);
+  });
+
+  await Scenes.go('menu');
+
+  /* test hook used by scripts/verify.py (harmless in production) */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },          // for checks.js: direct access to the live scene (set up boards, read fields)
+    inputStats() { return { ...Scenes.inputStats }; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    boardObjects() { const b = Scenes.current?.board; let n = 0; const walk = (c) => { if (!c.visible) return; n++; c.children.forEach(walk); }; if (b) walk(b); return n - (b ? 1 : 0); },
+    buttons() {
+      const out = [];
+      const walk = (c) => {
+        if (!c.visible || c.destroyed) return;
+        if (c.isButton) { const p = c.getGlobalPosition(); out.push({ label: c.btnText, x: p.x, y: p.y }); }
+        for (const ch of c.children) walk(ch);
+      };
+      walk(app.stage);
+      return out;
+    },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endGame) { s.endGame({ delay: 0 }); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+  };
+})().catch((e) => showFatal(e.message || String(e)));
+</script>
+</body>
+</html>

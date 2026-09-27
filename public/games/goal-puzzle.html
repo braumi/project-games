@@ -1,0 +1,1661 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Goal Puzzle</title><!-- GAME-SPECIFIC: set to CONFIG.title (galleries read this tag) -->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #14121f; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+  #fatal { position: fixed; inset: auto 12px 12px 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fatal"></div>
+<script src="/vendor/matter.min.js"></script>
+<script type="module">
+/* =====================================================================
+   PIXIJS GAME SHELL (PixiJS v8, single file, no build step)
+   Sections marked  ##### GAME-SPECIFIC #####  are the only parts that
+   change per game. Everything else is the tested framework:
+   scenes, menu, pause, game over, play again, high scores, sound,
+   input (keys + swipe + tap), tweens, responsive scaling, test hook.
+   ===================================================================== */
+import { Application, Container, Graphics, Text, Rectangle } from '/vendor/pixi.min.mjs';
+
+/* ---------- fatal error overlay (never a silent blank screen) ---------- */
+const fatalBox = document.getElementById('fatal');
+function showFatal(msg) { fatalBox.style.display = 'block'; fatalBox.textContent = 'Error: ' + msg; }
+window.addEventListener('error', (e) => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ##### GAME-SPECIFIC: CONFIG ##### */
+const CONFIG = {
+  id: 'goal-puzzle',           // unique per game: namespaces saved scores
+  title: 'Goal Puzzle',
+  subtitle: 'Drag back, aim, score the goal',
+  width: 720, height: 1280,    // design resolution (portrait). Landscape games: 1280 x 720
+  maxHighScores: 10,
+  keyRepeat: false,            // true for continuous-movement games (e.g. paddle), false for turn/grid games
+  scoreLabel: 'Score',
+  lowerIsBetter: false,        // true for time-based games (fastest time wins)
+};
+const THEME = {
+  outerBg: 0x14121f,           // letterbox color outside the play area
+  bg: 0x1f1b2e,                // play-area background
+  panel: 0x2b2640,
+  primary: 0x7c5cff,
+  primaryHover: 0x9479ff,
+  secondary: 0x3a3452,
+  secondaryHover: 0x4a4366,
+  danger: 0xff5c7a,
+  text: 0xf4f1ff,
+  textDim: 0xa9a3c4,
+  accent: 0xffd166,
+  font: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+};
+/* Optional hooks, filled in the GAME-SPECIFIC scene section AFTER your classes are defined:
+     GAME_HOOKS.menuButtons.push(['Levels', () => Scenes.go('levels')]);   // extra menu buttons (between Play and High Scores)
+     GAME_HOOKS.scenes.levels = LevelSelectScene;                          // extra scenes, registered at boot
+   GameScene may define gameOverData() { return { extraLine: 'Gold medal' }; } to add a line to the Game Over screen. */
+const GAME_HOOKS = { menuButtons: [], scenes: {} };
+/* ##### END CONFIG ##### */
+
+const W = CONFIG.width, H = CONFIG.height;
+const LAND = W > H;   // landscape layout for the shared screens
+
+/* ---------- safe storage (localStorage may throw: private mode, sandboxed iframes) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fallback = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fallback : JSON.parse(raw); }
+      catch { return fallback; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+/* ---------- high scores ---------- */
+const HighScores = {
+  list() {
+    const l = Store.get('highscores', []);
+    return Array.isArray(l) ? l.filter((e) => e && Number.isFinite(e.score)) : [];
+  },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  better(a, b) { return CONFIG.lowerIsBetter ? a < b : a > b; },
+  /** Adds a score. Returns { rank (1-based or 0 if not ranked), isBest }. */
+  add(score) {
+    if (!Number.isFinite(score) || (!CONFIG.lowerIsBetter && score <= 0)) return { rank: 0, isBest: false };
+    const prevBest = this.list()[0];
+    const entry = { score, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list();
+    l.push(entry);
+    l.sort((a, b) => (CONFIG.lowerIsBetter ? a.score - b.score : b.score - a.score) || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    const isBest = rank === 1 && (!prevBest || this.better(score, prevBest.score));
+    return { rank, isBest };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* ---------- sound (WebAudio synth: no asset files needed) ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'move': this.tone(300, 0.04, 'sine', 0.06); break;
+      case 'score': this.tone(880, 0.07, 'triangle', 0.12, 1320); break;
+      case 'merge': this.tone(520, 0.09, 'sine', 0.12, 780); break;
+      case 'hit': this.tone(180, 0.08, 'square', 0.08); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.14, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- tweens (driven by app.ticker; promise-based; safe on destroyed targets) ---------- */
+const Ease = {
+  linear: (t) => t,
+  outQuad: (t) => 1 - (1 - t) * (1 - t),
+  outCubic: (t) => 1 - Math.pow(1 - t, 3),
+  inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  outBack: (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
+};
+const Tween = {
+  active: new Set(),
+  /** props: numeric fields of target; 'scale' sets scale.x and scale.y together. */
+  to(target, props, ms = 200, ease = Ease.outCubic) {
+    return new Promise((resolve) => {
+      const from = {};
+      for (const k of Object.keys(props)) from[k] = k === 'scale' ? target.scale.x : target[k];
+      const tw = { target, props, from, ms: Math.max(1, ms), t: 0, ease, resolve };
+      this.active.add(tw);
+    });
+  },
+  apply(tw, p) {
+    const e = tw.ease(p);
+    for (const k of Object.keys(tw.props)) {
+      const v = tw.from[k] + (tw.props[k] - tw.from[k]) * e;
+      if (k === 'scale') tw.target.scale.set(v); else tw.target[k] = v;
+    }
+  },
+  update(dtMs) {
+    for (const tw of [...this.active]) {
+      if (tw.target.destroyed) { this.active.delete(tw); tw.resolve(); continue; }
+      tw.t += dtMs;
+      const p = Math.min(1, tw.t / tw.ms);
+      this.apply(tw, p);
+      if (p >= 1) { this.active.delete(tw); tw.resolve(); }
+    }
+  },
+  /** Jump every running tween (optionally only one target's) to its end state. */
+  finish(target = null) {
+    for (const tw of [...this.active]) {
+      if (target && tw.target !== target) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  /** Scale up to `peak` and back (merge/score pop). */
+  pop(target, peak = 1.15, ms = 140) {
+    const base = target.scale.x;
+    return this.to(target, { scale: base * peak }, ms, (t) => Math.sin(Math.PI * t));   // up and back in one tween; finishing lands on base
+  },
+  /** Finish only tweens whose target is `container` or inside it (e.g. this.board). Prefer this over finish(). */
+  finishWithin(container) {
+    for (const tw of [...this.active]) {
+      let n = tw.target, inside = false;
+      while (n) { if (n === container) { inside = true; break; } n = n.parent; }
+      if (!inside && !tw.target.destroyed) continue;
+      this.active.delete(tw);
+      if (!tw.target.destroyed) this.apply(tw, 1);
+      tw.resolve();
+    }
+  },
+  kill(target) { for (const tw of [...this.active]) if (tw.target === target) { this.active.delete(tw); tw.resolve(); } },
+  get busy() { return this.active.size > 0; },
+};
+
+/* ---------- UI helpers ---------- */
+function makeText(text, size = 32, color = THEME.text, weight = '600', extra = {}) {
+  const t = new Text({ text: String(text), style: { fontFamily: THEME.font, fontSize: size, fill: color, fontWeight: weight, align: 'center', ...extra } });
+  t.anchor.set(0.5);
+  return t;
+}
+/** Shrink a Text uniformly so it fits maxW (and optional maxH). Call after setting .text. */
+function fitText(t, maxW, maxH = Infinity) {
+  t.scale.set(1);
+  const s = Math.min(1, maxW / Math.max(1, t.width), maxH / Math.max(1, t.height));
+  t.scale.set(s);
+  return t;
+}
+function makePanel(w, h, color = THEME.panel, radius = 24, alpha = 1) {
+  const g = new Graphics();
+  g.roundRect(-w / 2, -h / 2, w, h, radius).fill({ color, alpha });
+  return g;
+}
+function makeButton(label, onTap, opts = {}) {
+  const { w = 360, h = 88, size = 34, variant = 'primary' } = opts;
+  const base = variant === 'primary' ? THEME.primary : variant === 'danger' ? THEME.danger : THEME.secondary;
+  const hover = variant === 'primary' ? THEME.primaryHover : variant === 'danger' ? 0xff7a93 : THEME.secondaryHover;
+  const c = new Container();
+  c.isButton = true;
+  c.label = 'button:' + label;
+  const bg = new Graphics();
+  const draw = (col) => { bg.clear(); bg.roundRect(-w / 2, -h / 2, w, h, Math.min(28, h / 2)).fill(col); };
+  draw(base);
+  const t = makeText(label, size, THEME.text, '700');
+  c.addChild(bg, t);
+  c.eventMode = 'static';
+  c.cursor = 'pointer';
+  c.hitArea = new Rectangle(-w / 2, -h / 2, w, h);
+  c.on('pointerover', () => { draw(hover); c.scale.set(1.03); });
+  c.on('pointerout', () => { draw(base); c.scale.set(1); });
+  c.on('pointerdown', () => c.scale.set(0.96));
+  c.on('pointerup', () => c.scale.set(1.03));
+  c.on('pointerupoutside', () => { draw(base); c.scale.set(1); });
+  c.on('pointertap', (e) => {
+    e.stopPropagation();
+    if (Scenes.busy || c.disabled) return;
+    Sfx.unlock(); Sfx.play('click');
+    onTap(e);
+  });
+  c.setText = (s) => { t.text = String(s); c.btnText = String(s); };
+  c.btnText = label;
+  return c;
+}
+/** Vertical stack of buttons centered at (x, y). */
+function buttonColumn(defs, x, y, gap = 24, opts = {}) {
+  const col = new Container();
+  const h = opts.h || 88;
+  defs.forEach(([label, fn, o], i) => {
+    const b = makeButton(label, fn, { ...opts, ...(o || {}) });
+    b.position.set(0, i * (h + gap));
+    col.addChild(b);
+  });
+  col.position.set(x, y);
+  return col;
+}
+
+/* ---------- input: keyboard + swipe + actions ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'action', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();                       // stop arrows/space scrolling the page
+      Sfx.unlock();
+      const wasHeld = this.held.has(a);
+      this.held.add(a);
+      if (e.repeat && !CONFIG.keyRepeat) return;
+      if (wasHeld && !e.repeat) return;
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+  },
+  isDown(a) { return this.held.has(a); },
+};
+/** Swipe detection on the whole screen (stage hitArea = app.screen). */
+function initSwipe(app, root) {
+  let start = null;
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = app.screen;
+  app.stage.on('pointerdown', (e) => {
+    Sfx.unlock(); start = { x: e.global.x, y: e.global.y, t: performance.now() };
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+    const p = root.toLocal(e.global);
+    Scenes.dispatch('press', 'pointer', { x: p.x, y: p.y });   // instant: use for flap/jump/shoot games
+  });
+  const end = (e) => {
+    if (!start) return;
+    const dx = (e.global.x - start.x) / root.scale.x, dy = (e.global.y - start.y) / root.scale.y;
+    const dt = performance.now() - start.t;
+    start = null;
+    const dist = Math.hypot(dx, dy);
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }   // presses on buttons are not game input
+    if (dist < 25 && dt < 500) {               // a tap anywhere: 'tap' action with design-space position
+      const p = root.toLocal(e.global);
+      Scenes.dispatch('tap', 'pointer', { x: p.x, y: p.y });
+      return;
+    }
+    if (dist < 40 || dt > 1000) return;         // design-space pixels; ignore slow drags
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    Scenes.dispatch(dir, 'swipe');
+  };
+  app.stage.on('pointerup', end);
+  app.stage.on('pointerupoutside', end);
+}
+
+/* ---------- scenes ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.view = new Container(); this.view.label = 'scene:' + name; }
+  enter(_data) {}
+  exit() {}
+  update(_dtMs) {}
+  onAction(_action, _source, _pos) {}
+  onHidden() {}
+}
+const Scenes = {
+  app: null, root: null, current: null, busy: false, registry: {},
+  register(name, cls) { this.registry[name] = cls; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      const old = this.current;
+      if (old) {
+        await Tween.to(old.view, { alpha: 0 }, 140);
+        old.exit();
+        Tween.kill(old.view);
+        this.root.removeChild(old.view);
+        old.view.destroy({ children: true });
+      }
+      const Cls = this.registry[name];
+      const scene = new Cls(name);
+      this.current = scene;
+      scene.view.alpha = 0;
+      this.root.addChild(scene.view);
+      scene.enter(data);
+      await Tween.to(scene.view, { alpha: 1 }, 160);
+    } finally {
+      this.busy = false;
+    }
+  },
+  inputStats: {},
+  dispatch(action, source, pos = null) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, pos);
+  },
+};
+
+/* ---------- shared background ---------- */
+function makeBackground() {
+  const g = new Graphics();
+  g.rect(0, 0, W, H).fill(THEME.bg);
+  return g;
+}
+function soundLabel() { return Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+
+/* ---------- Menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    // Portrait: one centered column. Landscape (W > H): text on the left, buttons on the right.
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const ty = LAND ? H * 0.34 : H * 0.24;
+    const title = makeText(CONFIG.title, 96, THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, ty);
+    const sub = makeText(CONFIG.subtitle, 30, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: textW - 40 });
+    fitText(sub, textW - 40, 80);
+    sub.position.set(cx, ty + 90);
+    const best = HighScores.best();
+    const bestT = makeText(best ? `Best: ${formatScore(best)}` : 'No high score yet', 32, THEME.accent, '700');
+    bestT.position.set(cx, ty + 160);
+    const defs = [
+      ['Play', () => Scenes.go('game')],
+      ...GAME_HOOKS.menuButtons.map(([label, fn]) => [label, fn, { variant: 'secondary' }]),
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      [soundLabel(), () => { Sfx.setMuted(!Sfx.muted); this.onMuteChanged(); }, { variant: 'secondary' }],
+    ];
+    const bh = defs.length > 4 ? 76 : 88, gap = defs.length > 4 ? 18 : 24;
+    const colH = defs.length * bh + (defs.length - 1) * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.min(H * 0.55, H - 150 - colH + bh / 2);
+    const col = buttonColumn(defs, LAND ? W * 0.72 : W / 2, colTop, gap, { h: bh });
+    this.soundBtn = col.children[col.children.length - 1];
+    const hint = makeText('Enter to play  ·  M to mute', 24, THEME.textDim, '500');
+    hint.position.set(cx, H - 60);
+    this.view.addChild(title, sub, bestT, col, hint);
+  }
+  onMuteChanged() { this.soundBtn?.setText(soundLabel()); }
+  onAction(a) { if (a === 'confirm' || a === 'action') Scenes.go('game'); }
+}
+
+/* ---------- High scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const top = LAND ? 70 : 150;
+    const title = makeText('High Scores', LAND ? 60 : 72, THEME.text, '800');
+    title.position.set(W / 2, top);
+    const rowH = LAND ? 52 : 64;
+    const panelTop = top + (LAND ? 60 : 100);
+    const room = Math.floor((H - panelTop - 200) / rowH);             // rows that fit above the Back button
+    const rows = Math.max(3, Math.min(CONFIG.maxHighScores, room));
+    const panelW = LAND ? Math.min(W - 120, 760) : W - 120;
+    const panelH = 60 + rows * rowH;
+    const panel = makePanel(panelW, panelH);
+    panel.position.set(W / 2, panelTop + panelH / 2);
+    this.view.addChild(title, panel);
+    const list = HighScores.list().slice(0, rows);
+    if (!list.length) {
+      const none = makeText('No scores yet. Go play!', 34, THEME.textDim, '500');
+      none.position.set(W / 2, panelTop + panelH / 2);
+      this.view.addChild(none);
+    }
+    const left = W / 2 - panelW / 2 + 50, right = W / 2 + panelW / 2 - 50;
+    list.forEach((e, i) => {
+      const y = panelTop + 30 + rowH / 2 + i * rowH;
+      const color = i === 0 ? THEME.accent : THEME.text;
+      const r = makeText(`${i + 1}.`, 32, color, '700'); r.anchor.set(0, 0.5); r.position.set(left, y);
+      const sc = makeText(formatScore(e.score), 32, color, '700'); sc.position.set(W / 2, y);
+      const d = makeText(e.date || '', 22, THEME.textDim, '500'); d.anchor.set(1, 0.5); d.position.set(right, y);
+      this.view.addChild(r, sc, d);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' });
+    back.position.set(W / 2, Math.min(H - 70, panelTop + panelH + 90));
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- Game over ---------- */
+class GameOverScene extends Scene {
+  /** data: { score, rank, isBest, won, extraLine? } — extraLine comes from GameScene.gameOverData() (e.g. "Gold medal"). */
+  enter({ score = 0, rank = 0, isBest = false, won = false, extraLine = '' } = {}) {
+    this.score = score;
+    this.enteredAt = performance.now();
+    const cx = LAND ? W * 0.3 : W / 2, textW = LAND ? W * 0.5 : W - 80;
+    const y0 = LAND ? H * 0.2 : H * 0.2;
+    const title = makeText(won ? 'You Win!' : 'Game Over', 92, won ? THEME.accent : THEME.text, '800');
+    fitText(title, textW);
+    title.position.set(cx, y0);
+    const label = makeText(CONFIG.scoreLabel, 30, THEME.textDim, '600');
+    label.position.set(cx, y0 + 100);
+    const sc = makeText(formatScore(score), 110, THEME.text, '800');
+    fitText(sc, textW);
+    sc.position.set(cx, y0 + 185);
+    const bestLine = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${formatScore(HighScores.best())}`;
+    const b = makeText(bestLine, 36, isBest ? THEME.accent : THEME.textDim, '700');
+    b.position.set(cx, y0 + 275);
+    this.view.addChild(title, label, sc, b);
+    if (extraLine) {
+      const ex = makeText(extraLine, 30, THEME.text, '600', { wordWrap: true, wordWrapWidth: textW });
+      fitText(ex, textW, 80);
+      ex.position.set(cx, y0 + 330);
+      this.view.addChild(ex);
+    }
+    const bh = 88, gap = 24, colH = 3 * bh + 2 * gap;
+    const colTop = LAND ? (H - colH) / 2 + bh / 2 : Math.max(y0 + (extraLine ? 420 : 370), H - 140 - colH + bh / 2);
+    const col = buttonColumn([
+      ['Play Again', () => Scenes.go('game')],
+      ['High Scores', () => Scenes.go('highscores'), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ], LAND ? W * 0.72 : W / 2, colTop, gap);
+    this.view.addChild(col);
+    if (isBest) { b.scale.set(0.2); Tween.to(b, { scale: 1 }, 450, Ease.outBack); }
+  }
+  onAction(a) {
+    if (performance.now() - this.enteredAt < 800) return;   // grace period: a late Space/tap from the game must not skip this screen
+    if (a === 'confirm' || a === 'restart') Scenes.go('game'); else if (a === 'pause') Scenes.go('menu');
+  }
+}
+
+/* ---------- Game scene: framework part (HUD, pause, end) ---------- */
+class GameSceneBase extends Scene {
+  enter() {
+    this.score = 0;
+    this.state = 'playing';              // 'playing' | 'paused' | 'over'
+    this.board = new Container();        // put all game visuals in here
+    this.board.label = 'board';
+    this.hud = new Container();
+    this.overlay = null;
+    this.view.addChild(this.board, this.hud);
+    this.buildHud();
+    this.initGame();
+    this.renderScore();
+  }
+  buildHud() {
+    const scoreBox = makePanel(220, 96, THEME.panel, 18); scoreBox.position.set(150, 80);
+    const bestBox = makePanel(220, 96, THEME.panel, 18); bestBox.position.set(390, 80);
+    const sl = makeText(CONFIG.scoreLabel.toUpperCase(), 20, THEME.textDim, '700'); sl.position.set(150, 56);
+    const bl = makeText('BEST', 20, THEME.textDim, '700'); bl.position.set(390, 56);
+    this.scoreText = makeText('0', 40, THEME.text, '800'); this.scoreText.position.set(150, 96);
+    this.bestText = makeText(formatScore(HighScores.best()), 40, THEME.text, '800'); this.bestText.position.set(390, 96);
+    const pause = makeButton('II', () => this.togglePause(), { w: 96, h: 96, size: 34, variant: 'secondary' });
+    pause.label = 'button:Pause';
+    pause.position.set(W - 90, 80);
+    this.hud.addChild(scoreBox, bestBox, sl, bl, this.scoreText, this.bestText, pause);
+  }
+  addScore(n) {
+    if (this.state === 'over') return;
+    this.score += n;
+    this.renderScore();
+  }
+  setScore(n) { this.score = n; this.renderScore(); }
+  renderScore() {
+    this.scoreText.text = formatScore(this.score);
+    const best = HighScores.best();
+    const shown = CONFIG.lowerIsBetter ? best : Math.max(best, this.score);
+    this.bestText.text = formatScore(shown);
+  }
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedOverlay = this.overlay;               // keep e.g. a win overlay underneath; restored on resume
+    if (this.savedOverlay) { this.savedOverlay.visible = false; this.overlay = null; }
+    this.showOverlay('Paused', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => this.restart(), { variant: 'secondary' }],
+      ['Main Menu', () => Scenes.go('menu'), { variant: 'secondary' }],
+    ]);
+  }
+  resume() {
+    this.hideOverlay();
+    if (this.savedOverlay && !this.savedOverlay.destroyed) { this.savedOverlay.visible = true; this.overlay = this.savedOverlay; }
+    this.savedOverlay = null;
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  showOverlay(title, buttons, subtitle = '') {
+    this.hideOverlay();
+    const o = new Container(); o.label = 'overlay';
+    const dim = new Graphics(); dim.rect(0, 0, W, H).fill({ color: 0x000000, alpha: 0.6 });
+    dim.eventMode = 'static';                         // swallow clicks to the game underneath
+    dim.on('pointertap', (e) => e.stopPropagation());
+    const panelH = 218 + buttons.length * 112 + (subtitle ? 40 : 0);
+    const panel = makePanel(W - 140, panelH); panel.position.set(W / 2, H / 2);
+    const t = makeText(title, 64, THEME.text, '800'); fitText(t, W - 220); t.position.set(W / 2, H / 2 - panelH / 2 + 90);
+    o.addChild(dim, panel, t);
+    if (subtitle) { const s = makeText(subtitle, 28, THEME.textDim, '500', { wordWrap: true, wordWrapWidth: W - 220 }); s.position.set(W / 2, t.y + 70); o.addChild(s); }
+    const col = buttonColumn(buttons, W / 2, t.y + (subtitle ? 180 : 140));
+    o.addChild(col);
+    this.overlay = o;
+    this.view.addChild(o);
+  }
+  hideOverlay() { if (this.overlay) { this.overlay.destroy({ children: true }); this.overlay = null; } }
+  hideAllOverlays() { this.hideOverlay(); if (this.savedOverlay) { this.savedOverlay.destroy({ children: true }); this.savedOverlay = null; } }
+  /** Call exactly when the game ends. Idempotent. */
+  endGame({ won = false, delay = 500 } = {}) {
+    if (this.state === 'over') return;
+    this.state = 'over';
+    this.hideAllOverlays();
+    Sfx.play(won ? 'win' : 'lose');
+    const { rank, isBest } = HighScores.add(this.score);
+    const score = this.score;
+    const extra = this.gameOverData?.() || {};      // optional: return { extraLine: 'Gold medal' }
+    wait(delay).then(() => { if (Scenes.current === this) Scenes.go('gameover', { score, rank, isBest, won, ...extra }); });
+  }
+  onAction(a, source, pos) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.overlay) return;                       // game-specific overlay (e.g. win) is showing: only its buttons act
+    if (a === 'restart' && this.state === 'playing') return this.restart();
+    if (this.state !== 'playing') return;
+    this.handleInput(a, source, pos);
+  }
+  update(dtMs) {
+    if (this.state !== 'paused' && this.timers?.length) {          // this.later() timers: frozen while paused, dropped with the scene
+      for (const t of [...this.timers]) { t.left -= dtMs; if (t.left <= 0) { this.timers.splice(this.timers.indexOf(t), 1); t.fn(); } }
+    }
+    if (this.state === 'playing') this.tick(dtMs);
+  }
+  /** Run fn after ms of game time. Paused time doesn't count; cancelled if the scene is left. Use for result panels, delayed spawns, AI turns. */
+  later(ms, fn) { (this.timers ||= []).push({ left: ms, fn }); }
+  /** R key and Pause→Restart. Default: fresh game. Level-based games override to replay the CURRENT level (keep run score as it was at level start). */
+  restart() { Scenes.go('game'); }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+  exit() { this.cleanup?.(); }
+  /** Override in GameScene to also expose game data, e.g. { ...super.debugState(), grid: this.grid } (verify.py and play-tests read it). */
+  debugState() { return { state: this.state, score: this.score }; }
+}
+
+/* ---------- timing helper: resolves after ms of ticker time ---------- */
+function wait(ms) {
+  return new Promise((resolve) => {
+    let t = 0;
+    const fn = (ticker) => { t += ticker.deltaMS; if (t >= ms) { Scenes.app.ticker.remove(fn); resolve(); } };
+    Scenes.app.ticker.add(fn);
+  });
+}
+
+/* ##### GAME-SPECIFIC: formatting ##### */
+function formatScore(n) { return String(Math.round(n)); }
+
+/* ##### GAME-SPECIFIC: pure game logic (NO Pixi here; unit-tested below) ##### */
+/* RULE DECISIONS (where the spec is silent — chosen to match Football Puzzle Goal as closely as possible)
+   - Coordinates are design px (720x1280). Pitch = x 20..700, y 220..1260. Angles in degrees, 0 = right, -90 = up.
+   - Shot: the press must start within 90 px of the ball. The drag is measured from where the press started to the
+     pointer (not from the ball), shot direction is opposite to the drag, power = drag length / 150 px (capped at 1).
+     A press that moves less than 18 px from where it started (a tap) does nothing and uses no shot.
+     Full power = 20 px per 1/60 s step.
+   - Keyboard alternative: Left/Right rotate the aim 2 deg, Up/Down change power 5 %, Space/Enter shoots.
+   - Level edges: most levels have side boards (walls) on the left and right; the top and bottom lines are open.
+     A ball whose centre crosses an open line is "out": the shot stops and the ball returns to where that shot started.
+   - Defender hit: the shot stops and the ball returns to where the shot started (defenders are not solid; any touch counts).
+     A defender that already overlaps the ball when a shot starts is ignored until the ball has left it.
+   - Normal stop (speed < 0.2 px/step) or the 6 s cap: the next shot is taken from where the ball came to rest.
+   - Goal: the whole ball is over the goal line (centre at least one ball radius behind the line) and between the posts.
+     The net (sides/back) and the posts are solid. The goal is checked before every other stop reason.
+   - Stars: goal on shot 1/2/3 = 3/2/1 stars. Out of shots without a goal = level failed ("Try again").
+   - Moving defenders and the rotating bar run on level time (starts at 0 on each attempt, advances only while playing,
+     so pause freezes them). The aim line is a simulation copy started at the current level time.
+   - Aim line: the ball path until just before the 3rd contact (so the first 2 bounces are shown), max 150 steps.
+   - Coins: +10 per star above the best stars previously earned on that level (first time only). Coins are saved.
+   - High-score entry (as the spec says) = total stars on all levels (saved progress) x 100 + coins earned in this run.
+     The in-game Score HUD shows what the current run has added so far (starts at 0); at Game Over the stars owned
+     before the run are added, so the saved entry is exactly the spec formula.
+     A run starts when the game screen opens (Play / Play Again / a level from Level Select). Exactly one high-score
+     entry per run, written only when the run ends through Game Over: clearing the last level ("Finish") or pressing
+     "End Run" on a level's result panel. Leaving via Level Select or Main Menu abandons the run without an entry
+     (progress and coins are saved anyway, so nothing is lost). Restart (R or Pause -> Restart) replays the CURRENT level
+     in the same run; the run score is unchanged by it (stars already won stay saved).
+   - Rotating bar vs a resting ball: while the ball is waiting for the next shot, a bar sweeping into it pushes it out
+     (like being swept), so a shot never starts with the ball inside the bar.
+   - Bouncy pads (restitution 1.3) add energy, so the ball speed is capped at 30 px/step (1.5x a full-power shot).
+   - Level unlocking: level n+1 unlocks when level n has at least 1 star. "Play" opens the first uncleared level.
+*/
+const Logic = (() => {
+  const PITCH = { x: 20, y: 220, w: 680, h: 1040 };
+  const C = {
+    PITCH, BALL_R: 16, MAX_SPEED: 20, MAX_DRAG: 150, MIN_DRAG: 18, GRAB_R: 90,
+    STOP_SPEED: 0.2, MAX_BALL_SPEED: 30, MAX_STEPS: 360, STEP_MS: 1000 / 60,
+    FRICTION_AIR: 0.012, RESTITUTION: 0.7, PAD_RESTITUTION: 1.3,
+    POST_R: 9, NET_T: 12, BOARD_T: 60, CONE_R: 14, DEFENDER_R: 26, AIM_STEPS: 150,
+  };
+  const deg = Math.PI / 180;
+
+  function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+  /* ---------- levels ----------
+     goal: {x, y, w, depth, dir} (x,y) = centre of the goal line; dir = direction the mouth faces (towards the field).
+     objects: wall{x,y,w,h,angle} cone{x,y} pad{x,y,w,h,angle} defender{path:[x1,y1,x2,y2], speed px/s, phase 0..1}
+              bar{x,y,len,thick,speed deg/s,a0 deg}
+     boards: 'sides' (left+right walls) | 'none'
+     solution: {angle, power, t} a known 1-shot goal (t = level time in ms when it is taken). */
+  const G = (x, y, dir = 'down', w = 180) => ({ x, y, w, depth: 70, dir });
+  const LEVELS = [
+    // 1-3: basics — walls and cones
+    { name: 'First Kick', shots: 3, boards: 'sides', ball: { x: 360, y: 1080 }, goal: G(360, 330), objects: [] },
+    { name: 'The Wall', shots: 3, boards: 'sides', ball: { x: 360, y: 1080 }, goal: G(360, 330), objects: [
+      { type: 'wall', x: 360, y: 700, w: 300, h: 40, angle: 0 }] },
+    { name: 'Cone Alley', shots: 3, boards: 'sides', ball: { x: 170, y: 1120 }, goal: G(470, 330), objects: [
+      { type: 'wall', x: 250, y: 560, w: 460, h: 36, angle: 0 },
+      { type: 'cone', x: 520, y: 800 }, { type: 'cone', x: 560, y: 840 }, { type: 'cone', x: 600, y: 880 },
+      { type: 'cone', x: 420, y: 920 }, { type: 'cone', x: 380, y: 960 }] },
+    // 4-6: rotated walls
+    { name: 'Bank Shot', shots: 3, boards: 'sides', ball: { x: 560, y: 1100 }, goal: G(200, 330), objects: [
+      { type: 'wall', x: 420, y: 640, w: 360, h: 36, angle: -25 }] },
+    { name: 'Side Door', shots: 3, boards: 'sides', ball: { x: 360, y: 1120 }, goal: G(110, 520, 'right', 170), objects: [
+      { type: 'wall', x: 300, y: 760, w: 360, h: 36, angle: 30 },
+      { type: 'wall', x: 470, y: 420, w: 300, h: 36, angle: -35 },
+      { type: 'cone', x: 180, y: 900 }] },
+    { name: 'Zig Zag', shots: 2, boards: 'sides', ball: { x: 150, y: 1140 }, goal: G(540, 330), objects: [
+      { type: 'wall', x: 140, y: 860, w: 220, h: 36, angle: 20 },
+      { type: 'wall', x: 580, y: 600, w: 220, h: 36, angle: -20 }] },
+    // 7-9: bouncy pads
+    { name: 'Trampoline', shots: 3, boards: 'sides', ball: { x: 360, y: 1100 }, goal: G(200, 330), objects: [
+      { type: 'wall', x: 240, y: 700, w: 440, h: 40, angle: 0 },
+      { type: 'pad', x: 670, y: 650, w: 30, h: 300, angle: 0 }] },
+    { name: 'Pinball', shots: 2, boards: 'sides', ball: { x: 600, y: 1120 }, goal: G(520, 330), objects: [
+      { type: 'wall', x: 480, y: 700, w: 440, h: 40, angle: 0 },
+      { type: 'pad', x: 50, y: 650, w: 30, h: 300, angle: 0 },
+      { type: 'pad', x: 330, y: 1000, w: 140, h: 30, angle: -30 }] },
+    { name: 'Rebound', shots: 1, boards: 'sides', ball: { x: 360, y: 760 }, goal: G(360, 1170, 'up', 170), objects: [
+      { type: 'pad', x: 360, y: 300, w: 440, h: 30, angle: 0 },
+      { type: 'wall', x: 360, y: 980, w: 300, h: 36, angle: 0 },
+      { type: 'pad', x: 40, y: 900, w: 30, h: 240, angle: 0 },
+      { type: 'cone', x: 360, y: 560 }] },
+    // 10-12: moving defenders
+    { name: 'The Keeper', shots: 3, boards: 'sides', ball: { x: 360, y: 1080 }, goal: G(360, 330), objects: [
+      { type: 'defender', path: [220, 450, 500, 450], speed: 140, phase: 0 }] },
+    { name: 'Back Four', shots: 2, boards: 'sides', ball: { x: 200, y: 1100 }, goal: G(420, 330), objects: [
+      { type: 'defender', path: [120, 800, 600, 800], speed: 220, phase: 0 },
+      { type: 'defender', path: [600, 560, 180, 560], speed: 180, phase: 0.3 },
+      { type: 'wall', x: 560, y: 1000, w: 36, h: 200, angle: 0 }] },
+    { name: 'Tight Marking', shots: 2, boards: 'sides', ball: { x: 560, y: 1120 }, goal: G(180, 330), objects: [
+      { type: 'wall', x: 470, y: 520, w: 460, h: 36, angle: -10 },
+      { type: 'defender', path: [140, 480, 140, 900], speed: 200, phase: 0.5 },
+      { type: 'defender', path: [260, 440, 360, 440], speed: 90, phase: 0 },
+      { type: 'cone', x: 400, y: 850 }, { type: 'cone', x: 440, y: 850 }] },
+    // 13-15: rotating bar (+ mixes)
+    { name: 'Windmill', shots: 3, boards: 'sides', ball: { x: 360, y: 1100 }, goal: G(360, 330), objects: [
+      { type: 'bar', x: 360, y: 640, len: 360, thick: 30, speed: 60, a0: 0 }] },
+    { name: 'Clockwork', shots: 2, boards: 'sides', ball: { x: 160, y: 1120 }, goal: G(540, 330), objects: [
+      { type: 'bar', x: 400, y: 560, len: 320, thick: 30, speed: -75, a0: 30 },
+      { type: 'defender', path: [140, 820, 580, 820], speed: 160, phase: 0.2 },
+      { type: 'wall', x: 150, y: 460, w: 220, h: 36, angle: 20 }] },
+    { name: 'Grand Final', shots: 2, boards: 'sides', ball: { x: 360, y: 1140 }, goal: G(110, 420, 'right', 170), objects: [
+      { type: 'bar', x: 360, y: 820, len: 300, thick: 30, speed: 90, a0: 90 },
+      { type: 'pad', x: 660, y: 520, w: 30, h: 300, angle: 0 },
+      { type: 'wall', x: 460, y: 420, w: 220, h: 36, angle: -30 },
+      { type: 'defender', path: [260, 330, 260, 520], speed: 110, phase: 0 },
+      { type: 'cone', x: 520, y: 1000 }] },
+  ];
+  // filled in by the offline solver (work/goal-puzzle/solve.js) — every level has a known 1-shot goal
+  const SOLUTIONS = [{"angle": -94, "power": 0.6, "t": 0, "score": 60}, {"angle": -139, "power": 0.8, "t": 0, "score": 59}, {"angle": -47, "power": 0.8, "t": 0, "score": 58}, {"angle": -137, "power": 0.8, "t": 0, "score": 59}, {"angle": -29, "power": 0.9, "t": 0, "score": 59}, {"angle": -65, "power": 0.8, "t": 0, "score": 60}, {"angle": -52, "power": 0.7, "t": 0, "score": 59}, {"angle": -138, "power": 0.8, "t": 0, "score": 59}, {"angle": 26, "power": 0.7, "t": 0, "score": 59}, {"angle": -94, "power": 0.6, "t": 500, "score": 80}, {"angle": -78, "power": 0.6, "t": 1000, "score": 80}, {"angle": -135, "power": 0.8, "t": 1000, "score": 79}, {"angle": -138, "power": 0.8, "t": 500, "score": 79}, {"angle": -63, "power": 0.8, "t": 500, "score": 80}, {"angle": -109, "power": 0.9, "t": 1500, "score": 80}];
+
+  /* ---------- small pure helpers ---------- */
+  function dirVec(dir) { return { down: { x: 0, y: 1 }, up: { x: 0, y: -1 }, left: { x: -1, y: 0 }, right: { x: 1, y: 0 } }[dir]; }
+  /** Goal geometry: inner area, posts, net walls (rects {x,y,w,h}). */
+  function goalGeom(g) {
+    const d = dirVec(g.dir), n = { x: -d.y, y: d.x };
+    const at = (along, across) => ({ x: g.x - d.x * along + n.x * across, y: g.y - d.y * along + n.y * across });
+    const t = C.NET_T, hw = g.w / 2;
+    const rect = (c, lenAlong, lenAcross) => (d.x === 0 ? { x: c.x, y: c.y, w: lenAcross, h: lenAlong } : { x: c.x, y: c.y, w: lenAlong, h: lenAcross });
+    const walls = [
+      rect(at(g.depth + t / 2, 0), t, g.w + 2 * t),            // back of the net
+      rect(at(g.depth / 2, hw + t / 2), g.depth, t),           // side nets
+      rect(at(g.depth / 2, -hw - t / 2), g.depth, t),
+    ];
+    const posts = [at(0, hw), at(0, -hw)];
+    const c = at(g.depth / 2, 0);
+    const area = d.x === 0 ? { x: c.x - hw, y: c.y - g.depth / 2, w: g.w, h: g.depth } : { x: c.x - g.depth / 2, y: c.y - hw, w: g.depth, h: g.w };
+    return { d, n, walls, posts, area };
+  }
+  /** Is the ball (centre p) a goal? Whole ball past the goal line, centre between the posts. */
+  function isGoal(g, p) {
+    const d = dirVec(g.dir), n = { x: -d.y, y: d.x };
+    const rx = p.x - g.x, ry = p.y - g.y;
+    const along = -(rx * d.x + ry * d.y), across = rx * n.x + ry * n.y;
+    return along >= C.BALL_R && along <= g.depth && Math.abs(across) < g.w / 2;
+  }
+  /** Push a resting ball out of any rotating bar at time tMs (bars sweep; the ball is swept along). Pure. */
+  function pushOutOfBars(level, tMs, ball) {
+    let p = ball;
+    for (const b of kinematicsAt(level, tMs).bars) {
+      const a = b.angle * deg, ca = Math.cos(a), sa = Math.sin(a);
+      const dx = p.x - b.x, dy = p.y - b.y, lx = dx * ca + dy * sa, ly = -dx * sa + dy * ca;
+      const hx = b.len / 2, hy = b.thick / 2, r = C.BALL_R + 0.5;
+      const cx = Math.max(-hx, Math.min(hx, lx)), cy = Math.max(-hy, Math.min(hy, ly));
+      let nx, ny;
+      if (cx === lx && cy === ly) {                    // centre inside the bar: leave by the nearest side
+        const px = hx - Math.abs(lx), py = hy - Math.abs(ly);
+        if (py <= px) { nx = lx; ny = (ly >= 0 ? 1 : -1) * (hy + r); } else { nx = (lx >= 0 ? 1 : -1) * (hx + r); ny = ly; }
+      } else {
+        const ex = lx - cx, ey = ly - cy, d = Math.hypot(ex, ey);
+        if (d >= r) continue;
+        nx = cx + ex / d * r; ny = cy + ey / d * r;
+      }
+      p = { x: b.x + nx * ca - ny * sa, y: b.y + nx * sa + ny * ca };
+      p = { x: Math.max(PITCH.x + C.BALL_R, Math.min(PITCH.x + PITCH.w - C.BALL_R, p.x)), y: Math.max(PITCH.y + C.BALL_R, Math.min(PITCH.y + PITCH.h - C.BALL_R, p.y)) };
+    }
+    return p;
+  }
+  function barOverlap(level, tMs, ball) {
+    for (const b of kinematicsAt(level, tMs).bars) {
+      const a = b.angle * deg, dx = ball.x - b.x, dy = ball.y - b.y;
+      const lx = dx * Math.cos(a) + dy * Math.sin(a), ly = -dx * Math.sin(a) + dy * Math.cos(a);
+      const ex = lx - Math.max(-b.len / 2, Math.min(b.len / 2, lx)), ey = ly - Math.max(-b.thick / 2, Math.min(b.thick / 2, ly));
+      if (Math.hypot(ex, ey) < C.BALL_R - 0.01) return true;
+    }
+    return false;
+  }
+  function isOut(p) { return p.x < PITCH.x || p.x > PITCH.x + PITCH.w || p.y < PITCH.y || p.y > PITCH.y + PITCH.h; }
+  function starsForShot(shotNo) { return shotNo >= 1 && shotNo <= 3 ? 4 - shotNo : 0; }
+  function coinsFor(prevBest, stars) { return 10 * Math.max(0, stars - (prevBest || 0)); }
+  function runScore(bestStars, coinsThisRun) { return bestStars.reduce((a, b) => a + (b || 0), 0) * 100 + coinsThisRun; }
+  /* ---------- shop ---------- */
+  const SKINS = [
+    { id: 'classic', name: 'Classic', price: 0 }, { id: 'gold', name: 'Gold', price: 50 },
+    { id: 'fire', name: 'Fire', price: 80 }, { id: 'ice', name: 'Ice', price: 80 },
+    { id: 'beach', name: 'Beach Ball', price: 100 }, { id: 'rainbow', name: 'Rainbow', price: 120 },
+  ];
+  function normShop(shop) {
+    const owned = Array.isArray(shop && shop.owned) ? shop.owned.filter((id) => SKINS.some((s) => s.id === id)) : [];
+    if (!owned.includes('classic')) owned.unshift('classic');
+    const selected = shop && owned.includes(shop.selected) ? shop.selected : 'classic';
+    return { owned, selected };
+  }
+  /** Buy (or just select if owned). Returns { ok, reason, shop, coins } — never mutates inputs. */
+  function buySkin(shop, coins, id) {
+    const s = normShop(shop), skin = SKINS.find((k) => k.id === id);
+    if (!skin) return { ok: false, reason: 'unknown', shop: s, coins };
+    if (s.owned.includes(id)) return { ok: true, reason: 'select', shop: { ...s, selected: id }, coins };
+    if (coins < skin.price) return { ok: false, reason: 'coins', shop: s, coins };
+    return { ok: true, reason: 'bought', shop: { owned: [...s.owned, id], selected: id }, coins: coins - skin.price };
+  }
+  function isUnlocked(bestStars, i) { return i === 0 || (bestStars[i - 1] || 0) > 0; }
+  function nextLevel(bestStars, n = LEVELS.length) { for (let i = 0; i < n; i++) if (!(bestStars[i] > 0)) return i; return n - 1; }
+  /** Drag (from ball to pointer) -> shot. Returns null if too short. Direction is opposite to the drag. */
+  function aimFromDrag(ball, pointer) {
+    const dx = pointer.x - ball.x, dy = pointer.y - ball.y, len = Math.hypot(dx, dy);
+    if (!(len >= C.MIN_DRAG)) return null;
+    return { angle: Math.atan2(-dy, -dx) / deg, power: Math.min(1, len / C.MAX_DRAG) };
+  }
+  function canGrab(ball, p) { return Math.hypot(p.x - ball.x, p.y - ball.y) <= C.GRAB_R; }
+  function velocityFor(angle, power) {
+    const p = Math.max(0, Math.min(1, power)) * C.MAX_SPEED;
+    return { x: Math.cos(angle * deg) * p, y: Math.sin(angle * deg) * p };
+  }
+  function pingPong(path, speed, phase, tMs) {
+    const [x1, y1, x2, y2] = path, L = Math.hypot(x2 - x1, y2 - y1) || 1;
+    let s = (speed * tMs / 1000 + phase * 2 * L) % (2 * L);
+    if (s < 0) s += 2 * L;
+    const f = (s <= L ? s : 2 * L - s) / L;
+    return { x: x1 + (x2 - x1) * f, y: y1 + (y2 - y1) * f };
+  }
+  /** Positions of all moving things at level time tMs (pure; used by the view and the simulation). */
+  function kinematicsAt(level, tMs) {
+    const defenders = [], bars = [];
+    for (const o of level.objects) {
+      if (o.type === 'defender') { const p = pingPong(o.path, o.speed, o.phase || 0, tMs); defenders.push({ x: p.x, y: p.y, r: C.DEFENDER_R }); }
+      else if (o.type === 'bar') bars.push({ x: o.x, y: o.y, len: o.len, thick: o.thick, angle: o.a0 + o.speed * tMs / 1000 });
+    }
+    return { defenders, bars };
+  }
+
+  /* ---------- matter.js simulation (no Pixi; M = the Matter namespace) ---------- */
+  function createSim(M, level, ballPos, tMs) {
+    const { Engine, Bodies, Composite, Body, Events } = M;
+    const engine = Engine.create({ gravity: { x: 0, y: 0, scale: 0 }, enableSleeping: false });
+    const statics = [];
+    const opt = (extra = {}) => ({ isStatic: true, friction: 0, frictionStatic: 0, restitution: 0, ...extra });
+    if (level.boards !== 'none') {
+      const t = C.BOARD_T;
+      statics.push(Bodies.rectangle(PITCH.x - t / 2, PITCH.y + PITCH.h / 2, t, PITCH.h + 2 * t, opt({ label: 'board' })));
+      statics.push(Bodies.rectangle(PITCH.x + PITCH.w + t / 2, PITCH.y + PITCH.h / 2, t, PITCH.h + 2 * t, opt({ label: 'board' })));
+    }
+    const gg = goalGeom(level.goal);
+    for (const r of gg.walls) statics.push(Bodies.rectangle(r.x, r.y, r.w, r.h, opt({ label: 'net' })));
+    for (const p of gg.posts) statics.push(Bodies.circle(p.x, p.y, C.POST_R, opt({ label: 'post' })));
+    const bars = [];
+    for (const o of level.objects) {
+      if (o.type === 'wall') statics.push(Bodies.rectangle(o.x, o.y, o.w, o.h, opt({ label: 'wall', angle: (o.angle || 0) * deg })));
+      else if (o.type === 'pad') statics.push(Bodies.rectangle(o.x, o.y, o.w, o.h, opt({ label: 'pad', angle: (o.angle || 0) * deg, restitution: C.PAD_RESTITUTION })));
+      else if (o.type === 'cone') statics.push(Bodies.circle(o.x, o.y, C.CONE_R, opt({ label: 'cone' })));
+      else if (o.type === 'bar') { const b = Bodies.rectangle(o.x, o.y, o.len, o.thick, opt({ label: 'bar' })); bars.push(b); statics.push(b); }
+    }
+    // Body.setStatic (isStatic: true) resets restitution to 0 and friction to 1 — re-apply ours afterwards.
+    for (const b of statics) { b.restitution = b.label === 'pad' ? C.PAD_RESTITUTION : 0; b.friction = 0; }
+    const ball = Bodies.circle(ballPos.x, ballPos.y, C.BALL_R, {
+      label: 'ball', restitution: C.RESTITUTION, frictionAir: C.FRICTION_AIR, friction: 0, frictionStatic: 0, inertia: Infinity,
+    });
+    Composite.add(engine.world, [...statics, ball]);
+    const sim = { M, engine, ball, bars, level, t: tMs, steps: 0, bounces: 0, result: null, ignore: new Set(), spin: 0 };
+    const kin = kinematicsAt(level, tMs);
+    kin.bars.forEach((k, i) => Body.setAngle(bars[i], k.angle * deg, false));
+    kin.defenders.forEach((d, i) => { if (Math.hypot(d.x - ballPos.x, d.y - ballPos.y) < d.r + C.BALL_R) sim.ignore.add(i); });
+    Events.on(engine, 'collisionStart', (ev) => { for (const p of ev.pairs) if (p.bodyA === ball || p.bodyB === ball) sim.bounces++; });
+    return sim;
+  }
+  function launch(sim, angle, power) { sim.M.Body.setVelocity(sim.ball, velocityFor(angle, power)); }
+  /** One fixed step. Returns the result ('goal'|'defender'|'out'|'stopped'|'timeout') when the shot ends, else null. */
+  function stepSim(sim) {
+    if (sim.result) return sim.result;
+    const { Engine, Body } = sim.M;
+    sim.t += C.STEP_MS; sim.steps++;
+    const kin = kinematicsAt(sim.level, sim.t);
+    kin.bars.forEach((k, i) => Body.setAngle(sim.bars[i], k.angle * deg, true));
+    Engine.update(sim.engine, C.STEP_MS);
+    if (sim.ball.speed > C.MAX_BALL_SPEED) {   // bouncy pads add energy: cap it so the ball can never tunnel through walls
+      const k = C.MAX_BALL_SPEED / sim.ball.speed;
+      Body.setVelocity(sim.ball, { x: sim.ball.velocity.x * k, y: sim.ball.velocity.y * k });
+    }
+    const p = sim.ball.position;
+    sim.spin += sim.ball.speed / C.BALL_R;
+    let r = null;
+    if (isGoal(sim.level.goal, p)) r = 'goal';
+    else {
+      kin.defenders.forEach((d, i) => {
+        const hit = Math.hypot(d.x - p.x, d.y - p.y) < d.r + C.BALL_R;
+        if (sim.ignore.has(i)) { if (!hit) sim.ignore.delete(i); } else if (hit && !r) r = 'defender';
+      });
+      if (!r && isOut(p)) r = 'out';
+      else if (!r && sim.ball.speed < C.STOP_SPEED) r = 'stopped';
+      else if (!r && sim.steps >= C.MAX_STEPS) r = 'timeout';
+    }
+    if (r) { sim.result = r; Body.setVelocity(sim.ball, { x: 0, y: 0 }); }
+    return r;
+  }
+  /** Headless full shot (also the aim-line predictor: maxBounces 2 stops just before the 3rd contact). */
+  function simulateShot(M, level, ballPos, tMs, angle, power, { maxBounces = Infinity, maxSteps = C.MAX_STEPS, record = false } = {}) {
+    const sim = createSim(M, level, ballPos, tMs);
+    launch(sim, angle, power);
+    const path = record ? [{ x: ballPos.x, y: ballPos.y }] : null;
+    let result = null;
+    while (!result && sim.steps < maxSteps) {
+      const before = { x: sim.ball.position.x, y: sim.ball.position.y };
+      result = stepSim(sim);
+      if (sim.bounces > maxBounces) { if (record) path.push(before); break; }
+      if (record) path.push({ x: sim.ball.position.x, y: sim.ball.position.y });
+    }
+    return { result, path, steps: sim.steps, bounces: sim.bounces, end: { x: sim.ball.position.x, y: sim.ball.position.y } };
+  }
+  function predictPath(M, level, ballPos, tMs, angle, power) {
+    return simulateShot(M, level, ballPos, tMs, angle, power, { maxBounces: 2, maxSteps: C.AIM_STEPS, record: true }).path;
+  }
+
+  /* ---------- level state machine (plain data + the live sim) ---------- */
+  function newLevelState(i) {
+    const L = LEVELS[i];
+    return { level: i, shots: 0, maxShots: L.shots, ball: { ...L.ball }, shotStart: { ...L.ball }, t: 0, phase: 'aim', goals: 0, stars: 0, lastResult: null };
+  }
+  /** Start a shot. Returns null when a shot is not allowed (ball moving / level over / bad power). */
+  function beginShot(M, ls, angle, power) {
+    if (ls.phase !== 'aim' || ls.shots >= ls.maxShots || !(power > 0) || !Number.isFinite(angle)) return null;
+    const ball = pushOutOfBars(LEVELS[ls.level], ls.t, ls.ball);
+    const sim = createSim(M, LEVELS[ls.level], ball, ls.t);
+    launch(sim, angle, power);
+    return { ls: { ...ls, ball, phase: 'moving', shots: ls.shots + 1, shotStart: { ...ball } }, sim };
+  }
+  /** Advance one fixed step. Returns { ls, event } with event null | 'goal' | 'failed' | 'shotEnd'. */
+  function advance(ls, sim) {
+    if (ls.phase === 'aim') {
+      const t = ls.t + C.STEP_MS, ball = pushOutOfBars(LEVELS[ls.level], t, ls.ball);
+      return { ls: { ...ls, t, ball }, event: null };
+    }
+    if (ls.phase !== 'moving' || !sim) return { ls, event: null };
+    const r = stepSim(sim);
+    const t = sim.t, pos = { x: sim.ball.position.x, y: sim.ball.position.y };
+    if (!r) return { ls: { ...ls, t, ball: pos }, event: null };
+    if (r === 'goal') return { ls: { ...ls, t, ball: pos, phase: 'won', goals: ls.goals + 1, stars: starsForShot(ls.shots), lastResult: r }, event: 'goal' };
+    const ball = r === 'out' || r === 'defender' ? { ...ls.shotStart } : pos;
+    if (ls.shots >= ls.maxShots) return { ls: { ...ls, t, ball, phase: 'failed', lastResult: r }, event: 'failed' };
+    return { ls: { ...ls, t, ball, phase: 'aim', lastResult: r }, event: 'shotEnd' };
+  }
+
+  return { C, PITCH, LEVELS, SOLUTIONS, SKINS, normShop, buySkin, mulberry32, goalGeom, isGoal, isOut, starsForShot, coinsFor, runScore, isUnlocked, pushOutOfBars, barOverlap,
+    nextLevel, aimFromDrag, canGrab, velocityFor, pingPong, kinematicsAt, createSim, launch, stepSim, simulateShot, predictPath,
+    newLevelState, beginShot, advance };
+})();
+if (typeof module !== 'undefined') module.exports = Logic;
+
+
+/* ##### GAME-SPECIFIC: logic self-tests (run by verify.py via window.__game.selfTest()) ##### */
+const MX = () => window.Matter;
+const PT = (x, y) => ({ x, y });
+function runShot(level, ball, t, angle, power) { return Logic.simulateShot(MX(), level, ball, t, angle, power); }
+function playLevelShot(ls, angle, power, maxSteps = 400) {
+  const b = Logic.beginShot(MX(), ls, angle, power);
+  if (!b) return null;
+  let cur = b.ls; const events = [];
+  for (let i = 0; i < maxSteps && cur.phase === 'moving'; i++) { const r = Logic.advance(cur, b.sim); cur = r.ls; if (r.event) events.push(r.event); }
+  return { ls: cur, events, sim: b.sim };
+}
+const TESTS = [
+  // every level's stored solution scores in a headless matter.js simulation (one test per level)
+  ...Logic.LEVELS.map((L, i) => [`level ${i + 1} "${L.name}" stored solution scores`, () => {
+    const s = Logic.SOLUTIONS[i];
+    assert(s && Number.isFinite(s.angle) && s.power > 0 && s.power <= 1, 'no stored solution');
+    const r = runShot(L, L.ball, s.t, s.angle, s.power);
+    assertEq(r.result, 'goal', 'solution result');
+    // and through the real level state machine (what the scene runs): 3 stars on shot 1
+    const ls = { ...Logic.newLevelState(i), t: s.t };
+    const p = playLevelShot(ls, s.angle, s.power);
+    assertEq([p.ls.phase, p.ls.stars, p.ls.goals], ['won', 3, 1], 'state machine');
+  }]),
+  ['levels are valid: 15, shot limits 1-3, ball/goal inside pitch, new mechanic every 3 levels', () => {
+    assertEq(Logic.LEVELS.length, 15);
+    const P = Logic.PITCH, inside = (p) => p.x > P.x && p.x < P.x + P.w && p.y > P.y && p.y < P.y + P.h;
+    const firstSeen = {};
+    Logic.LEVELS.forEach((L, i) => {
+      assert(L.shots >= 1 && L.shots <= 3, 'shots ' + i);
+      assert(inside(L.ball), 'ball outside ' + i);
+      const g = Logic.goalGeom(L.goal);
+      const rects = [...g.walls.map((r) => ({ x: r.x - r.w / 2, y: r.y - r.h / 2, w: r.w, h: r.h })), g.area];
+      for (const r of rects) for (const [cx, cy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) assert(inside({ x: r.x + cx * r.w, y: r.y + cy * r.h }), 'goal outside pitch in level ' + (i + 1));
+      // a ball left alone does not move and is not touching anything (speed stays 0 -> 'stopped' at once)
+      const r = runShot(L, L.ball, 0, 0, 0.00001);
+      assert(['stopped', 'defender'].includes(r.result) && Math.hypot(r.end.x - L.ball.x, r.end.y - L.ball.y) < 0.5, 'ball overlaps something in level ' + (i + 1));
+      for (const o of L.objects) if (!(o.type in firstSeen)) firstSeen[o.type] = i;
+    });
+    assertEq([firstSeen.wall, firstSeen.cone, firstSeen.pad, firstSeen.defender, firstSeen.bar], [1, 2, 6, 9, 12], 'mechanics order');
+  }],
+  ['stars: goal on shot 1/2/3 = 3/2/1', () => {
+    assertEq([1, 2, 3].map(Logic.starsForShot), [3, 2, 1]);
+    // real flow: waste one shot (backwards, out), then score -> 2 stars
+    const L = Logic.LEVELS[0], s = Logic.SOLUTIONS[0];
+    let ls = Logic.newLevelState(0);
+    const miss = playLevelShot(ls, 90, 1);
+    assertEq([miss.ls.phase, miss.ls.shots, miss.ls.lastResult], ['aim', 1, 'out']);
+    assertEq(miss.ls.ball, L.ball, 'ball returns to the shot start after going out');
+    const hit = playLevelShot(miss.ls, s.angle, s.power);
+    assertEq([hit.ls.phase, hit.ls.stars], ['won', 2]);
+  }],
+  ['out of shots without a goal = level failed', () => {
+    let ls = Logic.newLevelState(8);   // 1-shot level
+    const r = playLevelShot(ls, 90, 0.2);
+    assertEq(r.ls.phase, 'failed'); assertEq(r.events, ['failed']);
+    assertEq(Logic.beginShot(MX(), r.ls, -90, 1), null, 'no shot after failing');
+  }],
+  ['classic bug: cannot shoot while the ball is still moving', () => {
+    const ls = Logic.newLevelState(0);
+    const b = Logic.beginShot(MX(), ls, -90, 1);
+    assertEq(b.ls.phase, 'moving');
+    const s2 = Logic.advance(b.ls, b.sim).ls;
+    assertEq(Logic.beginShot(MX(), s2, 0, 1), null, 'second shot while moving');
+    assertEq(s2.shots, 1);
+  }],
+  ['classic bug: a goal is counted once', () => {
+    const s = Logic.SOLUTIONS[0];
+    const p = playLevelShot(Logic.newLevelState(0), s.angle, s.power);
+    assertEq(p.events.filter((e) => e === 'goal').length, 1);
+    let ls = p.ls, events = 0;
+    for (let i = 0; i < 200; i++) { const r = Logic.advance(ls, p.sim); ls = r.ls; if (r.event) events++; }
+    assertEq([ls.goals, ls.stars, events, ls.phase], [1, 3, 0, 'won']);
+  }],
+  ['classic bug: ball stuck bouncing forever ends after 6 s', () => {
+    // a box of bouncy pads keeps the ball fast forever -> the 6 s cap must end the shot
+    const pad = (x, y, w, h) => ({ type: 'pad', x, y, w, h, angle: 0 });
+    const L = { shots: 3, boards: 'none', ball: PT(360, 700), goal: { x: 360, y: 330, w: 180, depth: 70, dir: 'down' },
+      objects: [pad(360, 460, 560, 80), pad(360, 940, 560, 80), pad(120, 700, 80, 560), pad(600, 700, 80, 560)] };
+    const r = runShot(L, L.ball, 0, 33, 1);
+    assertEq([r.result, r.steps], ['timeout', Logic.C.MAX_STEPS]);
+    assert(Logic.C.MAX_STEPS * Logic.C.STEP_MS <= 6001, '6 s cap');
+    // and the speed cap holds while pads keep adding energy
+    const sim = Logic.createSim(MX(), L, L.ball, 0); Logic.launch(sim, 33, 1); let maxV = 0;
+    while (!Logic.stepSim(sim)) maxV = Math.max(maxV, sim.ball.speed);
+    assert(maxV <= Logic.C.MAX_BALL_SPEED + 1e-6, 'speed cap ' + maxV);
+  }],
+  ['classic bug: aim line matches the real shot (moving bar + defender level)', () => {
+    const i = 13, L = Logic.LEVELS[i], t = 700, angle = -70, power = 0.85;
+    const pred = Logic.predictPath(MX(), L, L.ball, t, angle, power);
+    assert(pred.length > 10, 'prediction too short');
+    const b = Logic.beginShot(MX(), { ...Logic.newLevelState(i), t }, angle, power);
+    const real = [{ ...L.ball }]; let ls = b.ls;
+    while (ls.phase === 'moving' && real.length < pred.length) { ls = Logic.advance(ls, b.sim).ls; real.push({ ...b.sim.ball.position }); }
+    for (let k = 0; k < Math.min(pred.length, real.length) - 1; k++) {
+      assert(Math.hypot(pred[k].x - real[k].x, pred[k].y - real[k].y) < 1e-6, `point ${k} differs`);
+    }
+    // the predictor stops just before the 3rd contact
+    const full = Logic.simulateShot(MX(), L, L.ball, t, angle, power, { maxBounces: 2, maxSteps: 150, record: true });
+    assert(full.bounces <= 3, 'bounces');
+  }],
+  ['classic bug: moving things depend only on level time (paused => time does not advance => frozen)', () => {
+    const L = Logic.LEVELS[10];
+    assertEq(Logic.kinematicsAt(L, 1234), Logic.kinematicsAt(L, 1234));
+    assert(JSON.stringify(Logic.kinematicsAt(L, 0)) !== JSON.stringify(Logic.kinematicsAt(L, 500)), 'defenders move with time');
+    const ls = Logic.newLevelState(10);
+    const a = Logic.advance(ls, null).ls;
+    assertEq(a.t, Logic.C.STEP_MS); assertEq(ls.t, 0, 'advance must not mutate');
+    // ping-pong stays on its path and turns around
+    const o = L.objects.find((x) => x.type === 'defender');
+    for (let t = 0; t < 20000; t += 137) { const p = Logic.pingPong(o.path, o.speed, o.phase, t); assert(p.x >= 119.99 && p.x <= 600.01 && Math.abs(p.y - 800) < 1e-9, 'off path'); }
+  }],
+  ['defender hit stops the shot (not a loss) and returns the ball', () => {
+    const L = Logic.LEVELS[9];
+    // a still defender straight in front of the ball
+    const lvl = { ...L, objects: [{ type: 'defender', path: [360, 700, 400, 700], speed: 0, phase: 0 }] };
+    const r = runShot(lvl, L.ball, 0, -90, 1);
+    assertEq(r.result, 'defender');
+    assert(Math.abs(r.end.y - 700) <= Logic.C.DEFENDER_R + Logic.C.BALL_R + 1, 'stopped at the defender');
+    // the moving one through the level state machine: find an angle that meets it
+    let hit = null;
+    for (let a = -135; a <= -45 && !hit; a += 1) { const p = playLevelShot(Logic.newLevelState(9), a, 1); if (p.ls.lastResult === 'defender') hit = p; }
+    assert(hit, 'no angle hits the moving defender');
+    assertEq([hit.ls.phase, hit.ls.shots], ['aim', 1]);
+    assertEq(hit.ls.ball, L.ball);
+  }],
+  ['aim: drag starts within 90 px, direction opposite to drag, power capped', () => {
+    const b = PT(100, 100);
+    assert(Logic.canGrab(b, PT(190, 100)) && !Logic.canGrab(b, PT(191, 100)), 'grab radius 90');
+    const a = Logic.aimFromDrag(b, PT(100, 200));   // drag down -> shoot up
+    assert(Math.abs(a.angle + 90) < 1e-9 && Math.abs(a.power - 100 / Logic.C.MAX_DRAG) < 1e-9, JSON.stringify(a));
+    // power is measured from where the drag started, not from the ball: same drag vector anywhere = same shot
+    const start = PT(160, 130), end = PT(160, 230);
+    assertEq(Logic.aimFromDrag(start, end), a);
+    // a tap (pointer not moved from the press point) is not a shot, even 18-90 px from the ball
+    assertEq(Logic.aimFromDrag(start, start), null); assertEq(Logic.aimFromDrag(start, PT(170, 140)), null);
+    assertEq(Logic.aimFromDrag(b, PT(100, 1000)).power, 1);
+    assertEq(Logic.aimFromDrag(b, PT(105, 105)), null);
+    const v = Logic.velocityFor(-90, 5);
+    assert(Math.abs(Math.hypot(v.x, v.y) - Logic.C.MAX_SPEED) < 1e-9, 'power cap');
+  }],
+  ['goal detection: whole ball over the line and between the posts (all 4 directions)', () => {
+    const r = Logic.C.BALL_R;
+    const cases = [['down', PT(0, -r - 1), PT(0, -r + 1)], ['up', PT(0, r + 1), PT(0, r - 1)], ['right', PT(-r - 1, 0), PT(-r + 1, 0)], ['left', PT(r + 1, 0), PT(r - 1, 0)]];
+    for (const [dir, inP, outP] of cases) {
+      const g = { x: 300, y: 500, w: 180, depth: 70, dir };
+      assert(Logic.isGoal(g, PT(300 + inP.x, 500 + inP.y)), dir + ' in');
+      assert(!Logic.isGoal(g, PT(300 + outP.x, 500 + outP.y)), dir + ' on the line');
+      const side = dir === 'down' || dir === 'up' ? PT(300 + 91, 500 + inP.y) : PT(300 + inP.x, 500 + 91);
+      assert(!Logic.isGoal(g, side), dir + ' wide');
+    }
+  }],
+  ['bouncy pad returns the ball faster than a normal wall', () => {
+    const mk = (type) => ({ shots: 3, boards: 'none', ball: PT(360, 900), goal: { x: 360, y: 330, w: 180, depth: 70, dir: 'down' }, objects: [{ type, x: 360, y: 700, w: 300, h: 30, angle: 0 }] });
+    const speedAfter = (type) => { const sim = Logic.createSim(MX(), mk(type), PT(360, 900), 0); Logic.launch(sim, -90, 0.6); let n = 0;
+      while (sim.ball.velocity.y < 0 && n++ < 200) Logic.stepSim(sim); return sim.ball.velocity.y; };
+    const vw = speedAfter('wall'), vp = speedAfter('pad');
+    assert(vw > 0 && vp > vw * 1.5, `wall ${vw} pad ${vp}`);
+  }],
+  ['every stored solution can be dragged on the canvas (press within 90 px of the ball, release inside 720x1280)', () => {
+    Logic.LEVELS.forEach((L, i) => {
+      const s = Logic.SOLUTIONS[i], a = s.angle * Math.PI / 180, d = s.power * Logic.C.MAX_DRAG;
+      let ok = null;
+      for (let r = 0; r <= Logic.C.GRAB_R && !ok; r += 10) for (let k = 0; k < 16 && !ok; k++) {
+        const st = PT(L.ball.x + Math.cos(k * Math.PI / 8) * r, L.ball.y + Math.sin(k * Math.PI / 8) * r);
+        const en = PT(st.x - Math.cos(a) * d, st.y - Math.sin(a) * d);
+        if (en.x >= 4 && en.x <= 716 && en.y >= 4 && en.y <= 1276) ok = { st, en };
+      }
+      assert(ok, 'level ' + (i + 1) + ' solution needs a drag off the canvas');
+      const aim = Logic.aimFromDrag(ok.st, ok.en);
+      assert(Math.abs(aim.angle - s.angle) < 1e-6 && Math.abs(aim.power - s.power) < 1e-6, 'drag reproduces the shot ' + (i + 1));
+      assert(Logic.canGrab(L.ball, ok.st), 'press near ball');
+    });
+  }],
+  ['classic bug: rotating bar never sweeps through a resting ball', () => {
+    for (const i of [12, 13, 14]) {
+      const L = Logic.LEVELS[i], bar = L.objects.find((o) => o.type === 'bar');
+      // put the ball on the bar's sweep circle, then let 8 s of aiming time pass
+      let ls = { ...Logic.newLevelState(i), ball: PT(bar.x + bar.len * 0.3, bar.y + 40) };
+      for (let k = 0; k < 480; k++) {
+        ls = Logic.advance(ls, null).ls;
+        assert(!Logic.barOverlap(L, ls.t, ls.ball), `level ${i + 1}: ball inside the bar at t=${ls.t}`);
+        assert(!Logic.isOut(ls.ball), 'pushed off the pitch');
+      }
+      // a shot started now begins outside the bar
+      const b = Logic.beginShot(MX(), ls, -90, 0.5);
+      assert(!Logic.barOverlap(L, b.ls.t, b.ls.ball), 'shot starts inside the bar');
+    }
+    // pushOutOfBars leaves a ball that is clear of every bar untouched
+    const L = Logic.LEVELS[12]; assertEq(Logic.pushOutOfBars(L, 0, L.ball), L.ball);
+  }],
+  ['coins +10 per new star, only the first time; session score', () => {
+    assertEq(Logic.coinsFor(0, 3), 30); assertEq(Logic.coinsFor(3, 3), 0); assertEq(Logic.coinsFor(1, 3), 20); assertEq(Logic.coinsFor(2, 1), 0);
+    const best = new Array(15).fill(0); best[0] = 3; best[4] = 2;
+    assertEq(Logic.runScore(best, 30), 530);   // total stars x 100 + coins earned this run
+  }],
+  ['level unlocking and Play target', () => {
+    assert(Logic.isUnlocked([], 0) && !Logic.isUnlocked([], 1) && Logic.isUnlocked([1], 1) && !Logic.isUnlocked([0, 2], 1), 'unlock');
+    assertEq(Logic.nextLevel([]), 0); assertEq(Logic.nextLevel([3, 1]), 2); assertEq(Logic.nextLevel(new Array(15).fill(2)), 14);
+  }],
+  ['shop: buy with coins, select owned, never mutate', () => {
+    const shop = { owned: ['classic'], selected: 'classic' }; const before = JSON.stringify(shop);
+    const a = Logic.buySkin(shop, 60, 'gold');
+    assertEq([a.ok, a.reason, a.coins, a.shop.selected], [true, 'bought', 10, 'gold']);
+    const b = Logic.buySkin(a.shop, 10, 'fire');
+    assertEq([b.ok, b.reason, b.coins, b.shop.selected], [false, 'coins', 10, 'gold']);
+    const c = Logic.buySkin(a.shop, 0, 'classic');
+    assertEq([c.ok, c.shop.selected, c.coins], [true, 'classic', 0]);
+    assertEq(JSON.stringify(shop), before);
+    assertEq(Logic.normShop(null), { owned: ['classic'], selected: 'classic' });
+    assertEq(Logic.SKINS.length, 6);
+  }],
+  ['seeded random shots on every level: valid results, no NaN, ball stays on the pitch', () => {
+    const rng = Logic.mulberry32(7);
+    const valid = ['goal', 'defender', 'out', 'stopped', 'timeout'];
+    for (let k = 0; k < 45; k++) {
+      const i = k % 15; let ls = { ...Logic.newLevelState(i), t: rng() * 5000 };
+      while (ls.phase === 'aim') {
+        const p = playLevelShot(ls, rng() * 360 - 180, 0.2 + rng() * 0.8);
+        ls = p.ls;
+        assert(valid.includes(ls.lastResult), 'result ' + ls.lastResult);
+        assert(Number.isFinite(ls.ball.x) && Number.isFinite(ls.ball.y), 'NaN');
+        if (ls.phase !== 'won') assert(!Logic.isOut(ls.ball), 'ball left on the pitch');
+        assert(ls.shots <= ls.maxShots, 'shot limit');
+      }
+      assert(ls.phase === 'won' ? ls.stars === Logic.starsForShot(ls.shots) : ls.phase === 'failed', 'end state');
+    }
+  }],
+];
+
+
+/* ##### GAME-SPECIFIC: the game scene ##### */
+/* ---------- drawing helpers (Pixi only; read Logic data) ---------- */
+const COL = { grassA: 0x2f8f3f, grassB: 0x37a049, stands: 0x1c5a28, line: 0xffffff, wall: 0x9aa7b4, wallEdge: 0x5d6b78,
+  pad: 0xff4fd8, padEdge: 0xffb3f0, cone: 0xff8a1f, bar: 0x3d7bff, board: 0x263238 };
+function drawSkin(g, id, r) {
+  const wedges = (cols) => { const n = cols.length; for (let k = 0; k < n; k++) { const a0 = (k / n) * Math.PI * 2, a1 = ((k + 1) / n) * Math.PI * 2;
+    g.moveTo(0, 0).arc(0, 0, r, a0, a1).closePath().fill(cols[k]); } };
+  const pent = (cx, cy, rr, col, rot = -Math.PI / 2) => { const pts = []; for (let k = 0; k < 5; k++) { const a = rot + k * Math.PI * 2 / 5; pts.push(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr); } g.poly(pts).fill(col); };
+  const patches = (base, patch, edge) => {
+    g.circle(0, 0, r).fill(base);
+    pent(0, 0, r * 0.36, patch);
+    for (let k = 0; k < 5; k++) { const a = -Math.PI / 2 + k * Math.PI * 2 / 5 + Math.PI / 5; pent(Math.cos(a) * r * 0.8, Math.sin(a) * r * 0.8, r * 0.22, patch, a); }
+    g.circle(0, 0, r).stroke({ width: Math.max(1.5, r * 0.09), color: edge });
+  };
+  switch (id) {
+    case 'gold': patches(0xffd54f, 0xb8860b, 0x8d6e00); break;
+    case 'fire': patches(0xff5722, 0xffc107, 0xb71c1c); g.circle(-r * 0.3, -r * 0.35, r * 0.18).fill({ color: 0xffffff, alpha: 0.35 }); break;
+    case 'ice': patches(0xd7f3ff, 0x4fc3f7, 0x0277bd); g.circle(-r * 0.3, -r * 0.35, r * 0.2).fill({ color: 0xffffff, alpha: 0.7 }); break;
+    case 'rainbow': wedges([0xff3b30, 0xff9500, 0xffcc00, 0x34c759, 0x007aff, 0xaf52de]); g.circle(0, 0, r * 0.25).fill(0xffffff); g.circle(0, 0, r).stroke({ width: Math.max(1.5, r * 0.08), color: 0x333333 }); break;
+    case 'beach': wedges([0xe53935, 0xffffff, 0x1e88e5, 0xffffff, 0xfdd835, 0xffffff]); g.circle(0, 0, r * 0.22).fill(0xffffff); g.circle(0, 0, r).stroke({ width: Math.max(1.5, r * 0.08), color: 0x455a64 }); break;
+    default: patches(0xffffff, 0x222222, 0x222222);
+  }
+  return g;
+}
+function makeSkinView(id, r) { const c = new Container(); c.addChild(drawSkin(new Graphics(), id, r)); return c; }
+function starStr(n) { return '★'.repeat(n) + '☆'.repeat(Math.max(0, 3 - n)); }
+function loadProgress() { const s = Store.get('stars', []); return Array.from({ length: Logic.LEVELS.length }, (_, i) => (Array.isArray(s) && Number.isInteger(s[i]) ? Math.max(0, Math.min(3, s[i])) : 0)); }
+function loadCoins() { const c = Store.get('coins', 0); return Number.isFinite(c) && c >= 0 ? c : 0; }
+
+/* ---------- GameScene ---------- */
+class GameScene extends GameSceneBase {
+  enter(data) { this.startLevel = data && Number.isInteger(data.level) ? data.level : null; super.enter(); }
+  initGame() {
+    this.best = loadProgress();
+    this.coins = loadCoins();
+    this.shop = Logic.normShop(Store.get('shop', null));
+    this.runCoins = 0;                                  // coins earned in this run
+    this.baseStars = this.best.reduce((a, b) => a + b, 0);   // stars already saved when the run started
+    this.acc = 0; this.parts = []; this.pending = null; this.shakeT = 0; this.frame = 0;
+    this.drag = null; this.aim = null; this.keyAim = null; this.aimKey = '';
+    this.bg = new Graphics(); this.levelLayer = new Container(); this.goalView = new Container();
+    this.dynLayer = new Container(); this.aimG = new Graphics(); this.fxLayer = new Container();
+    this.ballView = makeSkinView(this.shop.selected, Logic.C.BALL_R);
+    const shadow = new Graphics(); shadow.ellipse(4, 6, Logic.C.BALL_R, Logic.C.BALL_R * 0.8).fill({ color: 0x000000, alpha: 0.25 });
+    this.ballShadow = shadow;
+    this.board.addChild(this.bg, this.levelLayer, this.goalView, this.dynLayer, this.aimG, this.ballShadow, this.ballView, this.fxLayer);
+    this.infoL = makeText('', 28, THEME.text, '700'); this.infoL.anchor.set(0, 0.5); this.infoL.position.set(28, 188);
+    this.infoR = makeText('', 26, THEME.accent, '700'); this.infoR.anchor.set(1, 0.5); this.infoR.position.set(W - 28, 188);
+    this.board.addChild(this.infoL, this.infoR);
+    this.drawPitch();
+    // pointer drag (aim). The shell's swipe/tap detection still runs; handleInput ignores swipes/taps.
+    const st = Scenes.app.stage;
+    this.onDown = (e) => this.pointerDown(e); this.onMove = (e) => this.pointerMove(e); this.onUp = (e) => this.pointerUp(e);
+    st.on('pointerdown', this.onDown); st.on('pointermove', this.onMove); st.on('pointerup', this.onUp); st.on('pointerupoutside', this.onUp);
+    let lvl = this.startLevel != null ? this.startLevel : Logic.nextLevel(this.best);
+    if (!Logic.isUnlocked(this.best, lvl)) lvl = Logic.nextLevel(this.best);
+    this.loadLevel(lvl);
+  }
+  cleanup() {
+    const st = Scenes.app.stage;
+    st.off('pointerdown', this.onDown); st.off('pointermove', this.onMove); st.off('pointerup', this.onUp); st.off('pointerupoutside', this.onUp);
+  }
+  drawPitch() {
+    const g = this.bg, P = Logic.PITCH;
+    g.rect(0, 150, W, H - 150).fill(COL.stands);
+    const n = 13, bh = P.h / n;
+    for (let k = 0; k < n; k++) g.rect(P.x, P.y + k * bh, P.w, bh + 0.5).fill(k % 2 ? COL.grassA : COL.grassB);
+    g.rect(P.x, P.y, P.w, P.h).stroke({ width: 4, color: COL.line, alpha: 0.9 });
+    g.moveTo(P.x, P.y + P.h / 2).lineTo(P.x + P.w, P.y + P.h / 2).stroke({ width: 4, color: COL.line, alpha: 0.7 });
+    g.circle(P.x + P.w / 2, P.y + P.h / 2, 90).stroke({ width: 4, color: COL.line, alpha: 0.7 });
+    g.circle(P.x + P.w / 2, P.y + P.h / 2, 6).fill({ color: COL.line, alpha: 0.8 });
+  }
+  loadLevel(i) {
+    this.levelIdx = i; this.L = Logic.LEVELS[i];
+    this.ls = Logic.newLevelState(i); this.sim = null;
+    this.acc = 0; this.pending = null; this.drag = null; this.aim = null; this.keyAim = null; this.aimKey = ''; this.spin = 0;
+    this.hideOverlay();
+    for (const c of this.levelLayer.removeChildren()) c.destroy({ children: true });
+    for (const c of this.goalView.removeChildren()) c.destroy({ children: true });
+    for (const c of this.dynLayer.removeChildren()) c.destroy({ children: true });
+    for (const p of this.parts) p.g.destroy(); this.parts = [];
+    this.aimG.clear();
+    const P = Logic.PITCH, L = this.L, lg = new Graphics();
+    if (L.boards !== 'none') {
+      lg.rect(P.x - 16, P.y - 4, 16, P.h + 8).fill(COL.board); lg.rect(P.x + P.w, P.y - 4, 16, P.h + 8).fill(COL.board);
+      lg.rect(P.x - 10, P.y, 3, P.h).fill({ color: 0xffffff, alpha: 0.35 }); lg.rect(P.x + P.w + 7, P.y, 3, P.h).fill({ color: 0xffffff, alpha: 0.35 });
+    }
+    this.levelLayer.addChild(lg);
+    for (const o of L.objects) {
+      if (o.type === 'wall' || o.type === 'pad') {
+        const c = new Container(), g = new Graphics();
+        g.rect(-o.w / 2 + 4, -o.h / 2 + 5, o.w, o.h).fill({ color: 0x000000, alpha: 0.22 });
+        if (o.type === 'wall') { g.rect(-o.w / 2, -o.h / 2, o.w, o.h).fill(COL.wall).stroke({ width: 3, color: COL.wallEdge }); }
+        else {
+          g.roundRect(-o.w / 2, -o.h / 2, o.w, o.h, Math.min(o.w, o.h) / 2).fill(COL.pad).stroke({ width: 3, color: COL.padEdge });
+          const horiz = o.w >= o.h, len = horiz ? o.w : o.h;
+          for (let s = -len / 2 + 20; s < len / 2 - 10; s += 26) { if (horiz) g.circle(s, 0, 4).fill(COL.padEdge); else g.circle(0, s, 4).fill(COL.padEdge); }
+        }
+        c.addChild(g); c.position.set(o.x, o.y); c.rotation = (o.angle || 0) * Math.PI / 180;
+        this.levelLayer.addChild(c);
+      } else if (o.type === 'cone') {
+        const g = new Graphics();
+        g.circle(o.x + 3, o.y + 5, 15).fill({ color: 0x000000, alpha: 0.25 });
+        g.circle(o.x, o.y, 15).fill(COL.cone).circle(o.x, o.y, 9).fill(0xffffff).circle(o.x, o.y, 5).fill(COL.cone);
+        this.levelLayer.addChild(g);
+      }
+    }
+    // goal: net + frame + posts
+    const gg = Logic.goalGeom(L.goal), a = gg.area, net = new Graphics();
+    net.rect(a.x, a.y, a.w, a.h).fill({ color: 0xffffff, alpha: 0.12 });
+    for (let x = a.x + 12; x < a.x + a.w; x += 12) net.moveTo(x, a.y).lineTo(x, a.y + a.h);
+    for (let y = a.y + 12; y < a.y + a.h; y += 12) net.moveTo(a.x, y).lineTo(a.x + a.w, y);
+    net.stroke({ width: 1.5, color: 0xffffff, alpha: 0.45 });
+    for (const r of gg.walls) net.rect(r.x - r.w / 2, r.y - r.h / 2, r.w, r.h).fill(0xf5f5f5);
+    for (const p of gg.posts) net.circle(p.x, p.y, Logic.C.POST_R).fill(0xffffff).stroke({ width: 2, color: 0x9e9e9e });
+    this.goalView.addChild(net);
+    // moving things
+    this.defViews = []; this.barViews = [];
+    let di = 0;
+    for (const o of L.objects) {
+      if (o.type === 'defender') {
+        const c = new Container(), g = new Graphics(), r = Logic.C.DEFENDER_R, col = di++ % 2 ? 0x1e63d6 : 0xe53935;
+        g.ellipse(5, 7, r, r * 0.85).fill({ color: 0x000000, alpha: 0.28 });
+        g.ellipse(0, 0, r, r * 0.72).fill(col).stroke({ width: 3, color: 0xffffff });
+        g.circle(0, 0, r * 0.45).fill(0x5d4037).circle(0, -2, r * 0.36).fill(0x6d4c41);
+        c.addChild(g); this.dynLayer.addChild(c); this.defViews.push(c);
+      } else if (o.type === 'bar') {
+        const c = new Container(), g = new Graphics();
+        g.rect(-o.len / 2 + 4, -o.thick / 2 + 5, o.len, o.thick).fill({ color: 0x000000, alpha: 0.25 });
+        g.roundRect(-o.len / 2, -o.thick / 2, o.len, o.thick, 8).fill(COL.bar).stroke({ width: 3, color: 0xbcd2ff });
+        g.circle(0, 0, 10).fill(0xffffff).circle(0, 0, 5).fill(COL.bar);
+        c.addChild(g); c.position.set(o.x, o.y); this.dynLayer.addChild(c); this.barViews.push(c);
+      }
+    }
+    this.renderDynamic(); this.updateInfo(); this.setScore(this.runScore());
+  }
+  /** HUD score = what this run added so far (starts at 0). The saved high score adds the stars owned before the run,
+      so the entry is exactly the spec's total stars x 100 + coins earned this run. */
+  runScore() { return Logic.runScore(this.best, this.runCoins) - this.baseStars * 100; }
+  endGame(opts) { if (this.state !== 'over') this.setScore(this.score + this.baseStars * 100); super.endGame(opts); }
+  /** R / Pause -> Restart: replay the CURRENT level in the same run (score unchanged, no high-score entry). */
+  restart() { if (this.state === 'over') return; if (this.state === 'paused') this.resume(); this.hideAllOverlays(); this.loadLevel(this.levelIdx); }
+  /** Keyboard: Enter/Space on a result panel = its first button. */
+  onAction(a, source, pos) {
+    if (this.state === 'playing' && this.overlay && this.overlayPrimary && (a === 'confirm' || a === 'action')) { const f = this.overlayPrimary; f(); return; }
+    super.onAction(a, source, pos);
+  }
+  showPanel(title, buttons, subtitle) { this.showOverlay(title, buttons, subtitle); this.overlayPrimary = buttons[0][1]; }
+  hideOverlay() { super.hideOverlay(); this.overlayPrimary = null; }
+  endRun() { if (this.state !== 'playing') return; this.setScore(this.runScore()); this.endGame({ won: false }); }
+  gameOverData() { return { extraLine: `★ ${this.best.reduce((a, b) => a + b, 0)} / 45 stars  ·  +${this.runCoins} coins this run` }; }
+  updateInfo() {
+    const left = `Level ${this.levelIdx + 1}: ${this.L.name}`;
+    const rem = this.ls.maxShots - this.ls.shots;
+    const right = `Shots ${'●'.repeat(rem)}${'○'.repeat(this.ls.shots)}   Coins ${this.coins}`;
+    if (this.infoL.text !== left) { this.infoL.text = left; fitText(this.infoL, 380); }
+    if (this.infoR.text !== right) { this.infoR.text = right; fitText(this.infoR, 300); }
+  }
+  canAim() { return this.state === 'playing' && !this.overlay && this.ls && this.ls.phase === 'aim' && Scenes.current === this; }
+  designPos(e) { return this.board.toLocal(e.global); }
+  pointerDown(e) {
+    if (!this.canAim()) return;
+    let n = e.target; while (n) { if (n.isButton) return; n = n.parent; }
+    const p = this.designPos(e);
+    if (!Logic.canGrab(this.ls.ball, p)) return;
+    this.drag = { sx: p.x, sy: p.y, x: p.x, y: p.y }; this.keyAim = null; this.aim = null;
+  }
+  pointerMove(e) {
+    if (!this.drag) return;
+    if (!this.canAim()) { this.drag = null; this.aim = null; return; }
+    const p = this.designPos(e); this.drag.x = p.x; this.drag.y = p.y;
+    this.aim = Logic.aimFromDrag({ x: this.drag.sx, y: this.drag.sy }, p);   // measured from where the press started
+  }
+  pointerUp(e) {
+    if (!this.drag) return;
+    const p = this.designPos(e), d = this.drag; this.drag = null;
+    const aim = this.canAim() ? Logic.aimFromDrag({ x: d.sx, y: d.sy }, p) : null;   // null for a tap (moved < MIN_DRAG)
+    this.aim = null;
+    if (aim) this.shoot(aim.angle, aim.power);
+  }
+  /** Start a shot (used by drag release, keyboard and checks.js). Returns false if not allowed (e.g. ball moving). */
+  shoot(angle, power) {
+    if (!this.canAim()) return false;
+    const r = Logic.beginShot(window.Matter, this.ls, angle, power);
+    if (!r) return false;
+    this.ls = r.ls; this.sim = r.sim; this.aim = null; this.keyAim = null; this.drag = null;
+    this.aimG.clear(); this.aimKey = '';
+    Sfx.play('hit'); this.updateInfo();
+    return true;
+  }
+  handleInput(a, source) {
+    if (source !== 'key' || !this.canAim()) return;
+    if (!this.keyAim) this.keyAim = { angle: -90, power: 0.6 };
+    const k = this.keyAim;
+    if (a === 'left') k.angle -= 2; else if (a === 'right') k.angle += 2;
+    else if (a === 'up') k.power = Math.min(1, k.power + 0.05); else if (a === 'down') k.power = Math.max(0.1, k.power - 0.05);
+    else if (a === 'action' || a === 'confirm') { this.shoot(k.angle, k.power); return; }
+    this.aim = { angle: k.angle, power: k.power }; Sfx.play('move');
+  }
+  /** Run n fixed steps synchronously (same code path as tick; used by checks.js). */
+  fastForward(n) { for (let i = 0; i < n && this.state === 'playing'; i++) this.fixedStep(); this.renderDynamic(); }
+  /** Show a pending end-of-level overlay right away (checks.js; the ticker does this after a short delay). */
+  flushPending() { if (this.pending) { const f = this.pending.fn; this.pending = null; if (this.state === 'playing') f(); } }
+  fixedStep() {
+    if (this.overlay && this.ls.phase !== 'moving') return;
+    const r = Logic.advance(this.ls, this.sim);
+    this.ls = r.ls;
+    if (r.event) this.onEvent(r.event);
+  }
+  onEvent(ev) {
+    if (ev === 'goal') {
+      this.sim = null;
+      const i = this.levelIdx, stars = this.ls.stars, prev = this.best[i] || 0;
+      const gained = Logic.coinsFor(prev, stars);
+      if (stars > prev) { this.best[i] = stars; Store.set('stars', this.best); }
+      if (gained) { this.coins += gained; this.runCoins += gained; Store.set('coins', this.coins); }
+      this.setScore(this.runScore()); this.updateInfo();
+      Sfx.play('win'); this.shakeT = 500; this.confetti();
+      const last = i === Logic.LEVELS.length - 1;
+      this.pending = { ms: 900, fn: () => this.showPanel('Goal!', [
+        [last ? 'Finish' : 'Next Level', () => this.nextLevel()],
+        ['Retry', () => this.loadLevel(this.levelIdx), { variant: 'secondary' }],
+        ['Levels', () => Scenes.go('levels'), { variant: 'secondary' }],
+        ['End Run', () => this.endRun(), { variant: 'secondary' }],
+      ], `${starStr(stars)}   +${gained} coins`) };
+    } else if (ev === 'failed') {
+      this.sim = null; this.updateInfo();
+      this.floatText(this.ls.lastResult === 'out' ? 'Out!' : this.ls.lastResult === 'defender' ? 'Blocked!' : 'Missed!');
+      Sfx.play('lose');
+      this.pending = { ms: 700, fn: () => this.showPanel('Try again', [
+        ['Retry', () => this.loadLevel(this.levelIdx)],
+        ['Levels', () => Scenes.go('levels'), { variant: 'secondary' }],
+        ['End Run', () => this.endRun(), { variant: 'secondary' }],
+      ], 'Out of shots') };
+    } else if (ev === 'shotEnd') {
+      this.sim = null; this.updateInfo();
+      const r = this.ls.lastResult;
+      if (r === 'out') { this.floatText('Out!'); Sfx.play('lose'); } else if (r === 'defender') { this.floatText('Blocked!'); Sfx.play('hit'); }
+      else Sfx.play('move');
+    }
+  }
+  nextLevel() {
+    if (this.state !== 'playing') return;
+    if (this.levelIdx >= Logic.LEVELS.length - 1) { this.hideOverlay(); this.setScore(this.runScore()); this.endGame({ won: true }); return; }
+    this.loadLevel(this.levelIdx + 1);
+  }
+  floatText(s) {
+    const t = makeText(s, 44, 0xffffff, '800', { stroke: { color: 0x000000, width: 6 } });
+    t.position.set(this.ls.ball.x, Math.max(260, this.ls.ball.y - 50));
+    this.fxLayer.addChild(t);
+    this.parts.push({ g: t, vx: 0, vy: -1.2, vr: 0, life: 900, text: true });
+  }
+  confetti() {
+    const g = this.L.goal, cols = [0xffd166, 0xff5c7a, 0x7c5cff, 0x4fc3f7, 0x7ee787, 0xffffff];
+    for (let k = 0; k < 44; k++) {
+      const p = new Graphics(); p.rect(-5, -3, 10, 6).fill(cols[k % cols.length]);
+      p.position.set(g.x, g.y); p.rotation = k;
+      this.fxLayer.addChild(p);
+      const a = (k / 44) * Math.PI * 2, s = 3 + (k * 37 % 11) * 0.6;
+      this.parts.push({ g: p, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 2, vr: 0.2, life: 1200 + (k % 5) * 100 });
+    }
+  }
+  tick(dtMs) {
+    this.frame++;
+    this.acc += dtMs;
+    while (this.acc >= Logic.C.STEP_MS && this.state === 'playing') { this.acc -= Logic.C.STEP_MS; this.fixedStep(); }
+    if (this.pending) { this.pending.ms -= dtMs; if (this.pending.ms <= 0) { const f = this.pending.fn; this.pending = null; if (this.state === 'playing' && Scenes.current === this) f(); } }
+    for (let k = this.parts.length - 1; k >= 0; k--) {
+      const p = this.parts[k]; p.life -= dtMs;
+      p.g.x += p.vx * dtMs / 16.7; p.g.y += p.vy * dtMs / 16.7; p.g.rotation += p.vr;
+      if (!p.text) { p.vy += 0.12; p.vx *= 0.99; }
+      p.g.alpha = Math.min(1, p.life / 300);
+      if (p.life <= 0) { p.g.destroy(); this.parts.splice(k, 1); }
+    }
+    if (this.shakeT > 0) { this.shakeT = Math.max(0, this.shakeT - dtMs); const s = Math.sin(this.shakeT / 25) * 6 * (this.shakeT / 500);
+      this.goalView.position.set(this.L.goal.dir === 'down' || this.L.goal.dir === 'up' ? 0 : s, this.L.goal.dir === 'down' || this.L.goal.dir === 'up' ? s : 0); }
+    this.renderDynamic();
+    this.renderAim();
+  }
+  renderDynamic() {
+    const kin = Logic.kinematicsAt(this.L, this.ls.t);
+    kin.defenders.forEach((d, i) => this.defViews[i] && this.defViews[i].position.set(d.x, d.y));
+    kin.bars.forEach((b, i) => { if (this.barViews[i]) this.barViews[i].rotation = b.angle * Math.PI / 180; });
+    const b = this.ls.ball;
+    this.ballView.position.set(b.x, b.y); this.ballShadow.position.set(b.x, b.y);
+    if (this.sim) { const v = this.sim.ball.velocity; this.ballView.rotation += (Math.abs(v.x) + Math.abs(v.y) > 0 ? Math.sign(v.x || v.y) : 0) * this.sim.ball.speed / Logic.C.BALL_R; }
+  }
+  renderAim() {
+    const aim = this.canAim() ? this.aim : null;
+    if (!aim) { if (this.aimKey) { this.aimG.clear(); this.aimKey = ''; } this.aimPath = null; return; }
+    const moving = this.L.objects.some((o) => o.type === 'defender' || o.type === 'bar');
+    const key = `${aim.angle.toFixed(3)}|${aim.power.toFixed(3)}|${this.ls.ball.x}|${this.ls.ball.y}` + (moving ? '|' + this.ls.t : '');
+    if (key === this.aimKey) return;
+    this.aimKey = key;
+    const path = Logic.predictPath(window.Matter, this.L, this.ls.ball, this.ls.t, aim.angle, aim.power);
+    this.aimPath = path;
+    const g = this.aimG; g.clear();
+    const b = this.ls.ball;
+    if (this.drag) g.moveTo(this.drag.sx, this.drag.sy).lineTo(this.drag.x, this.drag.y).stroke({ width: 4, color: 0x000000, alpha: 0.35 });
+    const pc = aim.power > 0.8 ? 0xff5c7a : aim.power > 0.5 ? 0xffd166 : 0x7ee787;
+    g.circle(b.x, b.y, Logic.C.BALL_R + 8).stroke({ width: 5, color: pc, alpha: 0.9 });
+    let acc = 0, n = 0;
+    for (let k = 1; k < path.length; k++) {
+      acc += Math.hypot(path[k].x - path[k - 1].x, path[k].y - path[k - 1].y);
+      if (acc >= 18) { acc = 0; n++; g.circle(path[k].x, path[k].y, 4.5).fill({ color: 0xffffff, alpha: Math.max(0.25, 1 - n * 0.02) }); }
+    }
+  }
+  debugState() {
+    const ls = this.ls || {};
+    return { ...super.debugState(), level: this.levelIdx, phase: ls.phase, shots: ls.shots, maxShots: ls.maxShots, ball: ls.ball, t: ls.t,
+      stars: ls.stars, goals: ls.goals, lastResult: ls.lastResult, coins: this.coins, best: this.best, runCoins: this.runCoins,
+      skin: this.shop && this.shop.selected, defenders: this.L ? Logic.kinematicsAt(this.L, ls.t).defenders : [], aiming: !!this.aim,
+      aimPoints: this.aimPath ? this.aimPath.length : 0, overlay: !!this.overlay };
+  }
+}
+
+/* ---------- Level select ---------- */
+class LevelsScene extends Scene {
+  enter() {
+    const best = loadProgress();
+    const title = makeText('Levels', 72, THEME.text, '800'); title.position.set(W / 2, 110);
+    const tot = makeText(`★ ${best.reduce((a, b) => a + b, 0)} / 45    Coins ${loadCoins()}`, 30, THEME.accent, '700'); tot.position.set(W / 2, 190);
+    this.view.addChild(title, tot);
+    Logic.LEVELS.forEach((L, i) => {
+      const open = Logic.isUnlocked(best, i);
+      const b = makeButton(open ? String(i + 1) : 'Locked', () => { if (open) Scenes.go('game', { level: i }); else Sfx.play('hit'); },
+        { w: 190, h: 140, size: open ? 48 : 28, variant: open ? (best[i] ? 'primary' : 'secondary') : 'secondary' });
+      b.label = 'button:Level ' + (i + 1);
+      b.children[1].y = -18;
+      const s = makeText(open ? starStr(best[i]) : String(i + 1), 30, open ? THEME.accent : THEME.textDim, '700'); s.y = 34;
+      b.addChild(s);
+      if (!open) b.alpha = 0.45;
+      b.position.set(140 + (i % 3) * 220, 320 + Math.floor(i / 3) * 165);
+      this.view.addChild(b);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' }); back.position.set(W / 2, 1180);
+    this.view.addChild(back);
+  }
+  onAction(a) { if (a === 'pause') Scenes.go('menu'); else if (a === 'confirm') Scenes.go('game'); }
+}
+
+/* ---------- Shop ---------- */
+class ShopScene extends Scene {
+  enter() { this.content = new Container(); this.view.addChild(this.content); this.msg = ''; this.build(); }
+  build() {
+    for (const c of this.content.removeChildren()) c.destroy({ children: true });
+    const shop = Logic.normShop(Store.get('shop', null)), coins = loadCoins();
+    const title = makeText('Shop', 72, THEME.text, '800'); title.position.set(W / 2, 110);
+    const ct = makeText(`Coins ${coins}`, 34, THEME.accent, '800'); ct.position.set(W / 2, 190);
+    this.content.addChild(title, ct);
+    if (this.msg) { const m = makeText(this.msg, 26, THEME.danger, '700'); m.position.set(W / 2, 240); this.content.addChild(m); }
+    Logic.SKINS.forEach((s, i) => {
+      const x = 190 + (i % 2) * 340, y = 420 + Math.floor(i / 2) * 270;
+      const panel = makePanel(300, 240, THEME.panel, 22); panel.position.set(x, y);
+      const ball = makeSkinView(s.id, 46); ball.position.set(x, y - 58);
+      const name = makeText(s.name, 28, THEME.text, '700'); name.position.set(x, y + 10);
+      const owned = shop.owned.includes(s.id), sel = shop.selected === s.id;
+      const label = sel ? 'Selected' : owned ? 'Select' : `Buy ${s.price}`;
+      const b = makeButton(label, () => this.tapSkin(s.id), { w: 240, h: 64, size: 26, variant: sel ? 'secondary' : 'primary' });
+      b.label = 'button:Skin ' + s.name;
+      b.position.set(x, y + 78);
+      this.content.addChild(panel, ball, name, b);
+    });
+    const back = makeButton('Back', () => Scenes.go('menu'), { variant: 'secondary' }); back.position.set(W / 2, 1200);
+    this.content.addChild(back);
+  }
+  tapSkin(id) {
+    const r = Logic.buySkin(Store.get('shop', null), loadCoins(), id);
+    if (r.ok) { Store.set('shop', r.shop); Store.set('coins', r.coins); this.msg = ''; Sfx.play(r.reason === 'bought' ? 'score' : 'click'); }
+    else { this.msg = 'Not enough coins - score goals to earn more'; Sfx.play('lose'); }
+    Promise.resolve().then(() => { if (!this.view.destroyed) this.build(); });   // rebuild after the tap event finishes
+  }
+  onAction(a) { if (a === 'pause') Scenes.go('menu'); }
+}
+
+window.__goalSolutions = Logic.SOLUTIONS; window.__goalLogic = Logic;   // for checks.js / play tests
+GAME_HOOKS.menuButtons.push(['Levels', () => Scenes.go('levels')], ['Shop', () => Scenes.go('shop')]);
+GAME_HOOKS.scenes.levels = LevelsScene;
+GAME_HOOKS.scenes.shop = ShopScene;
+
+/* ##### END GAME-SPECIFIC ##### */
+
+/* ---------- test helpers ---------- */
+function assert(cond, msg = 'assertion failed') { if (!cond) throw new Error(msg); }
+function assertEq(a, b, msg = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg} expected ${B} got ${A}`); }
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const app = new Application();
+  await app.init({
+    resizeTo: window,
+    background: THEME.outerBg,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    preference: 'webgl',
+  });
+  document.getElementById('app').appendChild(app.canvas);
+
+  const root = new Container(); root.label = 'root';
+  root.addChild(makeBackground());
+  const sceneLayer = new Container(); sceneLayer.label = 'scenes';
+  root.addChild(sceneLayer);
+  app.stage.addChild(root);
+
+  const mask = new Graphics(); mask.rect(0, 0, W, H).fill(0xffffff);
+  root.addChild(mask); root.mask = mask;       // nothing draws outside the play area
+
+  function layout() {
+    const sw = app.screen.width, sh = app.screen.height;
+    const s = Math.min(sw / W, sh / H);
+    root.scale.set(s);
+    root.position.set(Math.round((sw - W * s) / 2), Math.round((sh - H * s) / 2));
+    app.stage.hitArea = app.screen;
+  }
+  layout();
+  window.addEventListener('resize', () => requestAnimationFrame(() => { app.resize(); layout(); }));
+
+  Scenes.app = app; Scenes.root = sceneLayer;
+  Scenes.register('menu', MenuScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+  for (const [name, cls] of Object.entries(GAME_HOOKS.scenes)) Scenes.register(name, cls);
+
+  Input.init();
+  initSwipe(app, root);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden(); });
+
+  app.ticker.add((ticker) => {
+    const dt = Math.min(ticker.deltaMS, 50);  // clamp: no huge jumps after tab switch
+    Tween.update(dt);
+    Scenes.current?.update(dt);
+  });
+
+  await Scenes.go('menu');
+
+  /* test hook used by scripts/verify.py (harmless in production) */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },          // for checks.js: direct access to the live scene (set up boards, read fields)
+    inputStats() { return { ...Scenes.inputStats }; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    boardObjects() { const b = Scenes.current?.board; let n = 0; const walk = (c) => { if (!c.visible) return; n++; c.children.forEach(walk); }; if (b) walk(b); return n - (b ? 1 : 0); },
+    buttons() {
+      const out = [];
+      const walk = (c) => {
+        if (!c.visible || c.destroyed) return;
+        if (c.isButton) { const p = c.getGlobalPosition(); out.push({ label: c.btnText, x: p.x, y: p.y }); }
+        for (const ch of c.children) walk(ch);
+      };
+      walk(app.stage);
+      return out;
+    },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endGame) { s.endGame({ delay: 0 }); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+  };
+})().catch((e) => showFatal(e.message || String(e)));
+</script>
+</body>
+</html>
