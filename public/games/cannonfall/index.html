@@ -1,0 +1,2449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Cannonfall</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;700;800&display=swap">
+<style>
+  :root { color-scheme: light; --ink: #35235c; --cream: #fff8e8; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+         background: #6fc74a url('./backdrop.png') center / cover no-repeat; }
+  body { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+         font-family: "Baloo 2", "Trebuchet MS", "Segoe UI", system-ui, sans-serif; color: var(--cream); }
+  #app { position: fixed; inset: 0; touch-action: none;
+         background: #6fc74a url('./backdrop.png') center / cover no-repeat; }
+  #app canvas { display: block; width: 100%; height: 100%; }
+
+  /* ---------- UI overlay ---------- */
+  #ui { position: fixed; inset: 0; pointer-events: none; display: flex; flex-direction: column; }
+  #ui .layer { position: absolute; inset: 0; }
+  #ui button, #ui .clickable { pointer-events: auto; }
+  [hidden] { display: none !important; }
+
+  .btn { font: 800 20px/1 inherit; color: #fff; background: linear-gradient(180deg, #ffb13d, #f5851f);
+         border: 3px solid #ffffff; border-radius: 999px; padding: 14px 26px; min-width: 210px; cursor: pointer;
+         letter-spacing: .3px; text-shadow: 0 2px 0 rgba(0,0,0,.22);
+         box-shadow: 0 6px 0 #c45f10, 0 10px 18px rgba(30,20,60,.3);
+         transition: transform .08s ease, filter .12s ease; }
+  .btn:hover { filter: brightness(1.07) saturate(1.05); }
+  .btn:active { transform: translateY(4px); box-shadow: 0 2px 0 #c45f10, 0 5px 10px rgba(30,20,60,.3); }
+  .btn.sec { background: linear-gradient(180deg, #7fb2ff, #4a7fe0); box-shadow: 0 6px 0 #2d5bb0, 0 10px 18px rgba(30,20,60,.3); }
+  .btn.sec:active { box-shadow: 0 2px 0 #2d5bb0, 0 5px 10px rgba(30,20,60,.3); }
+  .btn:focus-visible { outline: 4px solid #ffe36b; outline-offset: 3px; }
+
+  .col { display: flex; flex-direction: column; gap: 14px; align-items: center; }
+  /* a soft plate so white text stays readable over bright grass and sky */
+  .banner { background: rgba(46,28,92,.40); border-radius: 26px; padding: 16px 30px; text-align: center;
+            box-shadow: inset 0 0 0 2px rgba(255,255,255,.22); }
+  @media (max-height: 560px) { .banner { padding: 9px 20px; border-radius: 18px; } }
+  .center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+            justify-content: center; gap: 18px; padding: 24px; box-sizing: border-box; }
+  .panel { background: linear-gradient(180deg, #fffdf6, #ffeec9); color: var(--ink);
+           border: 5px solid #ffffff; border-radius: 28px;
+           padding: 24px 30px; max-width: min(560px, 92vw); box-sizing: border-box; text-align: center;
+           box-shadow: 0 10px 0 rgba(150,96,20,.35), 0 28px 60px rgba(20,14,50,.45); }
+  .panel h2 { color: #6b3fbf; }
+  .scrim { position: absolute; inset: 0; background: rgba(28,18,64,.55); pointer-events: auto; z-index: 0; }
+  /* the scrim is positioned, so in-flow siblings would paint *under* it and swallow clicks */
+  .center > *:not(.scrim) { position: relative; z-index: 1; }
+
+  h1 { font-size: clamp(42px, 11vw, 78px); margin: 0; letter-spacing: 1px; color: #fff;
+       text-shadow: 0 3px 0 #f5851f, 0 6px 0 #c45f10, 0 12px 22px rgba(20,14,50,.4); }
+  h2 { font-size: clamp(26px, 6vw, 38px); margin: 0 0 6px; font-weight: 800; }
+  .sub { color: #7a6a9a; margin: 6px 0 0; font-size: 17px; font-weight: 600; }
+  .center > .sub, .banner .sub { color: #fffdf0; text-shadow: 0 2px 4px rgba(20,14,50,.45); }
+  .big { font-size: clamp(46px, 13vw, 76px); font-weight: 800; margin: 4px 0; color: #f5851f;
+         font-variant-numeric: tabular-nums; text-shadow: 0 3px 0 rgba(150,96,20,.28); }
+  .accent { color: #fff2b0; text-shadow: 0 2px 4px rgba(20,14,50,.5); }
+  .hint { color: #fffdf0; font-size: 15px; font-weight: 600; text-shadow: 0 2px 4px rgba(20,14,50,.5); }
+
+  /* HUD */
+  #hud { padding: calc(10px + env(safe-area-inset-top, 0px)) 12px 12px; }
+  .hudrow { display: flex; gap: 10px; align-items: flex-start; }
+  .chip { background: linear-gradient(180deg, #fffdf6, #ffeec9); color: var(--ink);
+          border: 3px solid #fff; border-radius: 18px; padding: 6px 13px 7px; min-width: 76px; text-align: center;
+          box-shadow: 0 4px 0 rgba(150,96,20,.3), 0 6px 14px rgba(20,14,50,.22); }
+  .chip .k { font-size: 11px; letter-spacing: .09em; color: #9a7fc4; font-weight: 800; }
+  .chip .v { font-size: 21px; font-weight: 800; font-variant-numeric: tabular-nums; color: #4a2f86; }
+  .spacer { flex: 1; }
+  #pausebtn { min-width: 0; width: 52px; height: 52px; padding: 0; font-size: 17px; border-radius: 999px; }
+  #ammo { position: absolute; left: 0; right: 0; bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+          display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; padding: 0 16px; }
+  .pip { width: 19px; height: 19px; border-radius: 50%; background: radial-gradient(circle at 34% 30%, #6d7a96, #2b2f44);
+         border: 2px solid #fff; box-shadow: 0 3px 0 rgba(20,14,50,.25); }
+  .pip.spent { background: rgba(255,255,255,.35); border-color: rgba(255,255,255,.7); box-shadow: none; }
+  #msg { position: absolute; left: 0; right: 0; top: 30%; text-align: center; font-size: clamp(26px, 7vw, 42px);
+         font-weight: 800; color: #fff; pointer-events: none; transition: opacity .3s ease;
+         text-shadow: 0 3px 0 #f5851f, 0 6px 0 #c45f10, 0 10px 18px rgba(20,14,50,.45); }
+
+  /* level select */
+  .levgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(66px, 1fr)); gap: 9px;
+             max-height: 50vh; overflow-y: auto; padding: 10px; width: min(560px, 92vw);
+             background: rgba(28,18,64,.3); border-radius: 20px; }
+  .lev { pointer-events: auto; background: linear-gradient(180deg, #ffffff, #ffeec9); border: 3px solid #fff;
+         color: #4a2f86; border-radius: 14px; padding: 7px 0 5px; font: 800 16px/1 inherit; cursor: pointer;
+         box-shadow: 0 4px 0 rgba(150,96,20,.3); }
+  .lev.locked { background: rgba(255,255,255,.3); border-color: rgba(255,255,255,.55); color: rgba(60,40,110,.5);
+                cursor: not-allowed; box-shadow: none; }
+  .lev .st { display: block; font-size: 11px; color: #f5851f; margin-top: 3px; height: 12px; }
+  .pager { display: flex; gap: 10px; align-items: center; justify-content: center; }
+  .pager .btn { min-width: 54px; padding: 10px 14px; }
+
+  table.scores { width: min(460px, 90vw); border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  table.scores { color: var(--ink); }
+  table.scores td { padding: 8px; border-bottom: 2px solid rgba(122,90,180,.18); font-weight: 700; }
+  table.scores td.r { color: #9a7fc4; width: 34px; }
+  table.scores td.s { text-align: right; font-weight: 800; }
+  table.scores tr:first-child td { color: #f5851f; }
+
+  #fatal { position: fixed; left: 12px; right: 12px; bottom: 12px; padding: 12px 14px; border-radius: 10px;
+           background: #3a0d12; color: #ffd7dc; font: 13px/1.4 ui-monospace, Menlo, monospace;
+           white-space: pre-wrap; display: none; z-index: 30; pointer-events: auto; }
+  #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+             color: #2f4a6b; font-size: 17px; font-weight: 700; letter-spacing: .05em; }
+  /* short screens (landscape phones): the chunky buttons must still fit */
+  @media (max-height: 560px) {
+    .center { gap: 9px; padding: 10px; }
+    .col { gap: 8px; }
+    .btn { font-size: 16px; padding: 9px 18px; min-width: 156px; border-width: 2px;
+           box-shadow: 0 4px 0 #c45f10, 0 6px 12px rgba(30,20,60,.3); }
+    .btn.sec { box-shadow: 0 4px 0 #2d5bb0, 0 6px 12px rgba(30,20,60,.3); }
+    .panel { padding: 12px 20px; border-width: 3px; border-radius: 20px; }
+    h1 { font-size: clamp(28px, 8vh, 46px); }
+    h2 { font-size: clamp(19px, 5.5vh, 28px); }
+    .big { font-size: clamp(28px, 10vh, 48px); margin: 0; }
+    .sub, .hint { font-size: 13px; }
+    .levgrid { max-height: 38vh; }
+    #pausebtn { width: 42px; height: 42px; font-size: 15px; }
+    .pip { width: 14px; height: 14px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .btn { transition: none; } }
+</style>
+
+</head>
+<body>
+<div id="app"></div>
+<div id="ui">
+  <div class="layer" id="hud" hidden></div>
+  <div class="layer" id="overlay" hidden></div>
+</div>
+<div id="loading">Loading&hellip;</div>
+<div id="fatal"></div>
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.min.js';
+import RAPIER from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/rapier.es.js';
+
+/* =====================================================================
+   CANNONFALL -- 3D block-toppling cannon game
+   Three.js (render) + Rapier3D (physics). One file, no build step.
+
+   Layout of this file:
+     CORE      -- config, storage, sound, rng, ballistics      (no THREE, no Rapier)
+     LOGIC     -- level generation + scoring                   (pure, testable in Node)
+     SIM       -- the physics world                            (needs Rapier only, no THREE)
+     TESTS     -- logic + simulation self-tests
+     SCENES    -- Three.js rendering and UI
+   SIM never touches THREE, so tests and the offline 1000-level sweep run headless.
+   ===================================================================== */
+
+/* ##### CORE ##### */
+const CONFIG = {
+  id: 'cannonfall',
+  title: 'Cannonfall',
+  subtitle: 'Knock every block off the pedestal',
+  maxHighScores: 8,
+  maxLevel: 1000,
+};
+
+const PHYS = {
+  dt: 1 / 60,                 // fixed simulation step -- never varies
+  gravity: 14,                // magnitude, m/s^2 (snappier than 9.81)
+  ballSpeed: 30,              // muzzle speed, m/s
+  ballRadius: 0.32,
+  ballDensity: 14,
+  pedestalRadius: 2.7,
+  pedestalTop: 1.7,
+  clearMargin: 0.06,          // how far past the rim counts as off
+  arenaKill: -6,              // things below this y are gone
+  arenaFar: 40,               // things past this distance are gone
+  settleSpeed: 0.35,          // below this, a body counts as at rest
+  settleTicks: 20,            // consecutive resting ticks before "settled"
+  maxShotTicks: 60 * 8,       // safety: a shot can't keep the world hot forever
+  comboWindow: 0.9,           // seconds; clears inside this window are one burst
+  debrisLinger: 1.4,          // seconds a cleared block lies on the ground before being removed
+};
+
+const TYPES = {
+  wood:   { density: 1.0,  friction: 0.5,  restitution: 0.05, color: 0xc9873f },
+  stone:  { density: 3.2,  friction: 0.55, restitution: 0.03, color: 0x8d949e },
+  glass:  { density: 0.55, friction: 0.3,  restitution: 0.10, color: 0x76cfe6, shatterAt: 9.5 },
+  barrel: { density: 1.4,  friction: 0.45, restitution: 0.08, color: 0xd9452f, blastAt: 7.0 },
+  steel:  { density: 8.0,  friction: 0.6,  restitution: 0.02, color: 0x59637a },
+};
+const BLAST = { radius: 1.7, impulse: 15 };   // a firecracker, not a bomb
+
+/* ---------- safe storage (private mode / sandboxed iframes can throw) ---------- */
+const Store = (() => {
+  const mem = new Map();
+  let ls = null;
+  try { const k = '__t'; window.localStorage.setItem(k, '1'); window.localStorage.removeItem(k); ls = window.localStorage; } catch { ls = null; }
+  const ns = (k) => CONFIG.id + ':' + k;
+  return {
+    get(k, fb = null) {
+      try { const raw = ls ? ls.getItem(ns(k)) : mem.get(ns(k)); return raw == null ? fb : JSON.parse(raw); }
+      catch { return fb; }
+    },
+    set(k, v) {
+      const raw = JSON.stringify(v);
+      try { if (ls) ls.setItem(ns(k), raw); else mem.set(ns(k), raw); } catch { mem.set(ns(k), raw); }
+    },
+  };
+})();
+
+const HighScores = {
+  list() { const l = Store.get('highscores', []); return Array.isArray(l) ? l.filter(e => e && Number.isFinite(e.score)) : []; },
+  best() { const l = this.list(); return l.length ? l[0].score : 0; },
+  add(score, level = 0) {
+    if (!Number.isFinite(score) || score <= 0) return { rank: 0, isBest: false };
+    const prev = this.list()[0];
+    const entry = { score, level, date: new Date().toISOString().slice(0, 10), t: Date.now() };
+    const l = this.list(); l.push(entry);
+    l.sort((a, b) => b.score - a.score || a.t - b.t);
+    const trimmed = l.slice(0, CONFIG.maxHighScores);
+    Store.set('highscores', trimmed);
+    const rank = trimmed.indexOf(entry) + 1;
+    return { rank, isBest: rank === 1 && (!prev || score > prev.score) };
+  },
+  clear() { Store.set('highscores', []); },
+};
+
+/* progress: furthest level reached + stars per level (sparse object) */
+const Progress = {
+  stars() { const s = Store.get('stars', {}); return (s && typeof s === 'object') ? s : {}; },
+  starsFor(n) { return this.stars()[n] || 0; },
+  scores() { const s = Store.get('levelScores', {}); return (s && typeof s === 'object') ? s : {}; },
+  bestScore(n) { return this.scores()[n] || 0; },
+  totalStars() { const s = this.stars(); let t = 0; for (const k in s) t += s[k]; return t; },
+  furthest() { const f = Store.get('furthest', 1); return Number.isFinite(f) ? Math.min(Math.max(1, f), CONFIG.maxLevel) : 1; },
+  record(n, stars, score = 0) {
+    const s = this.stars();
+    if ((s[n] || 0) < stars) { s[n] = stars; Store.set('stars', s); }
+    const sc = this.scores();
+    if ((sc[n] || 0) < score) { sc[n] = score; Store.set('levelScores', sc); }
+    if (n + 1 > this.furthest()) Store.set('furthest', Math.min(n + 1, CONFIG.maxLevel));
+  },
+  reset() { Store.set('stars', {}); Store.set('levelScores', {}); Store.set('furthest', 1); },
+};
+
+/* ---------- sound: WebAudio synth, no asset files ---------- */
+const Sfx = {
+  ctx: null,
+  muted: Store.get('muted', false) === true,
+  unlock() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    } catch { this.ctx = null; }
+  },
+  setMuted(m) { this.muted = m; Store.set('muted', m); },
+  tone(freq, dur = 0.08, type = 'sine', vol = 0.15, slideTo = null, delay = 0) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const t0 = this.ctx.currentTime + delay;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type; o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(this.ctx.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+    } catch { /* audio must never break the game */ }
+  },
+  noise(dur = 0.25, vol = 0.22) {
+    if (this.muted || !this.ctx) return;
+    try {
+      const n = Math.floor(this.ctx.sampleRate * dur);
+      const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate), d = buf.getChannelData(0);
+      for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 2);
+      const src = this.ctx.createBufferSource(); src.buffer = buf;
+      const g = this.ctx.createGain(); g.gain.value = vol;
+      const f = this.ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 900;
+      src.connect(f).connect(g).connect(this.ctx.destination); src.start();
+    } catch { /* ignore */ }
+  },
+  play(name) {
+    switch (name) {
+      case 'click': this.tone(660, 0.05, 'triangle', 0.12); break;
+      case 'fire': this.tone(150, 0.16, 'square', 0.16, 60); this.noise(0.18, 0.12); break;
+      case 'hit': this.tone(220, 0.05, 'triangle', 0.07); break;
+      case 'clear': this.tone(880, 0.07, 'triangle', 0.11, 1320); break;
+      case 'blast': this.noise(0.45, 0.3); this.tone(90, 0.4, 'sawtooth', 0.18, 40); break;
+      case 'glass': this.tone(2400, 0.12, 'triangle', 0.1, 900); this.noise(0.14, 0.1); break;
+      case 'win': [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, 'triangle', 0.13, null, i * 0.1)); break;
+      case 'lose': this.tone(400, 0.35, 'sawtooth', 0.08, 110); break;
+      default: break;
+    }
+  },
+};
+
+/* ---------- deterministic rng ---------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- ballistics: the direction that makes a shot pass through `to` ----------
+   Exact solution for a fixed muzzle speed under gravity, so the crosshair never lies. */
+function ballisticDir(from, to, speed = PHYS.ballSpeed, g = PHYS.gravity) {
+  const dx = to.x - from.x, dy = to.y - from.y, dz = to.z - from.z;
+  const d = Math.hypot(dx, dz);
+  if (d < 1e-4) return { x: 0, y: dy >= 0 ? 1 : -1, z: 0 };
+  const v2 = speed * speed;
+  const disc = v2 * v2 - g * (g * d * d + 2 * dy * v2);
+  // out of range: fall back to the 45 deg max-range angle
+  const theta = disc < 0 ? Math.PI / 4 : Math.atan2(v2 - Math.sqrt(disc), g * d);
+  const ch = Math.cos(theta), sh = Math.sin(theta);
+  return { x: (dx / d) * ch, y: sh, z: (dz / d) * ch };
+}
+
+/* ##### END CORE ##### */
+
+/* ##### LOGIC (pure: level generation + scoring) ##### */
+const U = 0.7;                    // block unit size
+const EPS = 0.004;                // gap between stacked blocks; avoids spawn interpenetration
+const FIT_R = 2.35;               // structures must sit inside this radius on the pedestal
+const MIN_BLOCKS = 50;            // every level is a proper stack, never a handful of cubes
+const MAX_BLOCKS = 96;            // performance ceiling
+const MAX_HEIGHT = 5.1;           // structures never rise further than this above the pedestal top
+const MAX_MASS = 3.0;             // a ball weighs ~0.96; anything heavier than this can't be shifted
+
+/* --- oriented-box overlap, used to guarantee no structure spawns interpenetrating --- */
+function obbAxes(yaw) {
+  const c = Math.cos(yaw), s = Math.sin(yaw);
+  return [{ x: c, z: -s }, { x: s, z: c }];            // local +x and +z in world xz
+}
+function projectOBB(o, ax) {
+  const [ux, uz] = obbAxes(o.yaw || 0);
+  const centre = o.x * ax.x + o.z * ax.z;
+  const r = Math.abs(ux.x * ax.x + ux.z * ax.z) * (o.sx / 2) + Math.abs(uz.x * ax.x + uz.z * ax.z) * (o.sz / 2);
+  return { min: centre - r, max: centre + r };
+}
+function boxesOverlap(a, b, tol = 1e-3) {
+  if (Math.abs(a.y - b.y) >= (a.sy + b.sy) / 2 - tol) return false;         // separated vertically
+  const axes = [...obbAxes(a.yaw || 0), ...obbAxes(b.yaw || 0)];
+  for (const ax of axes) {
+    const pa = projectOBB(a, ax), pb = projectOBB(b, ax);
+    if (pa.max <= pb.min + tol || pb.max <= pa.min + tol) return false;      // separating axis found
+  }
+  return true;
+}
+
+/** Do two boxes overlap when seen from above (ignoring height)? */
+function footprintOverlap(a, b, minOverlap = 0.02) {
+  const axes = [...obbAxes(a.yaw || 0), ...obbAxes(b.yaw || 0)];
+  for (const ax of axes) {
+    const pa = projectOBB(a, ax), pb = projectOBB(b, ax);
+    if (pa.max <= pb.min + minOverlap || pb.max <= pa.min + minOverlap) return false;
+  }
+  return true;
+}
+
+const Logic = {
+  MAX_MASS,
+  blockMass(b) { return (TYPES[b.type] || TYPES.wood).density * b.sx * b.sy * b.sz; },
+
+  /* ---------- scoring ---------- */
+  blockScore(i) { return 100 * Math.min(i, 5); },                 // i = position in the burst, 1-based
+  burstScore(n) { let s = 0; for (let i = 1; i <= n; i++) s += this.blockScore(i); return s; },
+  clearBonus() { return 500; },
+  /** Every ball you don't spend is worth points, so a tidy clear scores far more than a messy one. */
+  ballBonus(ballsLeft) { return 250 * Math.max(0, ballsLeft); },
+  /** Shots a tidy player should need on a stack this size. */
+  par(blocks) { return Math.max(3, Math.ceil(blocks / 12)); },
+  /** Score needed for 1, 2 and 3 stars on this level. Clearing at par earns three stars even
+      with no combos at all; combos make it comfortable. */
+  starTargets(blocks, ballsTotal) {
+    const base = 100 * blocks + this.clearBonus();
+    const par = this.par(blocks);
+    const three = base + this.ballBonus(Math.max(0, ballsTotal - par));
+    const two = base + this.ballBonus(Math.max(0, ballsTotal - par - 3));
+    return [base, Math.max(base + 250, two), Math.max(base + 500, three)];
+  },
+  stars(score, blocks, ballsTotal) {
+    const [, t2, t3] = this.starTargets(blocks, ballsTotal);
+    return score >= t3 ? 3 : score >= t2 ? 2 : 1;
+  },
+
+  /* ---------- difficulty ---------- */
+  ramp(n) { return Math.min(1, (n - 1) / 250); },
+  targetBlocks(n) {                                  // 22 at level 1 -> 52 by level 250, then creeps on
+    return Math.round(54 + 24 * this.ramp(n) + Math.min(8, Math.max(0, (n - 250) / 100)));
+  },
+  /** Deliberately generous: measured worst case for a level of this size is ~10 shots, so the
+      budget always covers it and the player is never stuck. Skill shows up in the star rating. */
+  ballsFor(blocks) { return Math.max(15, Math.min(24, Math.round(blocks / 5) + 6)); },
+  paletteFor(n) {
+    const p = ['wood'];
+    if (n >= 6) p.push('stone');
+    if (n >= 12) p.push('barrel');
+    if (n >= 20) p.push('glass');
+    if (n >= 35) p.push('steel');
+    return p;
+  },
+
+  /** Deterministic level definition for 1..CONFIG.maxLevel. */
+  level(n) {
+    n = Math.max(1, Math.min(CONFIG.maxLevel, Math.floor(n)));
+    const rng = mulberry32((n * 2654435761) % 4294967296);
+    const archetypes = ['tower', 'wall', 'pyramid', 'arch', 'ring', 'cross', 'table', 'castle', 'twist', 'jenga'];
+    const archetype = archetypes[(n - 1) % archetypes.length];
+    const wanted = Math.min(MAX_BLOCKS, this.targetBlocks(n) + Math.round((rng() - 0.5) * 4));
+    // Some archetypes cannot hit a small target exactly; grow it until the stack is a real one.
+    let blocks = [];
+    for (let attempt = 0, target = wanted; attempt < 6; attempt++, target = Math.round(target * 1.4) + 5) {
+      blocks = this._buildStack(archetype, rng, target);
+      if (blocks.length >= MIN_BLOCKS) break;
+    }
+
+    blocks.forEach((b, i) => { b.i = i; });
+    // types: wood by default, specials grow with level
+    const palette = this.paletteFor(n);
+    const special = Math.min(0.42, 0.08 + this.ramp(n) * 0.4);
+    for (const b of blocks) {
+      if (b.type) continue;                                        // archetype pinned this one
+      if (palette.length > 1 && rng() < special) {
+        const choices = palette.slice(1);
+        b.type = choices[Math.floor(rng() * choices.length)];
+      } else b.type = 'wood';
+    }
+    // steel is very heavy -- never more than a fifth of a structure
+    const steelCap = Math.max(1, Math.floor(blocks.length * 0.2));
+    let steel = 0;
+    for (const b of blocks) if (b.type === 'steel' && ++steel > steelCap) b.type = 'stone';
+
+    // A block heavier than MAX_MASS simply cannot be pushed off by a ball, which would make the
+    // level unwinnable. Downgrade the material until it is light enough (never resize: that would
+    // leave the stack floating).
+    const lighter = { steel: 'stone', stone: 'wood', barrel: 'wood', glass: 'wood' };
+    for (const b of blocks) {
+      let guard = 0;
+      while (this.blockMass(b) > MAX_MASS && lighter[b.type] && guard++ < 4) b.type = lighter[b.type];
+    }
+
+    return { n, archetype, blocks, balls: this.ballsFor(blocks.length), name: `Level ${n}` };
+  },
+
+  /** Is this block resting on the pedestal, or on blocks that actually carry its centre of mass?
+      Footprint overlap alone is not enough (an end brick can overlap and still topple), but the
+      test must accept bridging: a slab on four corner legs is carried, even though nothing
+      touches its middle. So the centre must lie inside the *outer bounds* of the contact
+      patches -- the 2D convex hull of the support -- not inside any single patch. */
+  isSupported(b, others) {
+    if (b.y - b.sy / 2 <= PHYS.pedestalTop + 0.02) return true;
+    const carriers = others.filter(o => o !== b
+      && Math.abs((o.y + o.sy / 2) - (b.y - b.sy / 2)) <= 0.03
+      && footprintOverlap(o, b));
+    if (!carriers.length) return false;
+    // rotated pieces (rings, twists) are checked by overlap only -- their footprints are not axis aligned
+    if ((b.yaw || 0) !== 0 || carriers.some(o => (o.yaw || 0) !== 0)) return true;
+    let xlo = Infinity, xhi = -Infinity, zlo = Infinity, zhi = -Infinity;
+    for (const o of carriers) {
+      xlo = Math.min(xlo, Math.max(b.x - b.sx / 2, o.x - o.sx / 2));
+      xhi = Math.max(xhi, Math.min(b.x + b.sx / 2, o.x + o.sx / 2));
+      zlo = Math.min(zlo, Math.max(b.z - b.sz / 2, o.z - o.sz / 2));
+      zhi = Math.max(zhi, Math.min(b.z + b.sz / 2, o.z + o.sz / 2));
+    }
+    const t = 1e-6;
+    return b.x >= xlo - t && b.x <= xhi + t && b.z >= zlo - t && b.z <= zhi + t;
+  },
+
+  /** Does anything rest on top of this block? */
+  carriesAnything(b, others) {
+    const top = b.y + b.sy / 2;
+    return others.some(o => o !== b
+      && Math.abs((o.y - o.sy / 2) - top) <= 0.03
+      && footprintOverlap(o, b));
+  },
+
+  /** Drop anything left floating (e.g. a lintel whose legs were trimmed away). */
+  pruneUnsupported(blocks) {
+    let list = blocks.slice(), changed = true;
+    while (changed) {
+      changed = false;
+      const keep = list.filter(b => this.isSupported(b, list));
+      if (keep.length !== list.length) { list = keep; changed = true; }
+    }
+    return list;
+  },
+
+  /** Build one stack: archetype geometry, trimmed to the pedestal, de-overlapped, supported,
+      then thinned symmetrically so levels of the same shape still differ. */
+  _buildStack(archetype, rng, target) {
+    const raw = this[archetype](rng, Math.max(6, target))
+      .filter(b => Math.hypot(b.x, b.z) + Math.max(b.sx, b.sz) / 2 <= PHYS.pedestalRadius)
+      .filter(b => b.y + b.sy / 2 <= PHYS.pedestalTop + MAX_HEIGHT);
+    // a block that would spawn inside an earlier one is dropped: overlapping bodies explode apart
+    let blocks = [];
+    for (const b of raw) {
+      if (blocks.length >= MAX_BLOCKS) break;
+      if (!blocks.some(o => boxesOverlap(o, b))) blocks.push(b);
+    }
+    // anything left hanging in mid-air must go, or the structure collapses before the first shot
+    blocks = this.pruneUnsupported(blocks);
+
+    // Thin the top symmetrically: take a loose block AND its mirror, so the stack stays even.
+    const areaOf = (b) => b.sx * b.sz;
+    const areas = blocks.map(areaOf).sort((a, b) => a - b);
+    const median = areas[Math.floor(areas.length / 2)] || 1;
+    const rounds = Math.floor(rng() * 3);
+    for (let k = 0; k < rounds; k++) {
+      if (blocks.length <= MIN_BLOCKS + 2) break;
+      const free = blocks.filter(b => b.y > PHYS.pedestalTop + 0.35
+        && areaOf(b) <= median * 1.6
+        && !this.carriesAnything(b, blocks));
+      if (!free.length) break;
+      const victim = free[Math.floor(rng() * free.length)];
+      const mirror = blocks.find(b => b !== victim
+        && Math.abs(b.x + victim.x) < 1e-3 && Math.abs(b.z - victim.z) < 1e-3
+        && Math.abs(b.y - victim.y) < 1e-3);
+      blocks = blocks.filter(b => b !== victim && b !== mirror);
+    }
+    return this.pruneUnsupported(blocks);
+  },
+
+  /** Every pair of blocks that would spawn interpenetrating (must always be empty). */
+  overlaps(blocks) {
+    const bad = [];
+    for (let i = 0; i < blocks.length; i++)
+      for (let j = i + 1; j < blocks.length; j++)
+        if (boxesOverlap(blocks[i], blocks[j])) bad.push([i, j]);
+    return bad;
+  },
+
+  /* ---------- archetypes: each aims for ~`target` blocks on the pedestal top ---------- */
+  _box(x, y, z, sx, sy, sz, yaw = 0, type = null) { return { x, y, z, sx, sy, sz, yaw, type }; },
+  /** centre height of layer L for blocks of height h */
+  _layerY(L, h) { return PHYS.pedestalTop + h / 2 + L * (h + EPS) + EPS; },
+  _clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); },
+
+  tower(rng, target) {
+    const out = [];
+    const w = target < 30 ? 3 : (target < 70 ? (rng() < 0.6 ? 3 : 4) : 4);
+    const layers = this._clamp(Math.round(target / (w * w)), 2, 9);
+    const s = w === 2 ? U : U * 0.78;
+    const pitch = s + 0.03;
+    for (let L = 0; L < layers; L++)
+      for (let i = 0; i < w; i++) for (let j = 0; j < w; j++)
+        out.push(this._box((i - (w - 1) / 2) * pitch, this._layerY(L, s), (j - (w - 1) / 2) * pitch, s, s, s));
+    return out;
+  },
+
+  wall(rng, target) {
+    const out = [];
+    const cols = this._clamp(Math.round(Math.sqrt(target * 1.5)) + (rng() < 0.4 ? 1 : 0), 2, 9);
+    // a wall one block deep and many rows high topples under its own weight, so keep it stout
+    const rows = this._clamp(Math.round(target / cols), 2, 9);
+    const bw = Math.min(U * 1.25, (FIT_R * 2) / (cols + 0.5) - 0.02);
+    const bh = U * 0.6, bd = U * 1.0, pitch = bw + 0.02;
+    // Running bond. Offset rows straddle the seams below and are closed at both ends with half
+    // bricks, so no brick's centre of mass ever hangs past its support (which is what topples walls).
+    const edge = (cols - 1) / 2 * pitch + bw / 2;        // outer face of the wall
+    for (let r = 0; r < rows; r++) {
+      if (r % 2 === 0) {
+        for (let c = 0; c < cols; c++)
+          out.push(this._box((c - (cols - 1) / 2) * pitch, this._layerY(r, bh), 0, bw, bh, bd));
+      } else {
+        for (let c = 0; c < cols - 1; c++)
+          out.push(this._box((c - (cols - 2) / 2) * pitch, this._layerY(r, bh), 0, bw, bh, bd));
+        if (r < rows - 1)                        // the top row is left notched rather than capped
+          for (const side of [-1, 1])
+            out.push(this._box(side * (edge - bw / 4), this._layerY(r, bh), 0, bw / 2, bh, bd, 0, 'wood'));   // light end caps: a steel half brick on the edge tips off
+      }
+    }
+    return out;
+  },
+
+  pyramid(rng, target) {
+    // square layers b^2, (b-1)^2, ... 1^2  -> totals 5, 14, 30, 55
+    let base = 2;
+    const total = b => { let s = 0; for (let k = 1; k <= b; k++) s += k * k; return s; };
+    while (base < 6 && (total(base) < target || Math.abs(total(base + 1) - target) < Math.abs(total(base) - target))) base++;
+    // corners sit at radius (base-1)/2*pitch*sqrt(2) + s/2, so size from the diagonal
+    const s = Math.min(U * 0.92, (FIT_R * 2) / (0.6 + Math.SQRT2 * base));
+    const pitch = s + 0.03;
+    const out = [];
+    for (let L = 0; L < base; L++) {
+      const cnt = base - L;
+      for (let i = 0; i < cnt; i++) for (let j = 0; j < cnt; j++)
+        out.push(this._box((i - (cnt - 1) / 2) * pitch, this._layerY(L, s), (j - (cnt - 1) / 2) * pitch, s, s, s));
+    }
+    return out;
+  },
+
+  arch(rng, target) {
+    // Big arcades are two blocks deep: single-block legs this tall are slender towers that
+    // sway themselves apart. Each bay is a pair of thick piers, a stone lintel and a cap.
+    const out = [];
+    const deep = target > 34 ? 2 : 1;
+    const bays = deep === 2 ? this._clamp(Math.round(target / 24), 2, 3) : this._clamp(Math.round(target / 16), 1, 3);
+    const legH = U * 0.66, legW = U * 0.52;
+    const zs = deep === 2 ? [-(legW / 2 + 0.01), legW / 2 + 0.01] : [0];
+    const lintelD = deep === 2 ? legW * 2 + 0.02 : legW;
+    const pierX = deep === 2 ? legW * 1.5 : legW;       // wider than deep, so it cannot sway sideways
+    const perBay = Math.max(6, Math.round(target / bays));
+    const legs = this._clamp(Math.round((perBay - 1 - deep) / (2 * deep)), 2, 6);
+    // every bay (lintel included) has to fit inside FIT_R, or the radius filter eats the legs
+    const bayW = (FIT_R * 2) / bays - 0.08;
+    const span = Math.max(0.7, bayW - pierX);
+    for (let b = 0; b < bays; b++) {
+      const cx = bays === 1 ? 0 : (b - (bays - 1) / 2) * bayW;
+      for (let L = 0; L < legs; L++)
+        for (const z of zs) {
+          out.push(this._box(cx - span / 2, this._layerY(L, legH), z, pierX, legH, legW, 0, 'wood'));   // piers are one material: 8:1 density steps stacked 6 high creep
+          out.push(this._box(cx + span / 2, this._layerY(L, legH), z, pierX, legH, legW, 0, 'wood'));
+        }
+      const lintelH = legH * 0.7;
+      const lintelY = PHYS.pedestalTop + legs * (legH + EPS) + EPS + lintelH / 2;
+      out.push(this._box(cx, lintelY, 0, span + pierX, lintelH, lintelD, 0, 'stone'));
+      for (const z of zs)
+        out.push(this._box(cx, lintelY + lintelH / 2 + legH / 2 + EPS, z, pierX, legH, legW, 0, 'wood'));
+    }
+    return out;
+  },
+
+  ring(rng, target) {
+    const out = [];
+    const layers = this._clamp(Math.round(target / 11) + (rng() < 0.35 ? 1 : 0), 2, 6);
+    const cnt = this._clamp(Math.round(target / layers), 5, 15);
+    const s = U * 0.58;
+    const tangential = s * 1.25;
+    // arc spacing must exceed the tangential width, or neighbours spawn inside each other
+    const r = Math.min(2.2, Math.max(0.8, (cnt * tangential * 1.3) / (2 * Math.PI)));
+    for (let L = 0; L < layers; L++) {
+      for (let i = 0; i < cnt; i++) {
+        const a = (i / cnt) * Math.PI * 2;      // layers stack squarely; a half-step twist slides off
+        out.push(this._box(Math.cos(a) * r, this._layerY(L, s), Math.sin(a) * r, s, s, s * 1.25, -a));
+      }
+    }
+    return out;
+  },
+
+  cross(rng, target) {
+    // A full plus on every layer. Alternating the arm direction layer by layer looks clever but
+    // leaves every arm hanging over thin air, so the whole cross collapses to its centre column.
+    const out = [];
+    const arm = target > 78 ? 4 : target > 44 ? 3 : target > 26 ? 2 : 1;
+    const per = 1 + 4 * arm;
+    const layers = this._clamp(Math.round(target / per), 2, 7);
+    const s = U * 0.68, pitch = s + 0.03;
+    const taper = layers > 3 ? 1 : 0;                       // the top layer loses its outermost ring
+    for (let L = 0; L < layers; L++) {
+      const a = (taper && L === layers - 1) ? Math.max(1, arm - 1) : arm;
+      out.push(this._box(0, this._layerY(L, s), 0, s, s, s));
+      for (let i = 1; i <= a; i++) {
+        const d = i * pitch;
+        out.push(this._box(d, this._layerY(L, s), 0, s, s, s));
+        out.push(this._box(-d, this._layerY(L, s), 0, s, s, s));
+        out.push(this._box(0, this._layerY(L, s), d, s, s, s));
+        out.push(this._box(0, this._layerY(L, s), -d, s, s, s));
+      }
+    }
+    return out;
+  },
+
+  table(rng, target) {
+    const out = [];
+    const legH = U * 0.78, legW = U * 0.6;
+    const half = Math.min(1.5, 0.75 + target * 0.011);
+    const legLayers = target > 40 ? 3 : 2;
+    for (let L = 0; L < legLayers; L++)
+      for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]])
+        out.push(this._box(sx * half, this._layerY(L, legH), sz * half, legW, legH, legW, 0, 'wood'));   // one material top to bottom, or the legs creep
+    const slabH = legH * 0.42;                 // thin enough that the widest slab stays under MAX_MASS
+    const slabW = half * 2 + legW;
+    const slabY = PHYS.pedestalTop + legLayers * (legH + EPS) + EPS + slabH / 2;
+    out.push(this._box(0, slabY, 0, slabW, slabH, slabW, 0, 'wood'));
+    // everything else is stacked on the slab in a grid that fits it, as many layers as it takes
+    const on = Math.max(1, target - (4 * legLayers + 1));
+    const s = U * 0.52, pitch = s + 0.04;
+    const n = Math.max(2, Math.floor((slabW - 0.1) / pitch));
+    let placed = 0;
+    for (let L = 0; placed < on; L++)
+      for (let i = 0; i < n && placed < on; i++)
+        for (let j = 0; j < n && placed < on; j++, placed++)
+          out.push(this._box((i - (n - 1) / 2) * pitch, slabY + slabH / 2 + s / 2 + L * (s + EPS) + EPS, (j - (n - 1) / 2) * pitch, s, s, s));
+    return out;
+  },
+
+  castle(rng, target) {
+    // a hollow square wall: perimeter cells only, no duplicated corners
+    const out = [];
+    const per = this._clamp(Math.round(target / 3.5), 6, 24);      // blocks per ring
+    const side = Math.max(3, Math.round(per / 4) + (rng() < 0.35 ? 1 : 0));   // cells along one side
+    const rows = this._clamp(Math.round(target / (side * 4 - 4 + 4)), 1, 7);
+    const bw = Math.min(U * 0.66, (FIT_R * 2) / (side + 1));
+    const bh = U * 0.62, pitch = bw + 0.03;
+    const half = (side - 1) / 2 * pitch;
+    const cells = [];
+    for (let i = 0; i < side; i++) {
+      const p = (i - (side - 1) / 2) * pitch;
+      cells.push([p, -half], [p, half]);                            // front and back rows
+      if (i > 0 && i < side - 1) cells.push([-half, p], [half, p]); // sides without the corners
+    }
+    for (let r = 0; r < rows; r++)
+      for (const [x, z] of cells)
+        out.push(this._box(x, this._layerY(r, bh), z, bw, bh, bw));
+    // corner turrets on top (taller than a wall block, so positioned by their own height)
+    const turretH = bh * 1.1;
+    const turretY = PHYS.pedestalTop + rows * (bh + EPS) + EPS + turretH / 2;
+    for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]])
+      out.push(this._box(sx * half, turretY, sz * half, bw, turretH, bw, 0, 'stone'));
+    return out;
+  },
+
+  /** twisted tower: each layer is a 4x4 pad rotated a little further */
+  twist(rng, target) {
+    const out = [];
+    const layers = this._clamp(Math.round(target / 16), 3, 8);
+    const s = U * 0.66, pitch = s + 0.03;
+    const step = [0.08, 0.12, 0.16][Math.floor(rng() * 3)];
+    for (let L = 0; L < layers; L++) {
+      const yaw = L * step;
+      const c = Math.cos(yaw), sn = Math.sin(yaw);
+      for (const ix of [-1.5, -0.5, 0.5, 1.5]) for (const iz of [-1.5, -0.5, 0.5, 1.5]) {
+        const lx = ix * pitch, lz = iz * pitch;
+        out.push(this._box(lx * c + lz * sn, this._layerY(L, s), -lx * sn + lz * c, s, s, s, yaw));
+      }
+    }
+    return out;
+  },
+
+  jenga(rng, target) {
+    const out = [];
+    const per = target > 40 ? 5 : 3;
+    const layers = this._clamp(Math.round(target / per), 2, 13);
+    const th = U * 0.52, wd = U * 0.5;
+    // beams must reach past the outermost beam of the layer above, or it hangs over the edge
+    const len = Math.max(U * (1.5 + rng() * 0.3), (per - 1) * (wd + 0.02) + wd + 0.2);
+    for (let L = 0; L < layers; L++) {
+      const across = (L % 2) === 1;
+      for (let i = 0; i < per; i++) {
+        const off = (i - (per - 1) / 2) * (wd + 0.02);
+        if (across) out.push(this._box(off, this._layerY(L, th), 0, wd, th, len));
+        else out.push(this._box(0, this._layerY(L, th), off, len, th, wd));
+      }
+    }
+    return out;
+  },
+
+};
+/* ##### END LOGIC ##### */
+
+/* ##### SIM (physics + rules; needs Rapier only, never THREE) ##### */
+class Sim {
+  /** @param RAPIER initialised Rapier module  @param level from Logic.level(n) */
+  constructor(RAPIER, level) {
+    this.R = RAPIER;
+    this.level = level;
+    this.world = new RAPIER.World({ x: 0, y: -PHYS.gravity, z: 0 });
+    this.world.timestep = PHYS.dt;
+    this.time = 0;
+    this.ticks = 0;
+    this.ballsLeft = level.balls;
+    this.ballsTotal = level.balls;
+    this.shotsFired = 0;
+    this.blockPoints = 0;
+    this.status = 'playing';                 // 'playing' | 'cleared' | 'failed'
+    this.events = [];
+    this.burst = { count: 0, timer: 0 };
+    this.restTicks = 0;
+    this.hotTicks = 0;
+    this.cooldown = 0;
+
+    // ground
+    this.world.createCollider(RAPIER.ColliderDesc.cuboid(60, 0.5, 60).setTranslation(0, -0.5, 0).setFriction(0.9));
+    // pedestal (solid cylinder, top at PHYS.pedestalTop)
+    this.world.createCollider(
+      RAPIER.ColliderDesc.cylinder(PHYS.pedestalTop / 2, PHYS.pedestalRadius)
+        .setTranslation(0, PHYS.pedestalTop / 2, 0).setFriction(0.5).setRestitution(0.02));
+
+    this.blocks = level.blocks.map((b, i) => this._addBlock(b, i));
+    this.balls = [];
+  }
+
+  _addBlock(b, i) {
+    const R = this.R;
+    const t = TYPES[b.type] || TYPES.wood;
+    const half = Math.sin((b.yaw || 0) / 2), cos = Math.cos((b.yaw || 0) / 2);
+    const body = this.world.createRigidBody(
+      R.RigidBodyDesc.dynamic().setTranslation(b.x, b.y, b.z)
+        .setRotation({ x: 0, y: half, z: 0, w: cos })
+        .setLinearDamping(0.05).setAngularDamping(0.15));
+    const col = this.world.createCollider(
+      R.ColliderDesc.cuboid(b.sx / 2, b.sy / 2, b.sz / 2)
+        .setDensity(t.density).setFriction(t.friction).setRestitution(t.restitution), body);
+    return { id: i, type: b.type, size: { x: b.sx, y: b.sy, z: b.sz }, body, col,
+             cleared: false, removed: false, destroyed: false, clearedAt: -1 };
+  }
+
+  /** Muzzle position -- where balls are born. Kept in the sim so tests aim like the game does.
+      It sits above the pedestal top: a lower muzzle makes shots at low blocks clip the near rim. */
+  static get muzzle() { return { x: 0, y: 2.35, z: 21.0 }; }
+
+  /** How far the barrel mouth sits ahead of the trunnion the barrel pivots on. The drawn gun
+      uses the same number, so balls leave the hole in the front of the barrel. */
+  static get barrelLen() { return 2.5; }
+
+  /** Where the ball starts and how fast, for an aim point. The ball is born at the mouth of the
+      barrel, so the angle is solved again *from the spawn point* -- solving from the pivot and
+      then skipping the length of the barrel throws the trajectory high and makes the crosshair lie. */
+  static solveShot(aimPoint) {
+    const from = Sim.muzzle, L = Sim.barrelLen;
+    const d0 = ballisticDir(from, aimPoint);
+    const spawn = { x: from.x + d0.x * L, y: from.y + d0.y * L, z: from.z + d0.z * L };
+    const dir = ballisticDir(spawn, aimPoint);
+    return { spawn, dir, vel: { x: dir.x * PHYS.ballSpeed, y: dir.y * PHYS.ballSpeed, z: dir.z * PHYS.ballSpeed } };
+  }
+
+  /** Fire at a world point. Returns true if a ball left the barrel. */
+  fire(aimPoint) {
+    if (this.status !== 'playing' || this.ballsLeft <= 0 || this.cooldown > 0) return false;
+    const { spawn, vel } = Sim.solveShot(aimPoint);
+    // each shot starts its own combo, so spamming clicks can't chain one burst into the next
+    if (this.burst.count > 0) { this.events.push({ type: 'burstEnd', count: this.burst.count }); this.burst.count = 0; this.burst.timer = 0; }
+    const b = this.world.createRigidBody(
+      this.R.RigidBodyDesc.dynamic()
+        .setTranslation(spawn.x, spawn.y, spawn.z)
+        .setLinvel(vel.x, vel.y, vel.z)
+        .setCcdEnabled(true).setLinearDamping(0.01));
+    this.world.createCollider(
+      this.R.ColliderDesc.ball(PHYS.ballRadius).setDensity(PHYS.ballDensity)
+        .setFriction(0.4).setRestitution(0.25), b);
+    this.balls.push({ body: b, born: this.time });
+    this.ballsLeft--;
+    this.shotsFired++;
+    this.cooldown = 0.15;
+    this.hotTicks = 0;
+    this.restTicks = 0;
+    this.events.push({ type: 'fire', at: { ...aimPoint } });
+    return true;
+  }
+
+  get remaining() { return this.blocks.filter(b => !b.cleared).length; }
+  get clearedCount() { return this.blocks.filter(b => b.cleared).length; }
+  get ballsInFlight() { return this.balls.length; }
+
+  _speed(body) { const v = body.linvel(); return Math.hypot(v.x, v.y, v.z); }
+
+  _explode(at, sourceId) {
+    this.events.push({ type: 'blast', at: { ...at } });
+    for (const b of this.blocks) {
+      if (b.removed || b.id === sourceId) continue;
+      const p = b.body.translation();
+      const dx = p.x - at.x, dy = p.y - at.y, dz = p.z - at.z;
+      const d = Math.hypot(dx, dy, dz);
+      if (d > BLAST.radius || d < 1e-4) continue;
+      const f = (1 - d / BLAST.radius) * BLAST.impulse * b.body.mass();
+      b.body.applyImpulse({ x: (dx / d) * f, y: (dy / d) * f + f * 0.25, z: (dz / d) * f }, true);
+    }
+    for (const ball of this.balls) {
+      const p = ball.body.translation();
+      const dx = p.x - at.x, dy = p.y - at.y, dz = p.z - at.z;
+      const d = Math.hypot(dx, dy, dz);
+      if (d > BLAST.radius || d < 1e-4) continue;
+      const f = (1 - d / BLAST.radius) * BLAST.impulse * ball.body.mass() * 0.4;
+      ball.body.applyImpulse({ x: (dx / d) * f, y: (dy / d) * f, z: (dz / d) * f }, true);
+    }
+  }
+
+  /** Mark a block cleared exactly once and score it inside the current burst. */
+  _markCleared(b, how) {
+    if (b.cleared) return;
+    b.cleared = true;
+    b.clearedAt = this.time;
+    this.burst.count++;
+    this.burst.timer = PHYS.comboWindow;
+    const pts = Logic.blockScore(this.burst.count);
+    this.blockPoints += pts;
+    this.events.push({ type: 'clear', id: b.id, how, points: pts, combo: this.burst.count });
+  }
+
+  _remove(b) {
+    if (b.removed) return;
+    b.removed = true;
+    this.world.removeRigidBody(b.body);
+    b.body = null;      // a freed handle panics the WASM module if touched; fail loudly in JS instead
+  }
+
+  /** Advance exactly one fixed step. Returns the events produced this tick.
+      Physics keeps running after the level ends so debris settles and anything still in flight
+      lands, but no further scoring or win/lose transitions happen. */
+  tick() {
+    this.events = [];
+    const live = this.status === 'playing';
+    this.world.step();
+    this.time += PHYS.dt;
+    this.ticks++;
+    if (this.cooldown > 0) this.cooldown = Math.max(0, this.cooldown - PHYS.dt);
+
+    // --- destructive block behaviour (barrels, glass) ---
+    if (live) for (const b of this.blocks) {
+      if (b.removed || b.destroyed) continue;
+      const t = TYPES[b.type];
+      const sp = this._speed(b.body);
+      if (t.blastAt && sp > t.blastAt) {
+        const at = { ...b.body.translation() };
+        b.destroyed = true;
+        this._markCleared(b, 'blast');
+        this._remove(b);
+        this._explode(at, b.id);
+      } else if (t.shatterAt && sp > t.shatterAt) {
+        b.destroyed = true;
+        this._markCleared(b, 'shatter');
+        this.events.push({ type: 'shatter', at: { ...b.body.translation() } });
+        this._remove(b);
+      }
+    }
+
+    // --- off-the-pedestal detection ---
+    for (const b of this.blocks) {
+      if (b.removed) continue;
+      const p = b.body.translation();
+      if (live && !b.cleared) {
+        const horiz = Math.hypot(p.x, p.z);
+        if (horiz > PHYS.pedestalRadius + PHYS.clearMargin || p.y < PHYS.pedestalTop - 0.4) {
+          this._markCleared(b, 'off');
+        }
+      }
+      // debris is tidied away once it has landed, instead of piling up as live bodies for ever
+      if (p.y < PHYS.arenaKill || Math.hypot(p.x, p.z) > PHYS.arenaFar) this._remove(b);
+      else if (b.cleared && b.clearedAt >= 0 && this.time - b.clearedAt > PHYS.debrisLinger
+               && (this._speed(b.body) < 0.8 || p.y < PHYS.pedestalTop - 0.6)) this._remove(b);
+    }
+
+    // --- balls leave the arena ---
+    for (let i = this.balls.length - 1; i >= 0; i--) {
+      const p = this.balls[i].body.translation();
+      if (p.y < PHYS.arenaKill || Math.hypot(p.x, p.z) > PHYS.arenaFar || this.time - this.balls[i].born > 12) {
+        this.world.removeRigidBody(this.balls[i].body);
+        this.balls.splice(i, 1);
+      }
+    }
+
+    // --- combo burst window ---
+    if (live && this.burst.count > 0) {
+      this.burst.timer -= PHYS.dt;
+      if (this.burst.timer <= 0) {
+        this.events.push({ type: 'burstEnd', count: this.burst.count });
+        this.burst.count = 0;
+      }
+    }
+
+    // --- rest detection ---
+    let moving = false;
+    for (const b of this.blocks) if (!b.removed && this._speed(b.body) > PHYS.settleSpeed) { moving = true; break; }
+    if (!moving) for (const b of this.balls) if (this._speed(b.body) > PHYS.settleSpeed) { moving = true; break; }
+    if (moving) { this.restTicks = 0; this.hotTicks++; } else { this.restTicks++; }
+
+    // --- win / lose ---
+    if (!live) return this.events;
+    // A clear always wins, even on the very last ball.
+    if (this.remaining === 0) {
+      this.status = 'cleared';
+      this.events.push({ type: 'cleared' });
+    } else if (this.ballsLeft === 0 && this.balls.length === 0 && this.restTicks >= PHYS.settleTicks) {
+      this.status = 'failed';
+      this.events.push({ type: 'failed' });
+    }
+    return this.events;
+  }
+
+  /** True once nothing is moving (or the world has been hot for too long). */
+  get settled() { return this.restTicks >= PHYS.settleTicks || this.hotTicks > PHYS.maxShotTicks; }
+
+  /** Score if the level ended right now: blocks knocked off, the clear bonus, and every ball
+      still in the rack. Spending more balls simply leaves fewer of them to cash in. */
+  finalScore() {
+    return this.blockPoints + (this.status === 'cleared'
+      ? Logic.clearBonus() + Logic.ballBonus(this.ballsLeft) : 0);
+  }
+
+  /** Stars for this level, read off the final score. */
+  starsEarned() { return Logic.stars(this.finalScore(), this.blocks.length, this.ballsTotal); }
+
+  /** Positions for the renderer / tests. */
+  snapshot() {
+    return {
+      status: this.status, ballsLeft: this.ballsLeft, remaining: this.remaining,
+      cleared: this.clearedCount, points: this.blockPoints, time: +this.time.toFixed(3),
+      blocks: this.blocks.filter(b => !b.removed).map(b => {
+        const p = b.body.translation();
+        return { id: b.id, type: b.type, cleared: b.cleared, x: +p.x.toFixed(3), y: +p.y.toFixed(3), z: +p.z.toFixed(3) };
+      }),
+    };
+  }
+
+  /* ---------- solver bot: proves a level is clearable with shots a player could take ---------- */
+  /** Aim point for the bot's `attempt`-th shot.
+      Targets a real block (a hollow ring's centroid is empty air), and mixes in glancing shots on
+      the inner face so the block is pushed *outwards* towards the nearest rim -- what a player does. */
+  botAim(attempt = 0) {
+    const live = this.blocks.filter(b => !b.cleared && !b.removed);
+    if (!live.length) return { x: 0, y: PHYS.pedestalTop + 0.5, z: 0 };
+    const pos = live.map(b => ({ b, p: b.body.translation() }));
+    // lowest first (knocking the base out topples the rest); ties go to the block nearest the cannon
+    pos.sort((a, c) => (a.p.y - c.p.y) || (c.p.z - a.p.z));
+    const spread = Math.max(1, Math.min(pos.length, 6));
+    const pick = pos[attempt % spread];
+    const p = pick.p, sz = pick.b.size;
+    const half = Math.max(sz.x, sz.z) / 2;
+
+    // direction from the pedestal axis out towards the rim (default: away from the cannon)
+    let ox = p.x, oz = p.z;
+    const len = Math.hypot(ox, oz);
+    if (len < 0.05) { ox = 0; oz = -1; } else { ox /= len; oz /= len; }
+
+    const round = Math.floor(attempt / spread) % 6;
+    const plan = [
+      { dx: 0, dy: 0, dz: 0 },                                        // straight at it
+      { dx: -ox * half * 0.7, dy: -0.10, dz: -oz * half * 0.7 },      // low glancing blow, pushes outwards
+      { dx: 0, dy: -0.12, dz: 0 },                                    // low and central
+      { dx: -ox * half * 0.85, dy: 0, dz: -oz * half * 0.85 },        // wide glancing blow
+      { dx: 0.28, dy: 0.05, dz: 0 },
+      { dx: -0.28, dy: 0.05, dz: 0 },
+    ][round];
+
+    const aim = { x: p.x + plan.dx, y: Math.max(PHYS.pedestalTop + 0.06, p.y + plan.dy), z: p.z + plan.dz };
+    // A shot that would bury itself in the side of the pedestal is a wasted ball, so lift the aim
+    // just enough to clear the rim on the way in.
+    for (let i = 0; i < 8 && !Sim.aimClearsRim(aim); i++) aim.y += 0.1;
+    return aim;
+  }
+
+  /** Would a shot at this point sail over the pedestal rim, or dig into its side? */
+  static aimClearsRim(aim) {
+    const { spawn, vel } = Sim.solveShot(aim);
+    const vh = Math.hypot(vel.x, vel.z);
+    if (vh < 1e-6) return true;
+    const tEnd = Math.hypot(aim.x - spawn.x, aim.z - spawn.z) / vh;
+    const aimR = Math.hypot(aim.x, aim.z);
+    for (let i = 1; i <= 28; i++) {
+      const t = tEnd * i / 28;
+      const x = spawn.x + vel.x * t, z = spawn.z + vel.z * t;
+      const r = Math.hypot(x, z);
+      if (r <= aimR + 0.15) break;                      // close to the target: the block is the thing it hits
+      if (r > PHYS.pedestalRadius + PHYS.ballRadius) continue;
+      const y = spawn.y + vel.y * t - 0.5 * PHYS.gravity * t * t;
+      if (y - PHYS.ballRadius < PHYS.pedestalTop - 0.01) return false;
+    }
+    return true;
+  }
+
+  /** A copy of the live world, enough to rebuild it exactly. */
+  exportState() {
+    return {
+      ballsLeft: this.ballsLeft, blockPoints: this.blockPoints, status: this.status,
+      blocks: this.blocks.map(b => b.removed ? { removed: true, cleared: b.cleared } : {
+        removed: false, cleared: b.cleared, destroyed: b.destroyed,
+        p: { ...b.body.translation() }, r: { ...b.body.rotation() },
+        lv: { ...b.body.linvel() }, av: { ...b.body.angvel() },
+      }),
+    };
+  }
+
+  /** Rebuild a world from exportState(), so a bot can try a shot without committing to it. */
+  static fromExport(RAPIER, level, state) {
+    const s = new Sim(RAPIER, level);
+    s.ballsLeft = state.ballsLeft;
+    s.blockPoints = state.blockPoints;
+    s.status = state.status;
+    state.blocks.forEach((snap, i) => {
+      const b = s.blocks[i];
+      if (snap.removed) { s._remove(b); b.cleared = snap.cleared; return; }
+      b.cleared = snap.cleared; b.destroyed = snap.destroyed;
+      b.body.setTranslation(snap.p, true);
+      b.body.setRotation(snap.r, true);
+      b.body.setLinvel(snap.lv, true);
+      b.body.setAngvel(snap.av, true);
+    });
+    return s;
+  }
+
+  /** Try a shot in a throwaway copy and report how many blocks it would clear. */
+  _tryShot(aim, ticks = 170) {
+    const copy = Sim.fromExport(this.R, this.level, this.exportState());
+    copy.cooldown = 0;
+    if (!copy.fire(aim)) { copy.destroy(); return -1; }
+    const before = copy.clearedCount;
+    for (let i = 0; i < ticks; i++) copy.tick();
+    const gained = copy.clearedCount - before;
+    copy.destroy();
+    return gained;
+  }
+
+  /** Endgame: with only a few blocks left, look ahead and pick the shot that actually clears them. */
+  bestEndgameAim() {
+    const live = this.blocks.filter(b => !b.cleared && !b.removed);
+    if (!live.length) return null;
+    const cands = [];
+    for (const b of live) {
+      const p = b.body.translation();
+      const half = Math.max(b.size.x, b.size.z) / 2;
+      let ox = p.x, oz = p.z;
+      const len = Math.hypot(ox, oz);
+      if (len < 0.05) { ox = 0; oz = -1; } else { ox /= len; oz /= len; }
+      for (const d of [[0, 0], [-ox * half * 0.8, -oz * half * 0.8], [0, 0.16], [0, -0.14],
+                       [half * 0.7, 0], [-half * 0.7, 0]]) {
+        const aim = { x: p.x + d[0], y: Math.max(PHYS.pedestalTop + 0.06, p.y + d[1]), z: p.z + (d[1] === 0 ? 0 : 0) };
+        if (d.length === 2 && d[1] === 0) { aim.x = p.x + d[0]; aim.z = p.z + (d[0] === 0 ? 0 : 0); }
+        for (let i = 0; i < 8 && !Sim.aimClearsRim(aim); i++) aim.y += 0.1;
+        cands.push(aim);
+      }
+    }
+    let best = null, bestGain = 0;
+    for (const aim of cands) {
+      const gain = this._tryShot(aim);
+      if (gain > bestGain) { bestGain = gain; best = aim; }
+      if (bestGain >= live.length) break;               // clears everything: take it
+    }
+    return bestGain > 0 ? best : null;
+  }
+
+  /** Run the bot to completion. Returns { status, shots, ticks, score }. */
+  runBot(maxTicks = 60 * 400, lookahead = true) {
+    let attempt = 0, guard = 0;
+    while (this.status === 'playing' && guard++ < maxTicks) {
+      if (this.ballsLeft > 0 && this.cooldown === 0 && this.settled && this.ballsInFlight === 0) {
+        // near the end, stop guessing: try the candidates and take one that actually works
+        const aim = (lookahead && this.remaining <= 5) ? this.bestEndgameAim() : null;
+        this.fire(aim || this.botAim(attempt++));
+      }
+      this.tick();
+      if (this.status !== 'playing') break;
+      if (this.ballsLeft === 0 && this.settled && this.ballsInFlight === 0) { this.tick(); break; }
+    }
+    return { status: this.status, shots: this.shotsFired, ticks: this.ticks, score: this.finalScore() };
+  }
+
+  /** Step until nothing moves (used by tests). */
+  settleOut(maxTicks = 60 * 10) {
+    let i = 0;
+    while (i++ < maxTicks) { this.tick(); if (this.settled) break; }
+    return i;
+  }
+
+  destroy() { try { this.world.free(); } catch { /* ignore */ } }
+}
+/* ##### END SIM ##### */
+
+/* ##### SCENES (Three.js rendering + DOM UI) ##### */
+
+const appEl = document.getElementById('app');
+const hudEl = document.getElementById('hud');
+const overlayEl = document.getElementById('overlay');
+const fatalEl = document.getElementById('fatal');
+
+function showFatal(msg) { fatalEl.style.display = 'block'; fatalEl.textContent = 'Error: ' + msg; }
+window.addEventListener('error', e => showFatal(e.message || String(e)));
+window.addEventListener('unhandledrejection', e => showFatal((e.reason && e.reason.message) || String(e.reason)));
+
+/* ---------- tiny DOM helper ---------- */
+function el(tag, attrs = {}, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') n.className = v;
+    else if (k === 'html') n.innerHTML = v;
+    else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
+    else if (v != null) n.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) if (c != null) n.append(c.nodeType ? c : document.createTextNode(String(c)));
+  return n;
+}
+function button(label, onClick, cls = '') {
+  return el('button', {
+    class: 'btn ' + cls,
+    onclick: (e) => { e.preventDefault(); if (Scenes.busy) return; Sfx.unlock(); Sfx.play('click'); onClick(e); },
+  }, label);
+}
+const fmt = n => Math.round(n).toLocaleString('en-US');
+
+/* ---------- 3D world (built once, reused by every level) ---------- */
+const PALETTE = {
+  grass: 0x6fc74a, grassDark: 0x4e9e33, dirt: 0xe0b46a, dirtDark: 0xc9954c,
+  sky: 0x7fd2ff, skyPale: 0xd7f2ff,
+  pedestal: 0xfff0cf, pedestalMid: 0xf5c65a, pedestalBase: 0x8b5cd6,
+  cannonBody: 0xe8402f, cannonBand: 0x3f7fe0, cannonGold: 0xffc63c,
+  outline: 0x2a2140,
+};
+
+const View = {
+  ready: false,
+
+  /* screenshot sky and hills wrapped on a cylinder behind the arena */
+  makeBackdrop(img) {
+    const W = 2048, H = 1200;
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const g = c.getContext('2d');
+
+    const sky = g.createLinearGradient(0, 0, 0, H * 0.88);
+    sky.addColorStop(0, '#4db4f5');
+    sky.addColorStop(0.55, '#8ed6ff');
+    sky.addColorStop(1, '#d9f3ff');
+    g.fillStyle = sky; g.fillRect(0, 0, W, H);
+
+    if (img && img.width) {
+      // HUD and 3D pieces sit in the photo; keep sky, mountains, and far hills only.
+      const sy = img.height * 0.08;
+      const sh = img.height * 0.30;
+      g.drawImage(img, 0, sy, img.width, sh, 0, H * 0.48, W, H * 0.42);
+    }
+
+    const gr = g.createLinearGradient(0, H * 0.90, 0, H);
+    gr.addColorStop(0, 'rgba(111,199,74,0)');
+    gr.addColorStop(0.45, '#6fc74a');
+    gr.addColorStop(1, '#63b942');
+    g.fillStyle = gr; g.fillRect(0, H * 0.88, W, H * 0.12);
+
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.minFilter = THREE.LinearFilter;
+    return tex;
+  },
+
+  init(backdropImg) {
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+    this.renderer.setClearColor(0x000000, 0);   // the screenshot sits as CSS behind the canvas
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    appEl.appendChild(this.renderer.domElement);
+
+    this.scene = new THREE.Scene();
+    this.scene.background = null;
+    this.scene.fog = new THREE.Fog(0x8fd07a, 115, 235);   // far enough not to seam against the painted grass
+    appEl.style.background = 'linear-gradient(180deg, #4db4f5 0%, #8ed6ff 52%, #d9f3ff 78%, #6fc74a 79%, #63b942 100%)';
+
+    this.camera = new THREE.PerspectiveCamera(28, 1, 0.1, 600);   // long lens: the target is far away
+    this.target = new THREE.Vector3(0, PHYS.pedestalTop + 1.9, 0);   // sight on the middle of a typical stack
+
+    // --- painted backdrop ---
+    // The painted world stands just beyond the grass disc: close enough that its horizon lines up
+    // with the edge of the 3D ground, instead of the ground running away to the far distance.
+    const BACK_R = 125, BACK_H = 62;
+    const back = new THREE.Mesh(
+      new THREE.CylinderGeometry(BACK_R, BACK_R, BACK_H, 64, 1, true),
+      new THREE.MeshBasicMaterial({ map: this.makeBackdrop(backdropImg), side: THREE.BackSide, fog: false, depthWrite: false }));
+    back.position.y = BACK_H / 2 - 8;
+    this.scene.add(back);
+
+    // --- light: bright midday, soft warm shadows ---
+    this.scene.add(new THREE.HemisphereLight(0xdff3ff, 0x69a84a, 1.15));
+    const sun = new THREE.DirectionalLight(0xfff6e0, 2.0);
+    sun.position.set(9, 17, 11);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    const sc = sun.shadow.camera;
+    sc.left = -20; sc.right = 20; sc.top = 24; sc.bottom = -22; sc.near = 1; sc.far = 90;
+    sun.shadow.bias = -0.0013;
+    sun.shadow.radius = 2;
+    this.scene.add(sun);
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+    // --- ground: bright grass with a dirt ring under the pedestal ---
+    const ground = new THREE.Mesh(
+      new THREE.CircleGeometry(118, 72),
+      new THREE.MeshStandardMaterial({ color: PALETTE.grass, roughness: 1 }));
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    this.scene.add(ground);
+    this.groundMesh = ground;
+
+    const dirt = new THREE.Mesh(
+      new THREE.CircleGeometry(PHYS.pedestalRadius + 1.7, 48),
+      new THREE.MeshStandardMaterial({ color: PALETTE.dirt, roughness: 1 }));
+    dirt.rotation.x = -Math.PI / 2; dirt.position.y = 0.012; dirt.receiveShadow = true;
+    this.scene.add(dirt);
+    // a worn patch under the gun emplacement too, so it sits in the ground rather than on it
+    const pad = new THREE.Mesh(
+      new THREE.CircleGeometry(2.5, 36),
+      new THREE.MeshStandardMaterial({ color: PALETTE.dirt, roughness: 1 }));
+    pad.rotation.x = -Math.PI / 2;
+    pad.position.set(Sim.muzzle.x, 0.012, Sim.muzzle.z);
+    pad.receiveShadow = true;
+    this.scene.add(pad);
+
+    // --- pedestal: cream column, gold collar, purple foot ---
+    const R = PHYS.pedestalRadius, TOP = PHYS.pedestalTop;
+    const ped = new THREE.Group();
+    const cream = new THREE.MeshStandardMaterial({ color: PALETTE.pedestal, roughness: 0.6 });
+    const gold = new THREE.MeshStandardMaterial({ color: PALETTE.pedestalMid, roughness: 0.35, metalness: 0.25 });
+    const purple = new THREE.MeshStandardMaterial({ color: PALETTE.pedestalBase, roughness: 0.55 });
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.42, R * 0.52, TOP * 0.62, 28), gold);
+    shaft.position.y = TOP * 0.40;
+    const foot = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.78, R * 0.92, TOP * 0.16, 30), purple);
+    foot.position.y = TOP * 0.08;
+    const footRim = new THREE.Mesh(new THREE.TorusGeometry(R * 0.86, TOP * 0.05, 10, 34), gold);
+    footRim.rotation.x = Math.PI / 2; footRim.position.y = TOP * 0.16;
+    const collar = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.96, R * 0.6, TOP * 0.16, 30), purple);
+    collar.position.y = TOP * 0.79;
+    const plate = new THREE.Mesh(new THREE.CylinderGeometry(R, R, TOP * 0.14, 34), cream);
+    plate.position.y = TOP - TOP * 0.07;
+    const plateRim = new THREE.Mesh(new THREE.TorusGeometry(R, TOP * 0.045, 10, 40), gold);
+    plateRim.rotation.x = Math.PI / 2; plateRim.position.y = TOP - TOP * 0.13;
+    for (const m of [shaft, foot, footRim, collar, plate, plateRim]) { m.castShadow = true; m.receiveShadow = true; ped.add(m); }
+    this.scene.add(ped);
+    this.pedestalMesh = plate;
+    this.pedestalHit = new THREE.Mesh(
+      new THREE.CylinderGeometry(R, R, TOP, 24),
+      new THREE.MeshBasicMaterial({ visible: false }));
+    this.pedestalHit.position.y = TOP / 2;
+    this.scene.add(this.pedestalHit);
+
+    // --- cannon: red barrel with gold muzzle and blue bands, on a solid stepped carriage ---
+    const m = Sim.muzzle;
+    const body = new THREE.MeshStandardMaterial({ color: PALETTE.cannonBody, roughness: 0.38 });
+    const band = new THREE.MeshStandardMaterial({ color: PALETTE.cannonBand, roughness: 0.42 });
+    const goldM = new THREE.MeshStandardMaterial({ color: PALETTE.cannonGold, roughness: 0.28, metalness: 0.4 });
+    const cream2 = new THREE.MeshStandardMaterial({ color: 0xfff0cf, roughness: 0.55 });
+
+    // The gun stands a long way from the camera now, so it is built big: the barrel is the
+    // hero shape, roughly as tall on screen as the stack it is shooting at.
+    // the barrel, pivoting at the muzzle anchor
+    this.cannon = new THREE.Group();
+    this.cannon.position.set(m.x, m.y, m.z);
+    this.barrelGroup = new THREE.Group();
+    // The trunnion is under the middle of the barrel, and the mouth is exactly Sim.barrelLen
+    // ahead of it, which is where the sim starts its balls.
+    const L = Sim.barrelLen;
+    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.66, L * 1.72, 26), body);
+    barrel.rotation.x = -Math.PI / 2; barrel.position.z = -L * 0.14; barrel.castShadow = true;
+    const flare = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.62, 0.5, 26), goldM);
+    flare.rotation.x = -Math.PI / 2; flare.position.z = -(L - 0.23); flare.castShadow = true;
+    const lip = new THREE.Mesh(new THREE.TorusGeometry(0.77, 0.12, 12, 30), goldM);
+    lip.position.z = -(L - 0.02);
+    const midBand = new THREE.Mesh(new THREE.TorusGeometry(0.58, 0.13, 12, 30), band);
+    midBand.position.z = -L * 0.42;
+    const heelBand = new THREE.Mesh(new THREE.TorusGeometry(0.69, 0.15, 12, 30), goldM);
+    heelBand.position.z = L * 0.62;
+    const cap = new THREE.Mesh(new THREE.SphereGeometry(0.57, 22, 16, 0, Math.PI * 2, 0, Math.PI / 2), body);
+    cap.rotation.x = Math.PI / 2; cap.position.z = L * 0.73; cap.castShadow = true;
+    this.barrelGroup.add(barrel, flare, lip, midBand, heelBand, cap);
+    this.cannon.add(this.barrelGroup);
+    // trunnion hub the barrel turns in
+    const hub = new THREE.Mesh(new THREE.SphereGeometry(0.62, 22, 18), band);
+    hub.castShadow = true;
+    this.cannon.add(hub);
+    // a little gold crown, as in the reference art
+    const crown = new THREE.Group();
+    const crownBand = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.24, 0.1, 14), goldM);
+    crown.add(crownBand);
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2;
+      const spike = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.16, 8), goldM);
+      spike.position.set(Math.cos(a) * 0.17, 0.12, Math.sin(a) * 0.17);
+      crown.add(spike);
+    }
+    crown.scale.setScalar(1.45); crown.position.set(0, 0.72, 1.24);
+    this.cannon.add(crown);
+    this.scene.add(this.cannon);
+
+    // carriage: a stepped column from the ground up to the hub, so nothing floats
+    const carriage = new THREE.Group();
+    const baseH = 0.5, midH = 0.7;
+    const drum = new THREE.Mesh(new THREE.CylinderGeometry(1.22, 1.54, baseH, 36), purple);
+    drum.position.y = baseH / 2; drum.castShadow = true; drum.receiveShadow = true;
+    const drumRim = new THREE.Mesh(new THREE.TorusGeometry(1.25, 0.12, 10, 44), goldM);
+    drumRim.rotation.x = Math.PI / 2; drumRim.position.y = baseH;
+    const midCol = new THREE.Mesh(new THREE.CylinderGeometry(0.86, 1.14, midH, 32), cream2);
+    midCol.position.y = baseH + midH / 2; midCol.castShadow = true;
+    const midRim = new THREE.Mesh(new THREE.TorusGeometry(0.88, 0.1, 10, 36), goldM);
+    midRim.rotation.x = Math.PI / 2; midRim.position.y = baseH + midH;
+    const topColH = Math.max(0.28, m.y - (baseH + midH) - 0.72);
+    const topCol = new THREE.Mesh(new THREE.CylinderGeometry(0.66, 0.82, topColH, 28), purple);
+    topCol.position.y = baseH + midH + topColH / 2; topCol.castShadow = true;
+    carriage.add(drum, drumRim, midCol, midRim, topCol);
+    // two blue cheeks holding the trunnion
+    for (const side of [-1, 1]) {
+      const cheek = new THREE.Mesh(new THREE.BoxGeometry(0.28, 1.35, 0.95), band);
+      cheek.position.set(side * 0.78, m.y - 0.52, 0);
+      cheek.castShadow = true;
+      carriage.add(cheek);
+    }
+    carriage.position.set(m.x, 0, m.z);
+    this.scene.add(carriage);
+
+    // --- crosshair ---
+    this.crosshair = new THREE.Group();
+    const ch1 = new THREE.Mesh(new THREE.RingGeometry(0.22, 0.30, 26),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.98, depthTest: false }));
+    const ch2 = new THREE.Mesh(new THREE.RingGeometry(0.30, 0.36, 26),
+      new THREE.MeshBasicMaterial({ color: 0xff5a2b, transparent: true, opacity: 0.95, depthTest: false }));
+    const ch3 = new THREE.Mesh(new THREE.CircleGeometry(0.06, 14),
+      new THREE.MeshBasicMaterial({ color: 0xff5a2b, transparent: true, opacity: 0.95, depthTest: false }));
+    this.crosshair.add(ch1, ch2, ch3);
+    this.crosshair.renderOrder = 999;
+    this.crosshair.visible = false;
+    this.scene.add(this.crosshair);
+
+    // --- reusable geometry / materials ---
+    this.ballGeo = new THREE.SphereGeometry(PHYS.ballRadius, 20, 16);
+    this.ballMat = new THREE.MeshStandardMaterial({ color: 0x2b2f44, roughness: 0.3, metalness: 0.55 });
+    this.outlineMat = new THREE.MeshBasicMaterial({ color: PALETTE.outline, side: THREE.BackSide });
+    const BLOCK_COLORS = {
+      wood: 0xffa62b, stone: 0x3f5fd0, glass: 0x8fe6ff, barrel: 0xee3b30, steel: 0x7a4fd0,
+    };
+    this.blockMats = {};
+    for (const k of Object.keys(TYPES)) {
+      this.blockMats[k] = new THREE.MeshStandardMaterial({
+        color: BLOCK_COLORS[k],
+        roughness: k === 'glass' ? 0.1 : k === 'steel' ? 0.35 : 0.42,
+        metalness: k === 'steel' ? 0.5 : 0.05,
+        transparent: k === 'glass', opacity: k === 'glass' ? 0.66 : 1,
+      });
+    }
+    this.raycaster = new THREE.Raycaster();
+    this.blockMeshes = [];
+    this.ballMeshes = [];
+    this.fx = [];
+    this.shake = 0;
+    this.ready = true;
+    this.resize();
+  },
+
+  resize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    this.renderer.setSize(w, h, false);
+    this.camera.aspect = w / Math.max(1, h);
+    // frame the arena: keep the whole stack visible in portrait and landscape
+    const half = Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    const dH = 6.6 / half;                                   // half-height of the action
+    const dW = 7.4 / (half * this.camera.aspect);            // half-width
+    // stand well behind the cannon, so the whole gun reads in the near foreground
+    this.camDist = Math.max(Sim.muzzle.z + 29, Math.min(80, Math.max(dH, dW)));
+    this.camera.updateProjectionMatrix();
+    this.placeCamera();
+  },
+
+  placeCamera() {
+    // Dead centre and high: the camera hangs right behind the gun, so the cannon sits at the
+    // bottom middle of the screen and the barrel points straight at the table.
+    const dir = new THREE.Vector3(0, 0.165, 1).normalize();
+    this.camBase = this.target.clone().add(dir.multiplyScalar(this.camDist));
+    this.camera.position.copy(this.camBase);
+    this.camera.lookAt(this.target);
+  },
+
+  clearLevel() {
+    for (const m of this.blockMeshes) { this.scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
+    this.blockMeshes.length = 0;
+    for (const m of this.ballMeshes) this.scene.remove(m);
+    this.ballMeshes.length = 0;
+    for (const f of this.fx) this.scene.remove(f.mesh);
+    this.fx.length = 0;
+  },
+
+  buildLevel(sim) {
+    this.clearLevel();
+    for (const b of sim.blocks) {
+      const geo = new THREE.BoxGeometry(b.size.x, b.size.y, b.size.z);
+      const mat = this.blockMats[b.type].clone();
+      // a touch of per-block lightness variation so neighbouring blocks don't merge visually
+      mat.color.offsetHSL(0, 0, (((b.id * 2654435761) % 1000) / 1000 - 0.5) * 0.07);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true; mesh.receiveShadow = true;
+      mesh.userData.blockId = b.id;
+      // cartoon outline: the same box turned inside out, a little larger
+      const outline = new THREE.Mesh(geo, this.outlineMat);
+      const grow = 0.075;
+      outline.scale.set(1 + grow / b.size.x, 1 + grow / b.size.y, 1 + grow / b.size.z);
+      mesh.add(outline);
+      this.scene.add(mesh);
+      this.blockMeshes.push(mesh);
+    }
+    this.syncFromSim(sim);
+  },
+
+  syncFromSim(sim) {
+    for (let i = 0; i < sim.blocks.length; i++) {
+      const b = sim.blocks[i], mesh = this.blockMeshes[i];
+      if (!mesh) continue;
+      if (b.removed) {                                   // shrink away rather than blink out
+        if (mesh.visible) {
+          mesh.scale.multiplyScalar(0.82);
+          if (mesh.scale.x < 0.06) mesh.visible = false;
+        }
+        continue;
+      }
+      const p = b.body.translation(), r = b.body.rotation();
+      mesh.position.set(p.x, p.y, p.z);
+      mesh.quaternion.set(r.x, r.y, r.z, r.w);
+    }
+    // balls
+    while (this.ballMeshes.length < sim.balls.length) {
+      const m = new THREE.Mesh(this.ballGeo, this.ballMat);
+      m.castShadow = true;
+      const o = new THREE.Mesh(this.ballGeo, this.outlineMat);
+      o.scale.setScalar(1.13);
+      m.add(o);
+      this.scene.add(m); this.ballMeshes.push(m);
+    }
+    for (let i = 0; i < this.ballMeshes.length; i++) {
+      const m = this.ballMeshes[i], b = sim.balls[i];
+      if (!b) { m.visible = false; continue; }
+      const p = b.body.translation();
+      m.visible = true; m.position.set(p.x, p.y, p.z);
+    }
+  },
+
+  /** World point under the pointer: the surface it is over, else a vertical plane through the middle. */
+  aimPointFrom(ndc) {
+    this.raycaster.setFromCamera(ndc, this.camera);
+    const targets = this.blockMeshes.filter(m => m.visible).concat([this.pedestalHit, this.groundMesh]);
+    const hits = this.raycaster.intersectObjects(targets, false);
+    if (hits.length) {
+      const p = hits[0].point.clone();
+      if (p.y < 0.25) p.y = 0.25;
+      return p;
+    }
+    const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const p = new THREE.Vector3();
+    if (this.raycaster.ray.intersectPlane(plane, p)) { p.y = Math.max(0.3, p.y); return p; }
+    return new THREE.Vector3(0, PHYS.pedestalTop + 1, 0);
+  },
+
+  aimAt(point) {
+    this.crosshair.position.copy(point);
+    this.crosshair.lookAt(this.camera.position);
+    this.crosshair.visible = true;
+    const { dir: d } = Sim.solveShot({ x: point.x, y: point.y, z: point.z });
+    const yaw = Math.atan2(d.x, d.z);
+    const pitch = Math.asin(Math.max(-1, Math.min(1, d.y)));
+    this.barrelGroup.rotation.set(0, yaw + Math.PI, 0);   // barrel points along -z locally
+    this.barrelGroup.rotateX(-pitch);
+  },
+
+  addBlast(at) {
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.3, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0xffd23c, transparent: true, opacity: 0.9 }));
+    mesh.position.set(at.x, at.y, at.z);
+    this.scene.add(mesh);
+    this.fx.push({ mesh, t: 0, life: 0.3, kind: 'blast' });
+    this.shake = Math.min(0.3, this.shake + 0.12);
+  },
+
+  addPuff(at) {
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 }));
+    mesh.position.set(at.x, at.y, at.z);
+    this.scene.add(mesh);
+    this.fx.push({ mesh, t: 0, life: 0.3, kind: 'puff' });
+  },
+
+  updateFx(dt) {
+    for (let i = this.fx.length - 1; i >= 0; i--) {
+      const f = this.fx[i];
+      f.t += dt;
+      const k = f.t / f.life;
+      if (k >= 1) { this.scene.remove(f.mesh); f.mesh.geometry.dispose(); f.mesh.material.dispose(); this.fx.splice(i, 1); continue; }
+      const s = f.kind === 'blast' ? 1 + k * 3.6 : 1 + k * 2.4;
+      f.mesh.scale.setScalar(s);
+      f.mesh.material.opacity = (f.kind === 'blast' ? 0.9 : 0.6) * (1 - k);
+    }
+    if (this.shake > 0.0001) {
+      this.shake = Math.max(0, this.shake - dt * 1.6);
+      const a = this.shake * 0.35;
+      this.camera.position.set(
+        this.camBase.x + (Math.random() - 0.5) * a,
+        this.camBase.y + (Math.random() - 0.5) * a,
+        this.camBase.z + (Math.random() - 0.5) * a);
+      this.camera.lookAt(this.target);
+    } else if (this.camBase && !this.camera.position.equals(this.camBase)) {
+      this.camera.position.copy(this.camBase);
+      this.camera.lookAt(this.target);
+    }
+  },
+
+  /** Screen position of a world point, for floating text. */
+  project(p) {
+    const v = new THREE.Vector3(p.x, p.y, p.z).project(this.camera);
+    return { x: (v.x * 0.5 + 0.5) * window.innerWidth, y: (-v.y * 0.5 + 0.5) * window.innerHeight };
+  },
+
+  render() { this.renderer.render(this.scene, this.camera); },
+};
+
+/* ---------- floating score text ---------- */
+function popText(worldPos, text, color = '#ffd166', size = 22) {
+  const s = View.project(worldPos);
+  const d = el('div', { class: 'pop' }, text);
+  d.style.cssText = `position:absolute;left:${s.x}px;top:${s.y}px;transform:translate(-50%,-50%);
+    color:${color};font-weight:800;font-size:${size}px;text-shadow:0 2px 0 rgba(0,0,0,.5);
+    pointer-events:none;transition:transform .7s ease-out,opacity .7s ease-out;opacity:1;z-index:5`;
+  hudEl.appendChild(d);
+  requestAnimationFrame(() => { d.style.transform = 'translate(-50%,-150%)'; d.style.opacity = '0'; });
+  setTimeout(() => d.remove(), 780);
+}
+
+/* ---------- input ---------- */
+const KEYMAP = {
+  ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+  ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+  Space: 'fire', Enter: 'confirm', NumpadEnter: 'confirm',
+  Escape: 'pause', KeyP: 'pause', KeyM: 'mute', KeyR: 'restart',
+};
+const Input = {
+  held: new Set(),
+  init() {
+    window.addEventListener('keydown', (e) => {
+      const a = KEYMAP[e.code];
+      if (!a) return;
+      e.preventDefault();
+      Sfx.unlock();
+      if (e.repeat && a !== 'left' && a !== 'right' && a !== 'up' && a !== 'down') return;
+      this.held.add(a);
+      Scenes.dispatch(a, 'key');
+    }, { passive: false });
+    window.addEventListener('keyup', (e) => { const a = KEYMAP[e.code]; if (a) this.held.delete(a); });
+    window.addEventListener('blur', () => this.held.clear());
+
+    // pointer: move aims, press fires. Swipes are recognised but gameplay ignores them.
+    const canvas = View.renderer.domElement;
+    const ndc = (e) => ({ x: (e.clientX / window.innerWidth) * 2 - 1, y: -(e.clientY / window.innerHeight) * 2 + 1 });
+    let start = null;
+    canvas.addEventListener('pointermove', (e) => { Scenes.current?.onAim?.(ndc(e)); });
+    canvas.addEventListener('pointerdown', (e) => {
+      Sfx.unlock();
+      start = { x: e.clientX, y: e.clientY, t: performance.now() };
+      Scenes.current?.onAim?.(ndc(e));
+      Scenes.dispatch('press', 'pointer', ndc(e));
+    });
+    const up = (e) => {
+      if (!start) return;
+      const dx = e.clientX - start.x, dy = e.clientY - start.y, dt = performance.now() - start.t;
+      start = null;
+      const dist = Math.hypot(dx, dy);
+      if (dist >= 45 && dt < 1000) {
+        const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+        Scenes.dispatch(dir, 'swipe');
+      }
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', () => { start = null; });
+  },
+  isDown(a) { return this.held.has(a); },
+};
+
+/* ---------- scene manager ---------- */
+class Scene {
+  constructor(name) { this.name = name; this.timers = []; }
+  enter() {}
+  exit() {}
+  update() {}
+  onAction() {}
+  onHidden() {}
+  later(ms, fn) { this.timers.push({ left: ms, fn }); }
+  tickTimers(dtMs, paused) {
+    if (paused) return;
+    for (const t of [...this.timers]) {
+      t.left -= dtMs;
+      if (t.left <= 0) { this.timers.splice(this.timers.indexOf(t), 1); t.fn(); }
+    }
+  }
+}
+
+const Scenes = {
+  current: null, busy: false, registry: {}, inputStats: {},
+  register(n, c) { this.registry[n] = c; },
+  async go(name, data = {}) {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      if (this.current) { this.current.exit(); this.current.timers.length = 0; }
+      overlayEl.innerHTML = ''; hudEl.innerHTML = '';
+      overlayEl.hidden = true; hudEl.hidden = true;
+      const scene = new this.registry[name](name);
+      this.current = scene;
+      scene.enter(data);
+      overlayEl.style.opacity = '0';
+      requestAnimationFrame(() => { overlayEl.style.transition = 'opacity .18s ease'; overlayEl.style.opacity = '1'; });
+      await new Promise(r => setTimeout(r, 60));
+    } finally { this.busy = false; }
+  },
+  dispatch(action, source, data) {
+    this.inputStats[source] = (this.inputStats[source] || 0) + 1;
+    if (action === 'mute') { Sfx.setMuted(!Sfx.muted); this.current?.onMuteChanged?.(); return; }
+    if (this.busy || !this.current) return;
+    this.current.onAction(action, source, data);
+  },
+};
+
+/* ---------- menu ---------- */
+class MenuScene extends Scene {
+  enter() {
+    View.crosshair.visible = false;
+    const best = HighScores.best();
+    const lv = Progress.furthest();
+    this.soundBtn = button(Sfx.muted ? 'Sound: Off' : 'Sound: On', () => {
+      Sfx.setMuted(!Sfx.muted); this.onMuteChanged();
+    }, 'sec');
+    overlayEl.hidden = false;
+    overlayEl.append(el('div', { class: 'center' },
+      el('div', { class: 'banner' },
+        el('h1', {}, CONFIG.title),
+        el('p', { class: 'sub' }, CONFIG.subtitle),
+        el('p', { class: 'accent', style: 'font-weight:800;margin:8px 0 0' },
+          best ? `Best run: ${fmt(best)}` : 'No high score yet')),
+      el('div', { class: 'col' },
+        button(lv > 1 ? `Play -- Level ${lv}` : 'Play', () => Scenes.go('game', { level: lv })),
+        button('Levels', () => Scenes.go('levels'), 'sec'),
+        button('High Scores', () => Scenes.go('highscores'), 'sec'),
+        this.soundBtn),
+      el('p', { class: 'hint banner', style: 'padding:8px 18px' }, 'Point and click to fire \u00b7 Esc pause \u00b7 M mute')));
+  }
+  onMuteChanged() { if (this.soundBtn) this.soundBtn.textContent = Sfx.muted ? 'Sound: Off' : 'Sound: On'; }
+  onAction(a) { if (a === 'confirm') Scenes.go('game', { level: Progress.furthest() }); }
+}
+
+/* ---------- level select (paged; 1000 levels) ---------- */
+class LevelsScene extends Scene {
+  enter() {
+    this.per = 60;
+    this.page = Math.floor((Progress.furthest() - 1) / this.per);
+    overlayEl.hidden = false;
+    this.root = el('div', { class: 'center' });
+    overlayEl.append(this.root);
+    this.render();
+  }
+  render() {
+    const furthest = Progress.furthest();
+    const pages = Math.ceil(CONFIG.maxLevel / this.per);
+    this.page = Math.max(0, Math.min(pages - 1, this.page));
+    const start = this.page * this.per + 1;
+    const grid = el('div', { class: 'levgrid' });
+    for (let n = start; n < start + this.per && n <= CONFIG.maxLevel; n++) {
+      const locked = n > furthest;
+      const st = Progress.starsFor(n);
+      grid.append(el('button', {
+        class: 'lev' + (locked ? ' locked' : ''),
+        disabled: locked ? '' : null,
+        onclick: () => { if (!locked) { Sfx.play('click'); Scenes.go('game', { level: n }); } },
+      }, String(n), el('span', { class: 'st' }, st ? '\u2605'.repeat(st) : '')));
+    }
+    this.root.innerHTML = '';
+    this.root.append(
+      el('h2', { class: 'banner' }, 'Levels'),
+      grid,
+      el('div', { class: 'pager' },
+        button('\u2039', () => { this.page--; this.render(); }, 'sec'),
+        el('span', { class: 'hint' }, `${start}\u2013${Math.min(CONFIG.maxLevel, start + this.per - 1)} of ${CONFIG.maxLevel}`),
+        button('\u203a', () => { this.page++; this.render(); }, 'sec')),
+      button('Back', () => Scenes.go('menu'), 'sec'));
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- high scores ---------- */
+class HighScoresScene extends Scene {
+  enter() {
+    const list = HighScores.list();
+    overlayEl.hidden = false;
+    const rows = list.length
+      ? list.map((e, i) => el('tr', {}, el('td', { class: 'r' }, `${i + 1}.`),
+          el('td', {}, e.level ? `Level ${e.level}` : (e.date || '')), el('td', { class: 's' }, fmt(e.score))))
+      : [el('tr', {}, el('td', { colspan: '3', style: 'text-align:center;color:#8b98b4' }, 'No scores yet. Go play!'))];
+    overlayEl.append(el('div', { class: 'center' },
+      el('h2', { class: 'banner' }, 'Best Level Scores'),
+      el('div', { class: 'panel' }, el('table', { class: 'scores' }, ...rows)),
+      button('Back', () => Scenes.go('menu'), 'sec')));
+  }
+  onAction(a) { if (a === 'pause' || a === 'confirm') Scenes.go('menu'); }
+}
+
+/* ---------- game over ---------- */
+class GameOverScene extends Scene {
+  enter({ score = 0, rank = 0, isBest = false, level = 1, won = false } = {}) {
+    this.enteredAt = performance.now();
+    overlayEl.hidden = false;
+    const line = isBest ? 'NEW BEST!' : rank ? `#${rank} on the leaderboard` : `Best: ${fmt(HighScores.best())}`;
+    overlayEl.append(el('div', { class: 'center' },
+      el('div', { class: 'panel' },
+        el('h2', {}, won ? 'Run Complete!' : 'Run Over'),
+        el('p', { class: 'sub' }, `Reached level ${level}`),
+        el('div', { class: 'big' }, fmt(score)),
+        el('p', { style: `font-weight:700;margin:0;color:${isBest ? '#ffd166' : '#a8b4cf'}` }, line)),
+      el('div', { class: 'col' },
+        button('Play Again', () => Scenes.go('game', { level: Progress.furthest() })),
+        button('High Scores', () => Scenes.go('highscores'), 'sec'),
+        button('Main Menu', () => Scenes.go('menu'), 'sec'))));
+  }
+  onAction(a) {
+    if (performance.now() - this.enteredAt < 800) return;    // don't let a stray fire skip this screen
+    if (a === 'confirm' || a === 'restart') Scenes.go('game', { level: Progress.furthest() });
+    else if (a === 'pause') Scenes.go('menu');
+  }
+}
+
+/* ---------- the game scene ----------
+   RULE DECISIONS (points the spec left open):
+   - Scoring is per level, not a running total: each level starts at zero and is scored on its own.
+   - A level scores block points (with combos) + a 500 clear bonus + 250 for every ball left in the
+     rack, so the more balls you spend the less you earn.
+   - Stars are read off that score: clearing at par (ceil(blocks/12) shots) earns three.
+   - The ball budget is deliberately generous so no level can strand a player; the stars, not the
+     budget, are what measure skill.
+   - The combo multiplier caps at x5 and belongs to a single shot; firing again starts a new burst.
+   - A level is cleared the instant the last block leaves the pedestal, even on the final ball.
+     It is failed only once the balls are gone AND the world has genuinely come to rest.
+   - Restart replays the current level from the score it started with, and records no high score.
+   - Progress and bonuses are banked the moment a level is cleared, not when the panel appears.
+   - Cleared blocks are removed ~1.4 s after they land, so debris does not pile up.
+   - Swipes are recognised (so the shell can report them) but ignored as a control. */
+class GameScene extends Scene {
+  enter({ level = 1 } = {}) {
+    this.levelNo = Math.max(1, Math.min(CONFIG.maxLevel, level));
+    this.bonus = 0;                    // level-end bonuses + anything added by the test hook
+    this.state = 'playing';            // 'playing' | 'paused' | 'over'
+    this.panel = null; this.savedPanel = null;
+    this.acc = 0;
+    this.aimNdc = { x: 0, y: 0.05 };
+    this.levelDone = false;            // guards double-counting a finished level
+
+    this.level = Logic.level(this.levelNo);
+    this.sim = new Sim(RAPIER, this.level);
+    View.buildLevel(this.sim);
+    this.updateAim();
+
+    hudEl.hidden = false;
+    this.buildHud();
+    this.refreshHud();
+    this.flash(`Level ${this.levelNo}`, 900);
+  }
+
+  /* ---------- HUD ---------- */
+  buildHud() {
+    this.elLevel = el('div', { class: 'v' }, String(this.levelNo));
+    this.elScore = el('div', { class: 'v' }, '0');
+    this.elBest = el('div', { class: 'v' }, fmt(HighScores.best()));
+    this.elAmmo = el('div', { id: 'ammo' });
+    this.elMsg = el('div', { id: 'msg' });
+    const chip = (k, v) => el('div', { class: 'chip' }, el('div', { class: 'k' }, k), v);
+    hudEl.append(
+      el('div', { class: 'hudrow' },
+        chip('LEVEL', this.elLevel), chip('SCORE', this.elScore), chip('BEST', this.elBest),
+        el('div', { class: 'spacer' }),
+        el('button', { class: 'btn sec', id: 'pausebtn', onclick: (e) => { e.preventDefault(); this.togglePause(); } }, 'II')),
+      this.elAmmo, this.elMsg);
+  }
+  get score() { return this.sim.blockPoints + this.bonus; }        // this level only
+  refreshHud() {
+    this.elScore.textContent = fmt(this.score);
+    this.elBest.textContent = fmt(Math.max(Progress.bestScore(this.levelNo), this.score));
+    this.elAmmo.innerHTML = '';
+    for (let i = 0; i < this.sim.ballsTotal; i++)
+      this.elAmmo.append(el('div', { class: 'pip' + (i < this.sim.ballsTotal - this.sim.ballsLeft ? ' spent' : '') }));
+  }
+  flash(text, ms = 1000) {
+    this.elMsg.textContent = text;
+    this.elMsg.style.opacity = '1';
+    this.later(ms, () => { if (this.elMsg) this.elMsg.style.opacity = '0'; });
+  }
+
+  /* ---------- aiming and firing ---------- */
+  onAim(ndc) {
+    if (this.state !== 'playing' || this.panel) return;
+    this.aimNdc = ndc;
+    this.updateAim();
+  }
+  updateAim() {
+    this.aimPoint = View.aimPointFrom(this.aimNdc);
+    View.aimAt(this.aimPoint);
+  }
+  canFire() { return this.state === 'playing' && !this.panel && this.sim.status === 'playing' && this.sim.ballsLeft > 0 && this.sim.cooldown === 0; }
+  fire() {
+    if (!this.canFire()) return false;
+    const ok = this.sim.fire({ x: this.aimPoint.x, y: this.aimPoint.y, z: this.aimPoint.z });
+    if (ok) {
+      Sfx.play('fire');
+      View.shake = Math.min(0.35, View.shake + 0.14);
+      this.refreshHud();
+    }
+    return ok;
+  }
+
+  onAction(a, source, data) {
+    if (a === 'pause') return this.togglePause();
+    if (this.state === 'paused') { if (a === 'confirm') this.resume(); return; }
+    if (this.panel) {                                   // a result panel owns the input
+      if (a === 'confirm') this.panel.querySelector('button')?.click();
+      return;
+    }
+    if (this.state !== 'playing') return;
+    if (a === 'restart') return this.restart();
+    if (source === 'swipe') return;                     // swipes are not a control in this game
+    if (a === 'press') { if (data) this.onAim(data); return this.fire(); }
+    if (a === 'fire' || a === 'confirm') return this.fire();
+    const step = 0.045;
+    if (a === 'left') this.onAim({ x: this.aimNdc.x - step, y: this.aimNdc.y });
+    else if (a === 'right') this.onAim({ x: this.aimNdc.x + step, y: this.aimNdc.y });
+    else if (a === 'up') this.onAim({ x: this.aimNdc.x, y: this.aimNdc.y + step });
+    else if (a === 'down') this.onAim({ x: this.aimNdc.x, y: this.aimNdc.y - step });
+  }
+
+  /* ---------- pause ---------- */
+  togglePause() {
+    if (this.state === 'over') return;
+    if (this.state === 'paused') return this.resume();
+    this.state = 'paused';
+    this.savedPanel = this.panel;                       // keep a result panel underneath
+    if (this.savedPanel) { this.savedPanel.style.display = 'none'; this.panel = null; }
+    this.showPanel('Paused', '', [
+      ['Resume', () => this.resume()],
+      ['Restart', () => this.restart(), 'sec'],
+      ['Main Menu', () => { this.endRun({ toMenu: true }); }, 'sec'],
+    ]);
+  }
+  resume() {
+    this.hidePanel();
+    if (this.savedPanel) { this.savedPanel.style.display = ''; overlayEl.hidden = false; this.panel = this.savedPanel; this.savedPanel = null; }
+    if (this.state === 'paused') this.state = 'playing';
+  }
+  onHidden() { if (this.state === 'playing') this.togglePause(); }
+
+  showPanel(title, sub, buttons) {
+    this.hidePanel();
+    overlayEl.hidden = false;
+    const p = el('div', { class: 'center' },
+      el('div', { class: 'scrim' }),
+      el('div', { class: 'panel' }, el('h2', {}, title), sub ? el('p', { class: 'sub' }, sub) : null),
+      el('div', { class: 'col' }, buttons.map(([label, fn, cls]) => button(label, fn, cls || ''))));
+    overlayEl.append(p);
+    this.panel = p;
+    return p;
+  }
+  hidePanel() { if (this.panel) { this.panel.remove(); this.panel = null; } if (!overlayEl.children.length) overlayEl.hidden = true; }
+
+  /* ---------- level flow ---------- */
+  restart() { Scenes.go('game', { level: this.levelNo }); }
+  nextLevel() {
+    if (this.levelNo >= CONFIG.maxLevel) return this.endRun({ won: true });
+    Scenes.go('game', { level: this.levelNo + 1 });
+  }
+  /** Ends the run: records the high score once, then shows the game-over screen (or the menu). */
+  endRun({ toMenu = false, won = false } = {}) {
+    if (this.state === 'over') return;
+    const score = this.score;
+    this.state = 'over';
+    const { rank, isBest } = HighScores.add(score, this.levelNo);
+    if (toMenu) Scenes.go('menu');
+    else Scenes.go('gameover', { score, rank, isBest, level: this.levelNo, won });
+  }
+
+  onLevelCleared() {
+    if (this.levelDone) return;
+    this.levelDone = true;
+    // bonuses and progress are banked immediately -- quitting during the panel can't lose them
+    this.bonus += Logic.clearBonus() + Logic.ballBonus(this.sim.ballsLeft);
+    const stars = Logic.stars(this.score, this.sim.blocks.length, this.sim.ballsTotal);
+    Progress.record(this.levelNo, stars, this.score);
+    this.refreshHud();
+    Sfx.play('win');
+    this.flash('Cleared!', 1200);
+    this.later(900, () => {
+      if (this.state === 'over') return;
+      const [, t2, t3] = Logic.starTargets(this.sim.blocks.length, this.sim.ballsTotal);
+      const gap = stars === 3 ? '' : `   \u00b7   ${fmt((stars === 1 ? t2 : t3) - this.score)} more for the next star`;
+      this.showPanel(`${'\u2605'.repeat(stars)}${'\u2606'.repeat(3 - stars)}  Level ${this.levelNo}`,
+        `${fmt(this.score)} points   \u00b7   ${this.sim.shotsFired} shot${this.sim.shotsFired === 1 ? '' : 's'}   \u00b7   ${this.sim.ballsLeft} balls left${gap}`,
+        [['Next Level', () => this.nextLevel()], ['End Run', () => this.endRun(), 'sec']]);
+    });
+  }
+  onLevelFailed() {
+    if (this.levelDone) return;
+    this.levelDone = true;
+    Sfx.play('lose');
+    this.flash('Out of balls', 1200);
+    this.later(700, () => {
+      if (this.state === 'over') return;
+      this.showPanel('Out of balls', `${this.sim.remaining} block${this.sim.remaining === 1 ? '' : 's'} still standing`,
+        [['Try Again', () => this.restart()], ['End Run', () => this.endRun(), 'sec']]);
+    });
+  }
+
+  /* ---------- per-frame ---------- */
+  update(dtMs) {
+    this.tickTimers(dtMs, this.state === 'paused');
+    if (this.state !== 'playing' || !this.sim) return;
+
+    this.acc += Math.min(dtMs, 100) / 1000;
+    let steps = 0;
+    while (this.acc >= PHYS.dt && steps < 6) {
+      const events = this.sim.tick();
+      this.acc -= PHYS.dt;
+      steps++;
+      for (const ev of events) this.handleEvent(ev);
+    }
+    if (steps === 6) this.acc = 0;                       // never spiral after a long stall
+    View.syncFromSim(this.sim);
+    if (!this.levelDone) {
+      if (this.sim.status === 'cleared') this.onLevelCleared();
+      else if (this.sim.status === 'failed') this.onLevelFailed();
+    }
+  }
+
+  handleEvent(ev) {
+    switch (ev.type) {
+      case 'clear': {
+        const b = this.sim.blocks[ev.id];
+        const p = b && !b.removed ? b.body.translation() : { x: 0, y: PHYS.pedestalTop + 1, z: 0 };
+        Sfx.play('clear');
+        popText(p, `+${ev.points}`, ev.combo > 1 ? '#ffd166' : '#dfe7f5', ev.combo > 1 ? 26 : 20);
+        if (ev.combo === 2) popText({ x: p.x, y: p.y + 0.7, z: p.z }, 'x2', '#ff8a5c', 28);
+        else if (ev.combo > 2) popText({ x: p.x, y: p.y + 0.7, z: p.z }, `x${ev.combo}`, '#ff6a43', 30);
+        this.refreshHud();
+        break;
+      }
+      case 'blast': View.addBlast(ev.at); Sfx.play('blast'); break;
+      case 'shatter': View.addPuff(ev.at); Sfx.play('glass'); break;
+      case 'fire': break;
+      default: break;
+    }
+  }
+
+  exit() { if (this.sim) { this.sim.destroy(); this.sim = null; } View.clearLevel(); View.crosshair.visible = false; }
+
+  debugState() {
+    return {
+      state: this.state, score: this.score, level: this.levelNo,
+      simStatus: this.sim ? this.sim.status : null,
+      ballsLeft: this.sim ? this.sim.ballsLeft : 0,
+      ballsTotal: this.sim ? this.sim.ballsTotal : 0,
+      remaining: this.sim ? this.sim.remaining : 0,
+      cleared: this.sim ? this.sim.clearedCount : 0,
+      panel: !!this.panel, levelDone: this.levelDone,
+    };
+  }
+  /** Used by the test hook to end a run on demand. */
+  addScore(n) { this.bonus += n; this.refreshHud(); }
+}
+
+/* ##### TESTS ##### */
+function assert(c, m = 'assertion failed') { if (!c) throw new Error(m); }
+function assertEq(a, b, m = '') { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${m} expected ${B} got ${A}`); }
+function simFor(n) { return new Sim(RAPIER, Logic.level(n)); }
+
+const TESTS = [
+  ['ballistics: the ball really passes through the crosshair point', () => {
+    for (const target of [{ x: 0, y: 2.0, z: 1.2 }, { x: 1.6, y: 4.2, z: -1.1 }, { x: -1.4, y: 1.9, z: 1.2 }, { x: 0, y: 4.6, z: -1.6 }]) {
+      // integrate from where the ball is actually created, with the velocity it actually gets
+      const { spawn, vel } = Sim.solveShot(target);
+      const horiz = Math.hypot(target.x - spawn.x, target.z - spawn.z);
+      const t = horiz / Math.hypot(vel.x, vel.z);
+      const y = spawn.y + vel.y * t - 0.5 * PHYS.gravity * t * t;
+      assert(Math.abs(y - target.y) < 0.01, `crosshair lies: ball passes ${(y - target.y).toFixed(3)} m off`);
+    }
+  }],
+
+  ['levels are deterministic and well formed', () => {
+    for (const n of [1, 7, 40, 137, 500, 1000]) {
+      const a = Logic.level(n), b = Logic.level(n);
+      assertEq(a.blocks, b.blocks, `level ${n} must be identical every time`);
+      assert(a.blocks.length >= MIN_BLOCKS, `level ${n} has too few blocks`);
+      assert(a.blocks.length <= MAX_BLOCKS, `level ${n} has too many blocks`);
+      assert(a.balls >= 15 && a.balls <= 24, `level ${n} ball count out of range`);
+      assertEq(Logic.overlaps(a.blocks), [], `level ${n} spawns overlapping blocks`);
+      for (const bl of a.blocks) {
+        assert(Math.hypot(bl.x, bl.z) <= PHYS.pedestalRadius, `level ${n} block outside the pedestal`);
+        assert(bl.y - bl.sy / 2 >= PHYS.pedestalTop - 1e-6, `level ${n} block starts below the pedestal top`);
+        assert(TYPES[bl.type], `level ${n} unknown block type ${bl.type}`);
+      }
+    }
+  }],
+
+  ['every level is a real stack and the ramp grows', () => {
+    for (const n of [1, 2, 9, 57, 300, 1000])
+      assert(Logic.level(n).blocks.length >= MIN_BLOCKS, `level ${n} has fewer than MIN_BLOCKS blocks`);
+    assert(Logic.targetBlocks(300) > Logic.targetBlocks(1), 'difficulty must ramp up');
+    assert(Logic.paletteFor(1).length === 1, 'level 1 is wood only');
+    assert(Logic.paletteFor(40).includes('steel'), 'steel unlocks by level 40');
+  }],
+
+  ['scoring: bursts, bonuses and stars', () => {
+    assertEq(Logic.burstScore(1), 100);
+    assertEq(Logic.burstScore(3), 600);              // 100 + 200 + 300
+    assertEq(Logic.blockScore(9), 500, 'multiplier caps at x5');
+    assertEq(Logic.ballBonus(4), 1000);
+    assertEq(Logic.par(24), 3); assertEq(Logic.par(60), 5);
+    // stars come off the score, and spending balls costs points
+    for (const blocks of [50, 66, 84]) {
+      const balls = Logic.ballsFor(blocks);
+      const [t1, t2, t3] = Logic.starTargets(blocks, balls);
+      assert(t1 < t2 && t2 < t3, 'star targets must increase');
+      assertEq(Logic.stars(t3, blocks, balls), 3);
+      assertEq(Logic.stars(t2, blocks, balls), 2);
+      assertEq(Logic.stars(t1, blocks, balls), 1);
+      // clearing at par with no combos is exactly three stars
+      const atPar = 100 * blocks + Logic.clearBonus() + Logic.ballBonus(balls - Logic.par(blocks));
+      assertEq(Logic.stars(atPar, blocks, balls), 3, 'clearing at par should be three stars');
+      // the same clear using three more balls must score less and drop a star
+      const sloppy = 100 * blocks + Logic.clearBonus() + Logic.ballBonus(balls - Logic.par(blocks) - 3);
+      assert(sloppy < atPar, 'using more balls must score less');
+      assert(Logic.stars(sloppy, blocks, balls) < 3, 'a sloppy clear should not be three stars');
+      // the budget always covers the worst measured need, so a level can never strand you
+      assert(balls >= Logic.par(blocks) + 5, `budget too tight for ${blocks} blocks`);
+    }
+  }],
+
+  ['a structure stands on its own when nobody shoots at it', () => {
+    for (const n of [1, 5, 8, 23]) {
+      const s = simFor(n);
+      for (let i = 0; i < 120; i++) s.tick();
+      assertEq(s.clearedCount, 0, `level ${n} collapsed on its own`);
+      assertEq(s.status, 'playing', `level ${n} ended by itself`);
+      s.destroy();
+    }
+  }],
+
+  ['a block is counted exactly once', () => {
+    const s = simFor(1);
+    s.fire(s.botAim(0));
+    let clears = 0;
+    for (let i = 0; i < 400; i++) for (const e of s.tick()) if (e.type === 'clear') clears++;
+    const ids = new Set();
+    for (const b of s.blocks) if (b.cleared) ids.add(b.id);
+    assertEq(clears, ids.size, 'clear events must match the number of cleared blocks');
+    s.destroy();
+  }],
+
+  ['clearing the last block wins even with no balls left', () => {
+    const s = simFor(1);
+    s.ballsLeft = 1;
+    while (s.status === 'playing') {
+      if (s.ballsLeft > 0 && s.cooldown === 0 && s.settled && s.ballsInFlight === 0) s.fire(s.botAim(0));
+      // force the remaining blocks off the pedestal on the same tick the last ball is gone
+      if (s.ballsLeft === 0 && s.ticks > 60) for (const b of s.blocks) if (!b.cleared) b.body.setTranslation({ x: 9, y: 3, z: 0 }, true);
+      s.tick();
+      if (s.ticks > 1200) break;
+    }
+    assertEq(s.status, 'cleared', 'a clear on the final ball must win, not fail');
+    s.destroy();
+  }],
+
+  ['a level is never failed while blocks are still moving', () => {
+    const s = simFor(2);
+    s.ballsLeft = 1;
+    s.fire(s.botAim(0));
+    let sawMovingFail = false;
+    for (let i = 0; i < 600; i++) {
+      s.tick();
+      if (s.status === 'failed') {
+        let moving = false;
+        for (const b of s.blocks) if (!b.removed && Math.hypot(b.body.linvel().x, b.body.linvel().y, b.body.linvel().z) > PHYS.settleSpeed) moving = true;
+        if (moving) sawMovingFail = true;
+        break;
+      }
+    }
+    assert(!sawMovingFail, 'failed while the world was still settling');
+    s.destroy();
+  }],
+
+  ['firing is refused when it should be', () => {
+    const s = simFor(1);
+    assert(s.fire({ x: 0, y: 3, z: 0 }), 'first shot should fire');
+    assert(!s.fire({ x: 0, y: 3, z: 0 }), 'cooldown must block an instant second shot');
+    for (let i = 0; i < 12; i++) s.tick();
+    assert(s.fire({ x: 0, y: 3, z: 0 }), 'should fire again after the cooldown');
+    s.ballsLeft = 0;
+    for (let i = 0; i < 12; i++) s.tick();
+    assert(!s.fire({ x: 0, y: 3, z: 0 }), 'no balls left means no shot');
+    s.status = 'cleared';
+    s.ballsLeft = 3;
+    assert(!s.fire({ x: 0, y: 3, z: 0 }), 'a finished level must not accept shots');
+    s.destroy();
+  }],
+
+  ['balls are removed after leaving the arena (no leak)', () => {
+    const s = simFor(1);
+    s.fire({ x: 0, y: 40, z: -30 });                    // straight over the top
+    for (let i = 0; i < 700; i++) s.tick();
+    assertEq(s.ballsInFlight, 0, 'the ball should be gone');
+    s.destroy();
+  }],
+
+  ['the combo multiplier belongs to one shot, not to a rolling timer', () => {
+    // two blocks knocked off by two separate shots must score 100 + 100, not 100 + 200
+    const lv = Logic.level(1);
+    const s = new Sim(RAPIER, lv);
+    for (let i = 0; i < 40; i++) s.tick();
+    const push = () => {
+      const b = s.blocks.find(x => !x.cleared && !x.removed);
+      b.body.setTranslation({ x: 9, y: 3, z: 0 }, true);
+    };
+    s.fire({ x: 0, y: 9, z: -9 }); push();                  // shot 1 clears one block
+    for (let i = 0; i < 6; i++) s.tick();
+    const afterFirst = s.blockPoints;
+    for (let i = 0; i < 12; i++) s.tick();                  // well inside the old 0.9 s window
+    s.fire({ x: 0, y: 9, z: -9 }); push();                  // shot 2 clears one block
+    for (let i = 0; i < 6; i++) s.tick();
+    assertEq(afterFirst, 100, 'the first clear scores one block');
+    assertEq(s.blockPoints, 200, 'a second shot must restart the combo, not extend it');
+    s.destroy();
+  }],
+
+  ['cleared blocks are eventually removed from the world', () => {
+    const s = simFor(30);
+    const pushed = s.blocks.slice(0, 3);                    // leave the rest standing so play continues
+    pushed.forEach((b, i) => b.body.setTranslation({ x: 4 + i * 0.9, y: 0.4, z: 0 }, true));
+    for (let i = 0; i < 30; i++) s.tick();
+    assertEq(pushed.filter(b => b.cleared).length, 3, 'blocks off the pedestal should count as cleared');
+    assertEq(s.status, 'playing', 'the level should still be in play');
+    for (let i = 0; i < 60 * 4; i++) s.tick();
+    assertEq(pushed.filter(b => !b.removed).length, 0, 'debris was never cleaned up');
+    s.destroy();
+  }],
+
+  ['physics keeps running after a level ends so nothing freezes mid-air', () => {
+    const s = simFor(1);
+    for (const b of s.blocks) b.body.setTranslation({ x: 6, y: 4, z: 0 }, true);
+    for (let i = 0; i < 5; i++) s.tick();
+    assertEq(s.status, 'cleared', 'pushing everything off clears the level');
+    const t0 = s.time;
+    for (let i = 0; i < 30; i++) s.tick();
+    assert(s.time > t0, 'the world must keep stepping after the level is cleared');
+    s.destroy();
+  }],
+
+  ['a barrel explodes once and shifts its neighbours', () => {
+    const lv = Logic.level(1);
+    lv.blocks.forEach(b => { b.type = 'wood'; });
+    lv.blocks[0].type = 'barrel';
+    const s = new Sim(RAPIER, lv);
+    for (let i = 0; i < 60; i++) s.tick();              // settle
+    const before = s.blocks.slice(1).map(b => ({ ...b.body.translation() }));
+    const bp = s.blocks[0].body.translation();
+    s.blocks[0].body.setLinvel({ x: 0, y: 0, z: -12 }, true);   // a hard knock detonates it
+    let blasts = 0;
+    for (let i = 0; i < 120; i++) for (const e of s.tick()) if (e.type === 'blast') blasts++;
+    assertEq(blasts, 1, 'a barrel must detonate exactly once');
+    assert(s.blocks[0].cleared, 'the barrel counts as cleared');
+    let moved = 0;
+    s.blocks.slice(1).forEach((b, i) => {
+      if (b.removed) { moved++; return; }                 // already tidied away: it certainly moved
+      const p = b.body.translation();
+      if (Math.hypot(p.x - before[i].x, p.y - before[i].y, p.z - before[i].z) > 0.05) moved++;
+    });
+    assert(moved > 0, 'the blast should move nearby blocks');
+    assert(bp, 'barrel had a position');
+    s.destroy();
+  }],
+
+  ['glass shatters when hit hard', () => {
+    const lv = Logic.level(1);
+    lv.blocks.forEach(b => { b.type = 'wood'; });
+    lv.blocks[0].type = 'glass';
+    const s = new Sim(RAPIER, lv);
+    for (let i = 0; i < 60; i++) s.tick();
+    s.blocks[0].body.setLinvel({ x: 0, y: 0, z: -14 }, true);
+    let shattered = 0;
+    for (let i = 0; i < 90; i++) for (const e of s.tick()) if (e.type === 'shatter') shattered++;
+    assertEq(shattered, 1, 'glass shatters once');
+    assert(s.blocks[0].cleared, 'shattered glass counts as cleared');
+    assert(s.blocks[0].removed, 'shattered glass leaves the world');
+    s.destroy();
+  }],
+
+  ['the simulation is fixed-step: chunking the ticks changes nothing', () => {
+    // Fire on fixed tick numbers, so the only thing that varies is how the ticks are grouped.
+    const shots = { 5: { x: 0.3, y: 2.6, z: 0 }, 240: { x: -0.4, y: 3.1, z: 0.2 } };
+    const run = (chunk) => {
+      const s = simFor(4);
+      let t = 0;
+      while (t < 600) {
+        for (let i = 0; i < chunk && t < 600; i++, t++) {
+          if (shots[t]) s.fire(shots[t]);
+          s.tick();
+        }
+      }
+      const snap = s.snapshot();
+      s.destroy();
+      return snap;
+    };
+    assertEq(run(1), run(7), 'stepping in different chunk sizes must give the same world');
+  }],
+
+  ['the bot clears a sample of levels within their ball budget', () => {
+    for (const n of [1, 3, 12, 27]) {
+      const s = simFor(n);
+      const r = s.runBot();
+      assertEq(r.status, 'cleared', `level ${n} was not clearable (left ${s.remaining} of ${s.blocks.length})`);
+      assert(r.shots <= s.ballsTotal, `level ${n} used more shots than it had balls`);
+      s.destroy();
+    }
+  }],
+
+  ['support test: bridging counts, overhanging does not', () => {
+    // a slab carried at its corners is supported even though nothing touches its middle
+    const slab = { x: 0, y: 2.5, z: 0, sx: 2.0, sy: 0.3, sz: 2.0, yaw: 0 };
+    const legs = [[-0.9, -0.9], [0.9, -0.9], [-0.9, 0.9], [0.9, 0.9]]
+      .map(([x, z]) => ({ x, y: 2.05, z, sx: 0.35, sy: 0.6, sz: 0.35, yaw: 0 }));
+    assert(Logic.isSupported(slab, [slab, ...legs]), 'a slab on four legs must count as supported');
+    // a brick whose centre hangs past its support is not
+    const over = { x: -0.967, y: 2.34, z: 0, sx: 0.624, sy: 0.42, sz: 0.7, yaw: 0 };
+    const under = { x: -0.644, y: 1.914, z: 0, sx: 0.624, sy: 0.42, sz: 0.7, yaw: 0 };
+    assert(!Logic.isSupported(over, [over, under]), 'an overhanging brick must not count as supported');
+    // and a block with nothing underneath at all
+    assert(!Logic.isSupported({ x: 0, y: 4, z: 0, sx: 0.5, sy: 0.5, sz: 0.5, yaw: 0 }, []), 'mid-air block');
+  }],
+
+  ['archetypes keep their defining feature', () => {
+    // the support prune must never strip a structure back to its legs
+    const feature = {
+      table: (lv) => lv.blocks.some(b => b.sx > 1.2 && b.sy < 0.4),            // the tabletop
+      arch: (lv) => lv.blocks.some(b => b.sx > 0.9 && b.sy < 0.4),             // a lintel
+      cross: (lv) => lv.blocks.filter(b => Math.abs(b.y - lv.blocks[0].y) < 1e-6).length >= 5,
+    };
+    for (const n of [7, 307, 997, 4, 304, 964, 6, 306, 996]) {
+      const lv = Logic.level(n);
+      const f = feature[lv.archetype];
+      if (f) assert(f(lv), `level ${n} (${lv.archetype}) lost its defining structure (${lv.blocks.length} blocks)`);
+      assert(lv.blocks.length >= MIN_BLOCKS, `level ${n} (${lv.archetype}) was pruned to ${lv.blocks.length} blocks`);
+    }
+  }],
+
+  ['every block in a generated level rests on something', () => {
+    for (const n of [1, 4, 14, 134, 362, 500, 777, 1000]) {
+      const blocks = Logic.level(n).blocks;
+      for (const b of blocks)
+        assert(Logic.isSupported(b, blocks), `level ${n}: a ${b.type} block is floating in mid-air`);
+    }
+  }],
+
+  ['a level never clears itself before the first shot', () => {
+    for (const n of [134, 202, 362, 404, 494]) {          // these collapsed on their own once
+      const s = simFor(n);
+      for (let i = 0; i < 150; i++) s.tick();
+      assertEq(s.clearedCount, 0, `level ${n} collapsed with nobody shooting`);
+      s.destroy();
+    }
+  }],
+
+  ['no block is too heavy for a cannonball to move', () => {
+    const ballMass = PHYS.ballDensity * (4 / 3) * Math.PI * Math.pow(PHYS.ballRadius, 3);
+    for (const n of [7, 17, 117, 327, 500, 997]) {
+      for (const b of Logic.level(n).blocks) {
+        const mass = TYPES[b.type].density * b.sx * b.sy * b.sz;
+        assert(mass <= Logic.MAX_MASS + 1e-6, `level ${n}: a ${b.type} block weighs ${mass.toFixed(2)} (cap ${Logic.MAX_MASS})`);
+        assert(mass < ballMass * 12, `level ${n}: block far heavier than the ball`);
+      }
+    }
+  }],
+
+  ['score adds up: blocks + clear bonus + unused balls', () => {
+    const s = simFor(1);
+    const r = s.runBot();
+    assertEq(r.status, 'cleared');
+    assertEq(s.finalScore(), s.blockPoints + Logic.clearBonus() + Logic.ballBonus(s.ballsLeft));
+    assert(s.blockPoints >= 100 * s.blocks.length / 5, 'every cleared block should have scored');
+    s.destroy();
+  }],
+];
+
+function runSelfTests() {
+  const failures = [];
+  for (const [name, fn] of TESTS) { try { fn(); } catch (e) { failures.push(`${name}: ${e.message}`); } }
+  return { total: TESTS.length, failures };
+}
+/* ##### END TESTS ##### */
+
+function loadBackdrop() {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = './backdrop.png';
+  });
+}
+
+/* ---------- boot ---------- */
+(async () => {
+  document.title = CONFIG.title;
+  const backdropP = loadBackdrop();
+  try {
+    await RAPIER.init();
+  } catch (e) {
+    // The physics engine is WebAssembly. Some sandboxed viewers block WebAssembly entirely
+    // (no 'wasm-unsafe-eval' in their CSP); say so plainly instead of showing a raw error.
+    const blocked = /WebAssembly|unsafe-eval|CompileError/i.test(String(e && e.message || e));
+    document.getElementById('loading').innerHTML = blocked
+      ? '<div style="max-width:32em;text-align:center;line-height:1.6;padding:24px">'
+        + '<b style="font-size:19px;color:#f2f6ff">This viewer blocks WebAssembly</b><br>'
+        + 'Cannonfall runs its 3D physics in WebAssembly, which this embedded viewer will not allow. '
+        + 'Open the downloaded <code>cannonfall.html</code> in a browser, or host it on your site, and it will run normally.</div>'
+      : 'Could not start: ' + (e && e.message || e);
+    return;
+  }
+  View.init(await backdropP);
+  Input.init();
+
+  Scenes.register('menu', MenuScene);
+  Scenes.register('levels', LevelsScene);
+  Scenes.register('game', GameScene);
+  Scenes.register('gameover', GameOverScene);
+  Scenes.register('highscores', HighScoresScene);
+
+  window.addEventListener('resize', () => View.resize());
+  document.addEventListener('visibilitychange', () => { if (document.hidden) Scenes.current?.onHidden?.(); });
+
+  let last = performance.now();
+  function frame(now) {
+    const dtMs = Math.min(100, now - last);
+    last = now;
+    try {
+      Scenes.current?.update?.(dtMs);
+      View.updateFx(dtMs / 1000);
+      View.render();
+    } catch (e) { showFatal(e.message || String(e)); throw e; }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  document.getElementById('loading').remove();
+  await Scenes.go('menu');
+
+  /* test hook -- harmless in production, used by scripts/verify.py and checks.js */
+  window.__game = {
+    ready: true,
+    get scene() { return Scenes.current?.name; },
+    get busy() { return Scenes.busy; },
+    get score() { return Scenes.current?.score ?? null; },
+    get sceneObj() { return Scenes.current; },
+    state() { const d = Scenes.current?.debugState?.(); return d == null ? null : JSON.parse(JSON.stringify(d)); },
+    buttons() {
+      const out = [];
+      for (const b of document.querySelectorAll('#ui button')) {
+        const r = b.getBoundingClientRect();
+        if (r.width && r.height && b.offsetParent !== null)
+          out.push({ label: b.textContent.trim(), x: r.left + r.width / 2, y: r.top + r.height / 2 });
+      }
+      return out;
+    },
+    boardObjects() { return View.blockMeshes.filter(m => m.visible).length + View.ballMeshes.filter(m => m.visible).length; },
+    inputStats() { return { ...Scenes.inputStats }; },
+    addScore(n) { const s = Scenes.current; if (s && s.addScore) { s.addScore(n); return true; } return false; },
+    forceGameOver() { const s = Scenes.current; if (s && s.endRun) { s.endRun(); return true; } return false; },
+    selfTest: runSelfTests,
+    highScores: () => HighScores.list(),
+    resetProgress() { Progress.reset(); HighScores.clear(); },
+  };
+})().catch(e => showFatal(e.message || String(e)));
+
+</script>
+</body>
+</html>

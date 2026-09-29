@@ -2,7 +2,7 @@
   "name": "playbox",
   "private": true,
   "version": "1.0.0",
-  "description": "React arcade for nine PixiJS browser games, with local high scores and a dedicated play page for each title.",
+  "description": "React arcade for ten browser games, with local high scores and a dedicated play page for each title.",
   "type": "module",
   "scripts": {
     "dev": "vite",

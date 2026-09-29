@@ -1,6 +1,6 @@
 # Playbox
 
-A React arcade for nine PixiJS browser games. The home page lists every title with category filters and local high scores. Each card opens a dedicated play page.
+A React arcade for ten browser games. The home page lists every title with category filters and local high scores. Each card opens a dedicated play page.
 
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
@@ -11,7 +11,7 @@ The current working copy also lives at `Documents/GitHub/playbox` — use that f
 
 ## Features
 
-- Catalogue of nine games with category filters
+- Catalogue of ten games with a featured new-game hero and category filters
 - Full-screen player with letterboxed aspect ratio and fullscreen support
 - Gameplay screenshots on every card
 - High scores stored in `localStorage` on this device
@@ -25,10 +25,10 @@ The current working copy also lives at `Documents/GitHub/playbox` — use that f
 | UI | React 19, React Router 7, CSS Modules |
 | Language | TypeScript |
 | Bundler | Vite 7 |
-| Games | PixiJS 8 ES modules, Matter.js for Hoop Drop |
+| Games | PixiJS 8 ES modules, Matter.js for Hoop Drop, Three.js and Rapier for Cannonfall |
 | Persistence | `localStorage` |
 
-The hall is a React SPA. Each game is a self-contained PixiJS module under `public/games/<id>/` and loads the engine from `/vendor/pixi.min.mjs`.
+The hall is a React SPA. Each game is a self-contained module under `public/games/<id>/`. Pixi titles load the engine from `/vendor/pixi.min.mjs`. Cannonfall is a Three.js + Rapier 3D game.
 
 ## Getting started
 
@@ -78,4 +78,4 @@ src/
 
 ## Games
 
-Puzzle: 2048, Marble Chain. Cards: Key Peaks Solitaire. Board: Halma. Sports: Hoop Drop, Goal Puzzle, Star Kick. Arcade: Subway Flap, Star Bouncer.
+Arcade: Cannonfall, Subway Flap, Star Bouncer. Puzzle: 2048, Marble Chain. Cards: Key Peaks Solitaire. Board: Halma. Sports: Hoop Drop, Goal Puzzle, Star Kick.

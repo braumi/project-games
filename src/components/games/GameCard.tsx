@@ -13,7 +13,10 @@ export function GameCard({ game }: GameCardProps) {
 
   return (
     <Link to={`/play/${game.id}`} className={styles.card} aria-label={`Play ${game.name}`}>
-      <GameThumb src={game.thumb} name={game.name} landscape={game.landscape} />
+      <div className={styles.media}>
+        <GameThumb src={game.thumb} name={game.name} landscape={game.landscape} />
+        {game.isNew ? <span className={styles.badge}>New</span> : null}
+      </div>
       <div className={styles.body}>
         <div className={styles.titleRow}>
           <h2>{game.name}</h2>

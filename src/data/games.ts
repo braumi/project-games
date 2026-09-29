@@ -15,9 +15,31 @@ export interface Game {
   storeId: string;
   description: string;
   how: HowPart[];
+  featured?: boolean;
+  isNew?: boolean;
 }
 
 export const GAMES: Game[] = [
+  {
+    id: "cannonfall",
+    file: "cannonfall/index.html",
+    thumb: "/images/games/cannonfall.png",
+    name: "Cannonfall",
+    category: "Arcade",
+    landscape: true,
+    storeId: "cannonfall",
+    featured: true,
+    isNew: true,
+    description: "Aim the cannon and knock every block off the pedestal. Combos, stars, and a thousand levels.",
+    how: [
+      { em: "Aim" },
+      " with the pointer, then ",
+      { em: "click" },
+      " or press ",
+      { em: "Space" },
+      " to fire.",
+    ],
+  },
   {
     id: "2048",
     file: "2048/index.html",
@@ -150,6 +172,10 @@ export const GAMES: Game[] = [
 
 export function getGame(id: string): Game | undefined {
   return GAMES.find((game) => game.id === id);
+}
+
+export function featuredGame(): Game | undefined {
+  return GAMES.find((game) => game.featured);
 }
 
 export function filterGames(category: Category): Game[] {
