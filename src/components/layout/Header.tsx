@@ -16,7 +16,7 @@ export function Header({ children }: HeaderProps) {
           <h1>Playbox</h1>
         </Link>
         <p className={styles.tag}>
-          Ten free browser games. No installs, no ads, your best scores saved on this device.
+          Eleven free browser games. No installs, no ads, your best scores saved on this device.
         </p>
       </div>
       {children}

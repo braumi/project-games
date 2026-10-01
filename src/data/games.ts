@@ -17,9 +17,29 @@ export interface Game {
   how: HowPart[];
   featured?: boolean;
   isNew?: boolean;
+  heroPosition?: string;
+  /** Catalogue art is landscape even when the player is portrait. */
+  thumbLandscape?: boolean;
 }
 
 export const GAMES: Game[] = [
+  {
+    id: "merge-garage",
+    file: "merge-garage/index.html",
+    thumb: "/images/games/merge-garage.jpg",
+    name: "Merge Garage",
+    category: "Puzzle",
+    landscape: false,
+    thumbLandscape: true,
+    storeId: "merge-garage",
+    featured: true,
+    isNew: true,
+    description: "Merge spare parts, fill customer orders, and restore Gus’s garage before Saturday.",
+    how: [
+      { em: "Drag" },
+      " two of a kind together. Merge a clean part onto a dusty one to open the boxes around it.",
+    ],
+  },
   {
     id: "cannonfall",
     file: "cannonfall/index.html",
@@ -28,8 +48,6 @@ export const GAMES: Game[] = [
     category: "Arcade",
     landscape: true,
     storeId: "cannonfall",
-    featured: true,
-    isNew: true,
     description: "Aim the cannon and knock every block off the pedestal. Combos, stars, and a thousand levels.",
     how: [
       { em: "Aim" },

@@ -1,6 +1,6 @@
 # Playbox
 
-A React arcade for ten browser games. The home page lists every title with category filters and local high scores. Each card opens a dedicated play page.
+A React arcade for eleven browser games. The home page lists every title with category filters and local high scores. Each card opens a dedicated play page.
 
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
@@ -11,7 +11,7 @@ The current working copy also lives at `Documents/GitHub/playbox` — use that f
 
 ## Features
 
-- Catalogue of ten games with a featured new-game hero and category filters
+- Catalogue of eleven games with a featured new-game hero and category filters
 - Full-screen player with letterboxed aspect ratio and fullscreen support
 - Gameplay screenshots on every card
 - High scores stored in `localStorage` on this device
@@ -78,4 +78,4 @@ src/
 
 ## Games
 
-Arcade: Cannonfall, Subway Flap, Star Bouncer. Puzzle: 2048, Marble Chain. Cards: Key Peaks Solitaire. Board: Halma. Sports: Hoop Drop, Goal Puzzle, Star Kick.
+Arcade: Cannonfall, Subway Flap, Star Bouncer. Puzzle: Merge Garage, 2048, Marble Chain. Cards: Key Peaks Solitaire. Board: Halma. Sports: Hoop Drop, Goal Puzzle, Star Kick.
